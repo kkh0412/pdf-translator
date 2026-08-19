@@ -3,6 +3,7 @@ import os
 import time
 import urllib.error
 import urllib.request
+import unicodedata
 from typing import Iterable
 
 
@@ -26,6 +27,22 @@ class GeminiHTTPError(RuntimeError):
 
 class GeminiOutputError(RuntimeError):
     """Gemini returned JSON, but it could not be safely mapped to the input batch."""
+
+
+def _sanitize_translation_text(value: str) -> str:
+    """Normalize model output and remove invisible control bytes unsafe for XeTeX."""
+    value = unicodedata.normalize("NFC", value or "")
+    out: list[str] = []
+    for ch in value:
+        if ch in {"\n", "\t"}:
+            out.append(ch)
+            continue
+        if unicodedata.category(ch).startswith("C"):
+            continue
+        if ch == "\u0338":
+            continue
+        out.append(ch)
+    return "".join(out).strip()
 
 
 def _chunks(
@@ -194,9 +211,12 @@ def _translate_batch_once(
 
     cleaned: list[str] = []
     for i, value in enumerate(translations):
-        if not isinstance(value, str) or not value.strip():
+        if not isinstance(value, str):
+            raise GeminiOutputError(f"Gemini returned a non-string translation at index {i}")
+        sanitized = _sanitize_translation_text(value)
+        if not sanitized:
             raise GeminiOutputError(f"Gemini returned an empty translation at index {i}")
-        cleaned.append(value.strip())
+        cleaned.append(sanitized)
 
     return cleaned
 

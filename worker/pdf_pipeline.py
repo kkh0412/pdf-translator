@@ -6,6 +6,7 @@ import re
 import shutil
 import statistics
 import subprocess
+import unicodedata
 from pathlib import Path
 
 import pymupdf
@@ -25,7 +26,31 @@ SERIF_MARKERS = (
 )
 
 
+def _sanitize_unicode(text: str, keep_newlines: bool = False) -> str:
+    """Normalize PDF/model text and remove control code points unsafe for XeTeX."""
+    text = unicodedata.normalize("NFC", text or "")
+    out: list[str] = []
+    for ch in text:
+        if ch == "\n" and keep_newlines:
+            out.append(ch)
+            continue
+        if ch in {"\t", "\r", "\n"}:
+            out.append(" ")
+            continue
+        # PDF extraction can contain NUL and other invisible control/private
+        # characters. They are not document content and can make XeTeX abort.
+        if unicodedata.category(ch).startswith("C"):
+            continue
+        # NFC composes common negated symbols (= + overlay -> ≠, ∈ + overlay -> ∉).
+        # Drop a remaining standalone combining solidus overlay.
+        if ch == "\u0338":
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
 def _clean_text(text: str, keep_newlines: bool = False) -> str:
+    text = _sanitize_unicode(text, keep_newlines=keep_newlines)
     if keep_newlines:
         lines = [" ".join(x.split()) for x in text.splitlines()]
         return "\n".join(x for x in lines if x)
@@ -414,9 +439,110 @@ LATEX_REPLACEMENTS = {
     "^": r"\textasciicircum{}",
 }
 
+# PDF text often contains Unicode math glyphs inside prose blocks. Kp text
+# fonts intentionally do not cover every mathematical symbol. Convert those
+# glyphs to real LaTeX math commands instead of relying on text-font coverage.
+UNICODE_MATH_REPLACEMENTS = {
+    "∈": r"\ensuremath{\in}",
+    "∉": r"\ensuremath{\notin}",
+    "∋": r"\ensuremath{\ni}",
+    "∅": r"\ensuremath{\varnothing}",
+    "∩": r"\ensuremath{\cap}",
+    "∪": r"\ensuremath{\cup}",
+    "⊂": r"\ensuremath{\subset}",
+    "⊆": r"\ensuremath{\subseteq}",
+    "⊃": r"\ensuremath{\supset}",
+    "⊇": r"\ensuremath{\supseteq}",
+    "≠": r"\ensuremath{\neq}",
+    "≮": r"\ensuremath{\not<}",
+    "≯": r"\ensuremath{\not>}",
+    "≤": r"\ensuremath{\leq}",
+    "≥": r"\ensuremath{\geq}",
+    "≈": r"\ensuremath{\approx}",
+    "≃": r"\ensuremath{\simeq}",
+    "≅": r"\ensuremath{\cong}",
+    "≡": r"\ensuremath{\equiv}",
+    "∼": r"\ensuremath{\sim}",
+    "∝": r"\ensuremath{\propto}",
+    "±": r"\ensuremath{\pm}",
+    "∓": r"\ensuremath{\mp}",
+    "×": r"\ensuremath{\times}",
+    "÷": r"\ensuremath{\div}",
+    "·": r"\ensuremath{\cdot}",
+    "⋅": r"\ensuremath{\cdot}",
+    "∑": r"\ensuremath{\sum}",
+    "∏": r"\ensuremath{\prod}",
+    "∫": r"\ensuremath{\int}",
+    "∮": r"\ensuremath{\oint}",
+    "∞": r"\ensuremath{\infty}",
+    "∂": r"\ensuremath{\partial}",
+    "∇": r"\ensuremath{\nabla}",
+    "∀": r"\ensuremath{\forall}",
+    "∃": r"\ensuremath{\exists}",
+    "¬": r"\ensuremath{\neg}",
+    "∧": r"\ensuremath{\wedge}",
+    "∨": r"\ensuremath{\vee}",
+    "→": r"\ensuremath{\to}",
+    "←": r"\ensuremath{\leftarrow}",
+    "↔": r"\ensuremath{\leftrightarrow}",
+    "⇒": r"\ensuremath{\Rightarrow}",
+    "⇐": r"\ensuremath{\Leftarrow}",
+    "⇔": r"\ensuremath{\Leftrightarrow}",
+    "↦": r"\ensuremath{\mapsto}",
+    "⊕": r"\ensuremath{\oplus}",
+    "⊗": r"\ensuremath{\otimes}",
+    "⊥": r"\ensuremath{\perp}",
+    "∥": r"\ensuremath{\parallel}",
+    "ℝ": r"\ensuremath{\mathbb{R}}",
+    "ℂ": r"\ensuremath{\mathbb{C}}",
+    "ℤ": r"\ensuremath{\mathbb{Z}}",
+    "ℚ": r"\ensuremath{\mathbb{Q}}",
+    "ℕ": r"\ensuremath{\mathbb{N}}",
+    "α": r"\ensuremath{\alpha}",
+    "β": r"\ensuremath{\beta}",
+    "γ": r"\ensuremath{\gamma}",
+    "δ": r"\ensuremath{\delta}",
+    "ε": r"\ensuremath{\epsilon}",
+    "ζ": r"\ensuremath{\zeta}",
+    "η": r"\ensuremath{\eta}",
+    "θ": r"\ensuremath{\theta}",
+    "ι": r"\ensuremath{\iota}",
+    "κ": r"\ensuremath{\kappa}",
+    "λ": r"\ensuremath{\lambda}",
+    "μ": r"\ensuremath{\mu}",
+    "ν": r"\ensuremath{\nu}",
+    "ξ": r"\ensuremath{\xi}",
+    "π": r"\ensuremath{\pi}",
+    "ρ": r"\ensuremath{\rho}",
+    "σ": r"\ensuremath{\sigma}",
+    "τ": r"\ensuremath{\tau}",
+    "φ": r"\ensuremath{\phi}",
+    "χ": r"\ensuremath{\chi}",
+    "ψ": r"\ensuremath{\psi}",
+    "ω": r"\ensuremath{\omega}",
+    "Γ": r"\ensuremath{\Gamma}",
+    "Δ": r"\ensuremath{\Delta}",
+    "Θ": r"\ensuremath{\Theta}",
+    "Λ": r"\ensuremath{\Lambda}",
+    "Ξ": r"\ensuremath{\Xi}",
+    "Π": r"\ensuremath{\Pi}",
+    "Σ": r"\ensuremath{\Sigma}",
+    "Φ": r"\ensuremath{\Phi}",
+    "Ψ": r"\ensuremath{\Psi}",
+    "Ω": r"\ensuremath{\Omega}",
+}
+
 
 def _latex_escape(text: str) -> str:
-    return "".join(LATEX_REPLACEMENTS.get(ch, ch) for ch in text)
+    text = _sanitize_unicode(text, keep_newlines=True)
+    out: list[str] = []
+    for ch in text:
+        math_replacement = UNICODE_MATH_REPLACEMENTS.get(ch)
+        if math_replacement is not None:
+            out.append(math_replacement)
+        else:
+            out.append(LATEX_REPLACEMENTS.get(ch, ch))
+    return "".join(out)
 
 
 def _latex_text(text: str, preserve_lines: bool = False) -> str:
@@ -666,6 +792,10 @@ def build_latex(profile: dict, nodes: list[dict], translations: dict[str, str], 
 def compile_latex(tex_source: str, work_dir: Path, output_path: Path) -> None:
     work_dir.mkdir(parents=True, exist_ok=True)
     tex_path = work_dir / "translated.tex"
+    # Final boundary check: never pass hidden PDF/OCR control bytes to XeTeX.
+    tex_source = _sanitize_unicode(tex_source, keep_newlines=True)
+    if "\x00" in tex_source:
+        raise RuntimeError("Internal error: NUL remained in generated LaTeX")
     tex_path.write_text(tex_source, encoding="utf-8")
 
     engine = shutil.which("xelatex")

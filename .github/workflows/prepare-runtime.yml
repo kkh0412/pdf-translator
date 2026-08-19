@@ -1,0 +1,99 @@
+name: Prepare PDF runtime cache
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'worker/requirements.txt'
+      - 'worker/latex_requirements.txt'
+      - 'worker/setup_runtime.sh'
+      - '.github/workflows/prepare-runtime.yml'
+      - '.github/workflows/process-pdf.yml'
+  schedule:
+    # GitHub can evict caches that are not accessed for a week. Touch twice weekly.
+    - cron: '23 3 * * 1,4'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pdf-runtime-cache
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Restore prepared runtime cache
+        id: runtime-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ~/.TinyTeX
+            ~/.cache/pdf-translator-fonts
+            .venv
+          key: ${{ runner.os }}-${{ runner.arch }}-pdf-translator-runtime-v5-${{ hashFiles('worker/requirements.txt', 'worker/latex_requirements.txt') }}
+
+      - name: Build runtime on first run only
+        if: steps.runtime-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: bash worker/setup_runtime.sh
+
+      - name: Smoke-test XeLaTeX before saving new cache
+        if: steps.runtime-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          export PATH="$HOME/.TinyTeX/bin/x86_64-linux:$PATH"
+          testdir="$(mktemp -d)"
+          mkdir -p "$testdir/font"
+          cp "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Regular.ttf" "$testdir/font/"
+          cp "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Bold.ttf" "$testdir/font/"
+          cp "$HOME/.cache/pdf-translator-fonts/KpRoman-Regular.otf" "$testdir/font/"
+          cp "$HOME/.cache/pdf-translator-fonts/KpRoman-Italic.otf" "$testdir/font/"
+          cp "$HOME/.cache/pdf-translator-fonts/KpRoman-Bold.otf" "$testdir/font/"
+          cp "$HOME/.cache/pdf-translator-fonts/KpRoman-BoldItalic.otf" "$testdir/font/"
+
+          cat > "$testdir/smoke.tex" <<'EOF'
+          \documentclass[10pt]{article}
+          \usepackage{fontspec}
+          \usepackage{xetexko}
+          \usepackage{amsmath,amssymb}
+          \setmainfont[
+            Path={font/},
+            UprightFont=KpRoman-Regular.otf,
+            ItalicFont=KpRoman-Italic.otf,
+            BoldFont=KpRoman-Bold.otf,
+            BoldItalicFont=KpRoman-BoldItalic.otf
+          ]{KpRoman-Regular.otf}
+          \setmainhangulfont[
+            Path={font/},
+            UprightFont=NanumMyeongjo-Regular.ttf,
+            BoldFont=NanumMyeongjo-Bold.ttf
+          ]{NanumMyeongjo-Regular.ttf}
+          \begin{document}
+          한국어 book text. English. $\rho\in M$, $A\neq B$, $A\cap B=\varnothing$.
+          \end{document}
+          EOF
+
+          (cd "$testdir" && xelatex -interaction=nonstopmode -halt-on-error smoke.tex >/dev/null)
+          test -s "$testdir/smoke.pdf"
+          rm -rf "$testdir"
+
+      - name: Save prepared runtime cache now
+        if: steps.runtime-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.TinyTeX
+            ~/.cache/pdf-translator-fonts
+            .venv
+          key: ${{ steps.runtime-cache.outputs.cache-primary-key }}
+
+      - name: Runtime cache ready
+        run: echo "TinyTeX, fonts and Python environment are cached."
