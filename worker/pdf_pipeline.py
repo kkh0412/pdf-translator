@@ -406,6 +406,258 @@ def _contains_bare_math_transport(text: str) -> bool:
     return bool(_BARE_MATH_TRANSPORT_RE.search(str(text or "")))
 
 
+
+_MATH_TRANSPORT_COMMAND = re.compile(
+    r"§(?:"
+    r"math(?:cal|bf|rm|sf|tt)?|"
+    r"boldsymbol|mathbf|mathrm|operatorname|text(?:sf|bf|it|tt|rm)?|"
+    r"frac|dfrac|tfrac|sqrt|sum|prod|int|iint|iiint|oint|lim|log|ln|exp|"
+    r"alpha|beta|gamma|delta|epsilon|varepsilon|zeta|eta|theta|vartheta|"
+    r"iota|kappa|lambda|mu|nu|xi|pi|varpi|rho|varrho|sigma|varsigma|"
+    r"tau|upsilon|phi|varphi|chi|psi|omega|"
+    r"Gamma|Delta|Theta|Lambda|Xi|Pi|Sigma|Upsilon|Phi|Psi|Omega|"
+    r"otimes|oplus|ominus|odot|times|cdot|pm|mp|"
+    r"Vert|vert|lVert|rVert|lvert|rvert|langle|rangle|left|right|"
+    r"dagger|ddagger|star|ast|infty|in|notin|subset|subseteq|supset|supseteq|"
+    r"leq|geq|neq|approx|sim|simeq|cong|propto|to|mapsto|"
+    r"cap|cup|wedge|vee|forall|exists|partial|nabla|"
+    r"widehat|widetilde|hat|tilde|bar|overline|underline|"
+    r"underbrace|overbrace|"
+    r"ket|bra|braket|mel|Tr|rank|supp|diag|coloneq|coloneqq"
+    r")(?=$|[^A-Za-z])"
+)
+
+
+def _is_transport_command_at(text: str, index: int) -> bool:
+    return bool(_MATH_TRANSPORT_COMMAND.match(text, index))
+
+
+def _find_transport_commands(text: str) -> list[re.Match]:
+    return list(_MATH_TRANSPORT_COMMAND.finditer(str(text or "")))
+
+
+def _balanced_group_end(
+    text: str,
+    index: int,
+    open_char: str,
+    close_char: str,
+) -> int:
+    if index >= len(text) or text[index] != open_char:
+        return index
+
+    depth = 0
+    i = index
+    while i < len(text):
+        ch = text[i]
+        if ch == open_char:
+            depth += 1
+        elif ch == close_char:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+
+    return index
+
+
+def _consume_transport_command(text: str, start: int) -> int:
+    match = _MATH_TRANSPORT_COMMAND.match(text, start)
+    if not match:
+        return start
+
+    i = match.end()
+    command = match.group(0)
+
+    # Vision may emit formatting commands in either §mathcal{M} or §mathcal M form.
+    if command in {
+        "§mathcal", "§mathbf", "§mathrm", "§mathsf", "§mathtt",
+        "§boldsymbol", "§hat", "§tilde", "§bar", "§widehat",
+        "§widetilde", "§overline", "§underline",
+    }:
+        j = i
+        while j < len(text) and text[j] == " ":
+            j += 1
+
+        if j < len(text):
+            if text[j] == "{":
+                after = _balanced_group_end(text, j, "{", "}")
+                if after > j:
+                    i = after
+            elif text[j].isalnum():
+                i = j + 1
+
+    # Explicit brace arguments such as §frac{a}{b}, §sqrt{x}, §text{...}.
+    while i < len(text) and text[i] == "{":
+        after = _balanced_group_end(text, i, "{", "}")
+        if after <= i:
+            break
+        i = after
+
+    # Direct scripts.
+    while i < len(text) and text[i] in "_^":
+        i += 1
+
+        if i < len(text) and text[i] == "{":
+            after = _balanced_group_end(text, i, "{", "}")
+            if after <= i:
+                break
+            i = after
+        elif i < len(text) and text[i] == "§":
+            after = _consume_transport_command(text, i)
+            i = after if after > i else i + 1
+        elif i < len(text):
+            i += 1
+
+    return i
+
+
+_MATHISH_CONTIGUOUS = set(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    "_^{}()[]|=+-*/,:.<>"
+)
+
+
+def _expand_math_transport_span(
+    text: str,
+    command_start: int,
+    command_end: int,
+) -> tuple[int, int]:
+    """Recover the maximal contiguous inline formula containing §command."""
+    left = command_start
+    right = command_end
+
+    while left > 0 and text[left - 1] in _MATHISH_CONTIGUOUS:
+        left -= 1
+
+    while right < len(text):
+        if text[right] == "§" and _is_transport_command_at(text, right):
+            after = _consume_transport_command(text, right)
+            if after > right:
+                right = after
+                continue
+
+        if text[right] in _MATHISH_CONTIGUOUS:
+            right += 1
+            continue
+
+        break
+
+    # If the initial command sits inside C_{§mathcal{M}} or D(§rho...), absorb
+    # immediately adjacent closing delimiters until the local token is balanced.
+    pairs = (("{", "}"), ("(", ")"), ("[", "]"))
+    for open_char, close_char in pairs:
+        segment = text[left:right]
+        opens = segment.count(open_char)
+        closes = segment.count(close_char)
+
+        while closes < opens and right < len(text) and text[right] == close_char:
+            right += 1
+            closes += 1
+
+        while opens < closes and left > 0 and text[left - 1] == open_char:
+            left -= 1
+            opens += 1
+
+    return left, right
+
+
+def _merge_overlapping_spans(
+    spans: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    if not spans:
+        return []
+
+    merged: list[list[int]] = []
+    for start, end in sorted(spans):
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+
+    return [(item[0], item[1]) for item in merged]
+
+
+def _trim_terminal_prose_punctuation(
+    text: str,
+    start: int,
+    end: int,
+) -> tuple[int, int]:
+    """Keep sentence punctuation outside the inline math placeholder.
+
+    Internal punctuation stays untouched. Thus:
+      §gamma,                       -> math §gamma + prose comma
+      D(§rho§Vert§gamma).           -> math D(...) + prose period
+      S_{§mathcal M,§gamma}^{(j)}   -> internal comma remains math
+    """
+    while end > start and text[end - 1] in ",.;:":
+        end -= 1
+    return start, end
+
+
+def _split_text_with_bare_transport(
+    text: str,
+) -> list[tuple[str, str]]:
+    """Convert only recognized § LaTeX transport syntax into math segments."""
+    text = _clean_prose_text(text)
+    matches = _find_transport_commands(text)
+
+    if not matches:
+        return [("text", text)]
+
+    spans: list[tuple[int, int]] = []
+
+    for match in matches:
+        consumed = _consume_transport_command(text, match.start())
+        start, end = _expand_math_transport_span(
+            text,
+            match.start(),
+            max(match.end(), consumed),
+        )
+        spans.append((start, end))
+
+    spans = _merge_overlapping_spans(spans)
+    spans = [
+        _trim_terminal_prose_punctuation(text, start, end)
+        for start, end in spans
+    ]
+
+    result: list[tuple[str, str]] = []
+    cursor = 0
+
+    for start, end in spans:
+        if end <= start:
+            continue
+
+        if start > cursor:
+            result.append(("text", text[cursor:start]))
+
+        formula = text[start:end].strip()
+        if formula:
+            result.append(("math", formula))
+
+        cursor = end
+
+    if cursor < len(text):
+        result.append(("text", text[cursor:]))
+
+    return result or [("text", text)]
+
+
+def _recover_all_math_from_text(
+    text: str,
+) -> list[tuple[str, str]]:
+    """Recover §math{...} wrappers, then bare transport in remaining prose."""
+    recovered: list[tuple[str, str]] = []
+
+    for part_type, content in _split_text_with_leaked_math(text):
+        if part_type == "math":
+            recovered.append(("math", content))
+        else:
+            recovered.extend(_split_text_with_bare_transport(content))
+
+    return recovered
+
+
 def _assemble_source(block: dict) -> tuple[str, dict[str, str]]:
     pieces: list[str] = []
     math_map: dict[str, str] = {}
@@ -413,33 +665,39 @@ def _assemble_source(block: dict) -> tuple[str, dict[str, str]]:
 
     def append_math(content: str) -> None:
         nonlocal math_index
+
+        cleaned = _clean_math(content)
+        if not cleaned:
+            return
+
         token = f"[[MATH_{math_index}]]"
-        math_map[token] = _clean_math(content)
+        math_map[token] = cleaned
         pieces.append(token)
         math_index += 1
 
     for part in block.get("parts", []):
-        ptype = part.get("type")
+        part_type = part.get("type")
         content = str(part.get("content", ""))
 
-        if ptype == "math":
+        if part_type == "math":
             append_math(content)
             continue
 
-        for recovered_type, recovered_content in _split_text_with_leaked_math(content):
+        for recovered_type, recovered_content in _recover_all_math_from_text(content):
             if recovered_type == "math":
                 append_math(recovered_content)
             else:
-                clean_text = _clean_prose_text(recovered_content)
-                if _contains_bare_math_transport(clean_text):
-                    raise RuntimeError(
-                        "Vision leaked a bare JSON-safe math transport token "
-                        f"into prose: {clean_text[:180]}"
-                    )
-                pieces.append(clean_text)
+                pieces.append(_clean_prose_text(recovered_content))
 
     source = "".join(pieces).strip()
     source = re.sub(r"[ \t\r\n]+", " ", source)
+
+    if _contains_bare_math_transport(source):
+        raise RuntimeError(
+            "Unrecoverable JSON-safe math transport remained in prose after "
+            f"automatic inline-math recovery: {source[:240]}"
+        )
+
     return source, math_map
 
 
@@ -448,7 +706,7 @@ def _render_translated_text(text: str, math_map: dict[str, str]) -> str:
 
     if _contains_bare_math_transport(text) or "\\math{" in text:
         raise RuntimeError(
-            "Internal math transport marker reached final text rendering"
+            "Unprotected math transport marker reached final text rendering"
         )
 
     out: list[str] = []

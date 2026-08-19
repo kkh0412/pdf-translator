@@ -1,4 +1,4 @@
-runtime-cache-version=7.0
+runtime-cache-version=7.1
 runner=ubuntu-24.04
 python=3.12-system
 tinytex=2026.07

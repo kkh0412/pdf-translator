@@ -1,35 +1,38 @@
-# PDF Translator v7.0
+# PDF Translator v7.1
 
-## Tables are real LaTeX
+## Fixed: bare math transport embedded in prose
 
-Tables are no longer cropped into images. Vision reconstructs logical rows,
-cells, horizontal colspans, header rows, alignments, cell emphasis, and inline
-math. Each text cell is translated independently with math protected, and the
-final PDF renders the result with `tabularx` and `booktabs`.
+v7.0 could still abort a page when Vision returned a normal prose block with a
+small inline formula mistakenly encoded inside the text part.
 
-A table is reconstructed semantically even when the source table itself is a
-bitmap. Captions and notes remain separate document blocks.
+v7.1 repairs this deterministically before translation:
 
-## Figures preserve their source representation
+    §rho
+      -> \rho
 
-The worker now inspects the source PDF object structure inside each figure bbox.
+    §Pi_y
+      -> \Pi_y
 
-- Bitmap-only visual: keeps the original PNG/JPEG bytes when the bbox matches
-  the embedded image; cropped bitmap regions remain raster at approximately
-  their native source sampling density.
-- Vector visual: clips the original source PDF region into a standalone PDF
-  asset, preserving paths and PDF text as vector content.
-- Mixed raster + vector visual: also uses a clipped PDF, preserving both kinds
-  of source objects without flattening them into PNG.
+    C_{§mathcal{M}}
+      -> C_{\mathcal{M}}
 
-Equations and tables are never treated as figure assets.
+    D(§rho§Vert§gamma)
+      -> D(\rho\Vert\gamma)
 
-## Retained from v6.x
+    S_{§mathcal M,§gamma}^{(j)}
+      -> S_{\mathcal M,\gamma}^{(j)}
 
-- 100-page limit
-- homepage `대관령산양의 번역기`
-- Unicode-name / math-transport repair
-- source bold-weight preservation
-- text-integrity validation
-- Gemini rate-limit handling
-- robust mathematical preflight and source-aware repair
+The recovered formula is stored behind the normal `[[MATH_n]]` placeholder, so
+the translation model cannot alter it.
+
+Sentence punctuation remains prose:
+`§gamma,` protects only `\gamma`, while the comma remains outside the math span.
+Internal punctuation such as the comma in `S_{\mathcal M,\gamma}` remains inside
+the formula.
+
+Only recognized mathematical transport commands are consumed. `§afránek` and
+literal `§ 3` remain prose and retain the v6.14 source-text correction path.
+
+The Vision prompt also explicitly forbids §-based math transport in text parts.
+
+All v7.0 semantic LaTeX tables and source-native vector/raster figures remain.
