@@ -429,28 +429,43 @@ def _pt(v: float) -> str:
     return f"{v:.2f}pt"
 
 
-def _font_setup(profile: dict, korean_font_dir: Path) -> str:
-    # The sample source uses Kp fonts. For other serif documents, Kp remains a
-    # book-oriented fallback; sans sources use TeX Gyre Heros for Latin text.
-    if profile["serif"]:
-        latin = r"\usepackage{kpfonts-otf}"
-    else:
-        latin = r"\setmainfont{TeX Gyre Heros}"
+def _font_setup(profile: dict, font_dir: Path) -> str:
+    """Use Kp OpenType font files directly instead of kpfonts-otf.sty.
 
-    path = str(korean_font_dir.resolve()).replace("\\", "/") + "/"
-    return rf"""
-{latin}
+    This keeps the source document's Kp-style typography while avoiding
+    kpfonts-otf.sty's package dependencies (realscripts / unicode-math).
+    """
+    if profile.get("serif", True):
+        latin = r"""
+\setmainfont[
+  Path={font/},
+  UprightFont=KpRoman-Regular.otf,
+  ItalicFont=KpRoman-Italic.otf,
+  BoldFont=KpRoman-Bold.otf,
+  BoldItalicFont=KpRoman-BoldItalic.otf
+]{KpRoman-Regular.otf}
+"""
+    else:
+        latin = r"""
+\setmainfont[
+  Path={font/},
+  UprightFont=KpSans-Regular.otf,
+  ItalicFont=KpSans-Italic.otf,
+  BoldFont=KpSans-Bold.otf,
+  BoldItalicFont=KpSans-BoldItalic.otf
+]{KpSans-Regular.otf}
+"""
+    return latin + r"""
 \setmainhangulfont[
-  Path={{{path}}},
+  Path={font/},
   UprightFont=NanumMyeongjo-Regular.ttf,
   BoldFont=NanumMyeongjo-Bold.ttf,
   ItalicFont=NanumMyeongjo-Regular.ttf,
-  ItalicFeatures={{FakeSlant=0.13}},
+  ItalicFeatures={FakeSlant=0.13},
   BoldItalicFont=NanumMyeongjo-Bold.ttf,
-  BoldItalicFeatures={{FakeSlant=0.13}}
-]{{NanumMyeongjo-Regular.ttf}}
+  BoldItalicFeatures={FakeSlant=0.13}
+]{NanumMyeongjo-Regular.ttf}
 """
-
 
 def _latex_topic(text: str) -> str:
     """Keep topic numbering and trailing lecture count light, with only the title bold."""
@@ -468,25 +483,60 @@ def _latex_topic(text: str) -> str:
 
 
 def build_latex(profile: dict, nodes: list[dict], translations: dict[str, str], work_dir: Path) -> str:
-    korean_font_dir = Path(os.getenv("KOREAN_FONT_DIR", "/usr/share/fonts/truetype/nanum"))
-    regular = korean_font_dir / "NanumMyeongjo-Regular.ttf"
-    bold = korean_font_dir / "NanumMyeongjo-Bold.ttf"
-    # Debian/Ubuntu uses slightly different filenames locally; support both.
-    if not regular.exists():
-        regular = korean_font_dir / "NanumMyeongjo.ttf"
-    if not bold.exists():
-        bold = korean_font_dir / "NanumMyeongjoBold.ttf"
-    if not regular.exists() or not bold.exists():
+    source_font_dir = Path(
+        os.getenv("BOOK_FONT_DIR", os.getenv("KOREAN_FONT_DIR", "/usr/share/fonts/truetype/nanum"))
+    )
+
+    korean_regular_candidates = [
+        source_font_dir / "NanumMyeongjo-Regular.ttf",
+        source_font_dir / "NanumMyeongjo.ttf",
+        Path("/usr/share/fonts/truetype/nanum/NanumMyeongjo.ttf"),
+    ]
+    korean_bold_candidates = [
+        source_font_dir / "NanumMyeongjo-Bold.ttf",
+        source_font_dir / "NanumMyeongjoBold.ttf",
+        Path("/usr/share/fonts/truetype/nanum/NanumMyeongjoBold.ttf"),
+    ]
+
+    def first_existing(paths: list[Path]) -> Path | None:
+        return next((x for x in paths if x.exists()), None)
+
+    korean_regular = first_existing(korean_regular_candidates)
+    korean_bold = first_existing(korean_bold_candidates)
+    if not korean_regular or not korean_bold:
         raise RuntimeError(
-            f"Korean book font files were not found in {korean_font_dir}. "
-            "The GitHub workflow should cache/download NanumMyeongjo-Regular.ttf and NanumMyeongjo-Bold.ttf."
+            f"Korean book font files were not found in {source_font_dir}. "
+            "Expected NanumMyeongjo regular and bold font files."
         )
 
-    # Put canonical names in work/font so the TeX template is independent of host filenames.
+    if profile.get("serif", True):
+        latin_names = [
+            "KpRoman-Regular.otf",
+            "KpRoman-Italic.otf",
+            "KpRoman-Bold.otf",
+            "KpRoman-BoldItalic.otf",
+        ]
+    else:
+        latin_names = [
+            "KpSans-Regular.otf",
+            "KpSans-Italic.otf",
+            "KpSans-Bold.otf",
+            "KpSans-BoldItalic.otf",
+        ]
+
+    missing_latin = [name for name in latin_names if not (source_font_dir / name).exists()]
+    if missing_latin:
+        raise RuntimeError(
+            "Book Latin font files are missing from "
+            f"{source_font_dir}: {', '.join(missing_latin)}"
+        )
+
     font_dir = work_dir / "font"
     font_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(regular, font_dir / "NanumMyeongjo-Regular.ttf")
-    shutil.copy2(bold, font_dir / "NanumMyeongjo-Bold.ttf")
+    shutil.copy2(korean_regular, font_dir / "NanumMyeongjo-Regular.ttf")
+    shutil.copy2(korean_bold, font_dir / "NanumMyeongjo-Bold.ttf")
+    for name in latin_names:
+        shutil.copy2(source_font_dir / name, font_dir / name)
 
     base = profile["base_font_size"]
     class_options = "10pt,twoside" if profile.get("twoside") else "10pt"
@@ -509,7 +559,7 @@ def build_latex(profile: dict, nodes: list[dict], translations: dict[str, str], 
             f"  bottom={_pt(profile['bottom_margin'])}"
         )
 
-    latin_setup = r"\usepackage{kpfonts-otf}" if profile.get("serif", True) else r"\setmainfont{TeX Gyre Heros}"
+    latin_setup = _font_setup(profile, font_dir)
 
     preamble = rf"""\documentclass[{class_options}]{{article}}
 \usepackage{{fontspec}}
@@ -522,15 +572,6 @@ def build_latex(profile: dict, nodes: list[dict], translations: dict[str, str], 
   {geometry_lines}
 }}
 {latin_setup}
-\setmainhangulfont[
-  Path={{font/}},
-  UprightFont=NanumMyeongjo-Regular.ttf,
-  BoldFont=NanumMyeongjo-Bold.ttf,
-  ItalicFont=NanumMyeongjo-Regular.ttf,
-  ItalicFeatures={{FakeSlant=0.13}},
-  BoldItalicFont=NanumMyeongjo-Bold.ttf,
-  BoldItalicFeatures={{FakeSlant=0.13}}
-]{{NanumMyeongjo-Regular.ttf}}
 \AtBeginDocument{{\fontsize{{{base:.2f}pt}}{{{base*1.27:.2f}pt}}\selectfont}}
 \setlength{{\parindent}}{{0pt}}
 \setlength{{\parskip}}{{0.43em}}

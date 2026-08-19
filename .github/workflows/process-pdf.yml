@@ -61,7 +61,7 @@ jobs:
           # New key fixes the old cache that was missing cjk-ko.
           # restore-keys lets us reuse the old TinyTeX download and only add
           # the missing package on the first v5.1 run.
-          key: ${{ runner.os }}-pdf-translator-latex-v5-2-coredeps-2026-08
+          key: ${{ runner.os }}-pdf-translator-latex-v5-3-direct-kp-fonts-2026-08
           restore-keys: |
             ${{ runner.os }}-pdf-translator-latex-v5-
 
@@ -90,18 +90,33 @@ jobs:
           set -euxo pipefail
           export PATH="$HOME/.TinyTeX/bin/x86_64-linux:$PATH"
 
-          # xetexko needs cjk-ko for kolabels-utf.sty / konames-utf.sty.
-          # tlmgr skips packages that are already installed, so after the new
-          # cache is saved this step is effectively only a quick check.
-          tlmgr install kpfonts-otf xetexko cjk-ko enumitem geometry graphics amsmath amsfonts tex-gyre
+          # Install only packages actually loaded by translated.tex.
+          # kpfonts-otf is installed ONLY as a source of Kp OTF font files.
+          # We deliberately do not load kpfonts-otf.sty, so its
+          # realscripts/unicode-math dependencies are irrelevant.
+          tlmgr install \
+            kpfonts-otf \
+            xetexko \
+            cjk-ko \
+            enumitem \
+            geometry \
+            graphics \
+            amsmath \
+            amsfonts
+
+          # Verify every .sty used by our generated preamble.
+          kpsewhich fontspec.sty
+          kpsewhich xetexko.sty
           kpsewhich kolabels-utf.sty
           kpsewhich geometry.sty
+          kpsewhich graphicx.sty
           kpsewhich enumitem.sty
           kpsewhich amsmath.sty
           kpsewhich amssymb.sty
-          kpsewhich kpfonts-otf.sty
 
           mkdir -p "$HOME/.cache/pdf-translator-fonts"
+
+          # Download Korean book fonts once; actions/cache reuses them.
           if [ ! -f "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Regular.ttf" ]; then
             curl -fL --retry 3 \
               -o "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Regular.ttf" \
@@ -113,8 +128,87 @@ jobs:
               https://raw.githubusercontent.com/google/fonts/main/ofl/nanummyeongjo/NanumMyeongjo-Bold.ttf
           fi
 
+          # Copy Kp font files out of the TeX tree into the persistent font cache.
+          for font in \
+            KpRoman-Regular.otf \
+            KpRoman-Italic.otf \
+            KpRoman-Bold.otf \
+            KpRoman-BoldItalic.otf \
+            KpSans-Regular.otf \
+            KpSans-Italic.otf \
+            KpSans-Bold.otf \
+            KpSans-BoldItalic.otf
+          do
+            src="$(kpsewhich "$font")"
+            test -n "$src"
+            cp -f "$src" "$HOME/.cache/pdf-translator-fonts/$font"
+          done
+
           test -f "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Regular.ttf"
           test -f "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Bold.ttf"
+          test -f "$HOME/.cache/pdf-translator-fonts/KpRoman-Regular.otf"
+          test -f "$HOME/.cache/pdf-translator-fonts/KpRoman-Italic.otf"
+          test -f "$HOME/.cache/pdf-translator-fonts/KpRoman-Bold.otf"
+          test -f "$HOME/.cache/pdf-translator-fonts/KpRoman-BoldItalic.otf"
+
+      - name: Compile LaTeX smoke test
+        if: steps.queue.outputs.has_jobs == 'true'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export PATH="$HOME/.TinyTeX/bin/x86_64-linux:$PATH"
+
+          testdir="$(mktemp -d)"
+          mkdir -p "$testdir/font"
+          cp "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Regular.ttf" "$testdir/font/"
+          cp "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Bold.ttf" "$testdir/font/"
+          cp "$HOME/.cache/pdf-translator-fonts/KpRoman-Regular.otf" "$testdir/font/"
+          cp "$HOME/.cache/pdf-translator-fonts/KpRoman-Italic.otf" "$testdir/font/"
+          cp "$HOME/.cache/pdf-translator-fonts/KpRoman-Bold.otf" "$testdir/font/"
+          cp "$HOME/.cache/pdf-translator-fonts/KpRoman-BoldItalic.otf" "$testdir/font/"
+
+          cat > "$testdir/smoke.tex" <<'EOF'
+          \documentclass[10pt]{article}
+          \usepackage{fontspec}
+          \usepackage{xetexko}
+          \usepackage{geometry}
+          \usepackage{graphicx}
+          \usepackage{enumitem}
+          \usepackage{amsmath,amssymb}
+          \geometry{margin=22mm}
+          \setmainfont[
+            Path={font/},
+            UprightFont=KpRoman-Regular.otf,
+            ItalicFont=KpRoman-Italic.otf,
+            BoldFont=KpRoman-Bold.otf,
+            BoldItalicFont=KpRoman-BoldItalic.otf
+          ]{KpRoman-Regular.otf}
+          \setmainhangulfont[
+            Path={font/},
+            UprightFont=NanumMyeongjo-Regular.ttf,
+            BoldFont=NanumMyeongjo-Bold.ttf,
+            ItalicFont=NanumMyeongjo-Regular.ttf,
+            ItalicFeatures={FakeSlant=0.13},
+            BoldItalicFont=NanumMyeongjo-Bold.ttf,
+            BoldItalicFeatures={FakeSlant=0.13}
+          ]{NanumMyeongjo-Regular.ttf}
+          \begin{document}
+          \textsc{Contents}
+          \begin{center}\large\scshape PH653. Quantum Field Theory I\end{center}
+          \textit{For Once, Then, Something}
+
+          \textbf{1. 국소성 원리} (1강)
+
+          한국어 본문과 English text, 수식 $E=mc^2$.
+          \begin{itemize}
+            \item 물리학에서의 국소성
+          \end{itemize}
+          \end{document}
+          EOF
+
+          (cd "$testdir" && xelatex -interaction=nonstopmode -halt-on-error -file-line-error smoke.tex)
+          test -s "$testdir/smoke.pdf"
+          rm -rf "$testdir"
 
       - name: Process queued PDFs
         if: steps.queue.outputs.has_jobs == 'true'
@@ -123,7 +217,7 @@ jobs:
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: gemini-3.5-flash-lite
-          KOREAN_FONT_DIR: /home/runner/.cache/pdf-translator-fonts
+          BOOK_FONT_DIR: /home/runner/.cache/pdf-translator-fonts
           MAX_PAGES: '20'
         run: |
           xelatex --version | head -1
