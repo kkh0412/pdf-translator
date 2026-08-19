@@ -518,8 +518,6 @@ def build_latex(profile: dict, nodes: list[dict], translations: dict[str, str], 
 \usepackage{{graphicx}}
 \usepackage{{enumitem}}
 \usepackage{{amsmath,amssymb}}
-\usepackage{{ragged2e}}
-\usepackage{{url}}
 \geometry{{
   {geometry_lines}
 }}

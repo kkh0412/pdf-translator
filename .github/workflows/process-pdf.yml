@@ -61,7 +61,7 @@ jobs:
           # New key fixes the old cache that was missing cjk-ko.
           # restore-keys lets us reuse the old TinyTeX download and only add
           # the missing package on the first v5.1 run.
-          key: ${{ runner.os }}-pdf-translator-latex-v5-1-cjkko-2026-08
+          key: ${{ runner.os }}-pdf-translator-latex-v5-2-coredeps-2026-08
           restore-keys: |
             ${{ runner.os }}-pdf-translator-latex-v5-
 
@@ -93,8 +93,13 @@ jobs:
           # xetexko needs cjk-ko for kolabels-utf.sty / konames-utf.sty.
           # tlmgr skips packages that are already installed, so after the new
           # cache is saved this step is effectively only a quick check.
-          tlmgr install kpfonts-otf xetexko cjk-ko enumitem
+          tlmgr install kpfonts-otf xetexko cjk-ko enumitem geometry graphics amsmath amsfonts tex-gyre
           kpsewhich kolabels-utf.sty
+          kpsewhich geometry.sty
+          kpsewhich enumitem.sty
+          kpsewhich amsmath.sty
+          kpsewhich amssymb.sty
+          kpsewhich kpfonts-otf.sty
 
           mkdir -p "$HOME/.cache/pdf-translator-fonts"
           if [ ! -f "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Regular.ttf" ]; then
