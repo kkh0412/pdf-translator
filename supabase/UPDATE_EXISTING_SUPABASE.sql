@@ -95,22 +95,37 @@ using (
 );
 
 -- ---------------------------------------------------------------------------
--- Immediate GitHub worker dispatch
+-- Immediate GitHub worker dispatch v6.8
 -- ---------------------------------------------------------------------------
--- One-time prerequisite:
+-- REQUIRED ONE-TIME SECRET:
 -- Supabase Dashboard > Database > Vault
--- Create a secret named exactly:
---   github_actions_token
--- Value = your existing GitHub fine-grained PAT with Actions: write for
---         kkh0412/pdf-translator.
---
--- The token never reaches browser JavaScript.
+-- name  = github_actions_token
+-- value = GitHub fine-grained PAT for kkh0412/pdf-translator
+--         Repository permission: Actions -> Read and write
 -- ---------------------------------------------------------------------------
 
-create extension if not exists pg_net;
+-- Be explicit so a partially configured database does not silently miss the
+-- dependencies required by the worker trigger.
+create extension if not exists supabase_vault with schema vault;
+create extension if not exists pg_net with schema extensions;
+create extension if not exists pg_cron;
 
-create or replace function public.dispatch_pdf_translation_worker()
-returns trigger
+alter table public.translation_jobs
+add column if not exists dispatch_attempts integer not null default 0;
+
+alter table public.translation_jobs
+add column if not exists dispatch_request_id bigint;
+
+alter table public.translation_jobs
+add column if not exists dispatch_last_at timestamptz;
+
+-- Dispatch exactly one queued job. This function can be called by both the
+-- AFTER INSERT trigger and the recovery cron.
+create or replace function public.dispatch_pdf_translation_worker(
+  p_job_id uuid,
+  p_reason text default 'insert'
+)
+returns bigint
 language plpgsql
 security definer
 set search_path = public, vault, net, pg_temp
@@ -118,9 +133,15 @@ as $$
 declare
   github_token text;
   request_id bigint;
+  current_status text;
 begin
-  if new.status <> 'queued' then
-    return new;
+  select status
+  into current_status
+  from public.translation_jobs
+  where id = p_job_id;
+
+  if current_status is distinct from 'queued' then
+    return null;
   end if;
 
   select decrypted_secret
@@ -133,13 +154,13 @@ begin
   if github_token is null or length(github_token) < 10 then
     update public.translation_jobs
     set
-      progress = 1,
+      progress = greatest(progress, 1),
       progress_message =
-        '자동 worker 설정이 완료되지 않았습니다 · Supabase Vault에 github_actions_token을 추가하세요.',
+        'GitHub worker token이 없습니다 · Supabase Vault에 github_actions_token을 추가하세요.',
       progress_updated_at = now()
-    where id = new.id;
+    where id = p_job_id;
 
-    return new;
+    return null;
   end if;
 
   begin
@@ -155,37 +176,65 @@ begin
       body := jsonb_build_object(
         'ref', 'main',
         'inputs', jsonb_build_object(
-          'job_id', new.id::text
+          'job_id', p_job_id::text
         )
       ),
-      timeout_milliseconds := 5000
+      timeout_milliseconds := 8000
     )
     into request_id;
 
     update public.translation_jobs
     set
-      progress = 2,
+      dispatch_attempts = dispatch_attempts + 1,
+      dispatch_request_id = request_id,
+      dispatch_last_at = now(),
+      progress = greatest(progress, 2),
       progress_message =
-        'GitHub worker 실행 요청 전송 완료 · runner 시작을 기다리고 있습니다.',
+        case
+          when p_reason = 'insert'
+            then 'GitHub worker 실행 요청 전송 완료 · runner 시작을 기다리고 있습니다.'
+          else 'GitHub worker 실행 요청 재전송 완료 · runner 시작을 기다리고 있습니다.'
+        end,
       progress_updated_at = now()
-    where id = new.id;
+    where id = p_job_id;
+
+    return request_id;
 
   exception
     when others then
       update public.translation_jobs
       set
-        progress = 1,
+        dispatch_attempts = dispatch_attempts + 1,
+        dispatch_last_at = now(),
+        progress = greatest(progress, 1),
         progress_message =
-          '즉시 worker 요청에 실패했습니다 · 15분 복구 worker가 다시 확인합니다.',
+          'GitHub worker 요청을 생성하지 못했습니다 · Supabase pg_net 설정을 확인하세요.',
         progress_updated_at = now()
-      where id = new.id;
-  end;
+      where id = p_job_id;
 
+      return null;
+  end;
+end;
+$$;
+
+revoke all on function public.dispatch_pdf_translation_worker(uuid, text)
+from public;
+
+-- AFTER INSERT trigger wrapper.
+create or replace function public.dispatch_pdf_translation_worker_after_insert()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  perform public.dispatch_pdf_translation_worker(new.id, 'insert');
   return new;
 end;
 $$;
 
-revoke all on function public.dispatch_pdf_translation_worker() from public;
+revoke all on function public.dispatch_pdf_translation_worker_after_insert()
+from public;
 
 drop trigger if exists dispatch_pdf_translation_worker_after_insert
 on public.translation_jobs;
@@ -193,7 +242,123 @@ on public.translation_jobs;
 create trigger dispatch_pdf_translation_worker_after_insert
 after insert on public.translation_jobs
 for each row
-execute function public.dispatch_pdf_translation_worker();
+execute function public.dispatch_pdf_translation_worker_after_insert();
+
+-- Read completed pg_net responses and turn GitHub/API errors into a message the
+-- browser can show. GitHub workflow_dispatch can return 200 or 204 depending on
+-- the REST API version; both are success.
+create or replace function public.refresh_pdf_translation_dispatch_responses()
+returns void
+language plpgsql
+security definer
+set search_path = public, net, pg_temp
+as $$
+begin
+  begin
+    update public.translation_jobs as j
+    set
+      progress_message =
+        case
+          when r.status_code in (200, 204)
+            then 'GitHub가 worker 실행 요청을 승인했습니다 · runner 시작을 기다리고 있습니다.'
+          when r.status_code = 401
+            then 'GitHub token 인증 실패(401) · Vault의 github_actions_token을 다시 확인하세요.'
+          when r.status_code = 403
+            then 'GitHub token 권한 부족(403) · pdf-translator 저장소의 Actions: Read and write 권한이 필요합니다.'
+          when r.status_code = 404
+            then 'GitHub workflow를 찾지 못했습니다(404) · 저장소/branch/process-pdf.yml을 확인하세요.'
+          when r.status_code is not null
+            then 'GitHub worker 요청 실패 · HTTP ' || r.status_code::text
+          when r.error_msg is not null
+            then 'GitHub worker 네트워크 요청 실패 · ' || left(r.error_msg, 180)
+          else j.progress_message
+        end,
+      progress = case
+        when r.status_code in (200, 204) then greatest(j.progress, 3)
+        else j.progress
+      end,
+      progress_updated_at = now()
+    from net._http_response as r
+    where
+      j.status = 'queued'
+      and j.dispatch_request_id = r.id
+      and (
+        r.status_code is not null
+        or r.error_msg is not null
+      );
+  exception
+    when undefined_table then
+      -- pg_net is beta and internal response storage may vary by version.
+      null;
+  end;
+end;
+$$;
+
+revoke all on function public.refresh_pdf_translation_dispatch_responses()
+from public;
+
+-- Recovery path that runs inside Supabase itself. If the initial INSERT trigger
+-- or GitHub request was transiently lost, retry queued jobs after ~30 seconds.
+create or replace function public.recover_queued_pdf_translation_workers()
+returns void
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  rec record;
+begin
+  perform public.refresh_pdf_translation_dispatch_responses();
+
+  for rec in
+    select id
+    from public.translation_jobs
+    where
+      status = 'queued'
+      and created_at < now() - interval '20 seconds'
+      and dispatch_attempts < 8
+      and (
+        dispatch_last_at is null
+        or dispatch_last_at < now() - interval '45 seconds'
+      )
+    order by created_at
+    limit 3
+  loop
+    perform public.dispatch_pdf_translation_worker(rec.id, 'cron-recovery');
+  end loop;
+end;
+$$;
+
+revoke all on function public.recover_queued_pdf_translation_workers()
+from public;
+
+-- Replace any previous recovery job with a sub-minute Supabase Cron job.
+do $$
+begin
+  perform cron.unschedule('pdf-translator-worker-recovery');
+exception
+  when others then null;
+end
+$$;
+
+-- Modern Supabase Cron supports interval syntax such as "30 seconds".
+-- If the project's pg_cron is older, fall back to every minute.
+do $$
+begin
+  perform cron.schedule(
+    'pdf-translator-worker-recovery',
+    '30 seconds',
+    'select public.recover_queued_pdf_translation_workers();'
+  );
+exception
+  when others then
+    perform cron.schedule(
+      'pdf-translator-worker-recovery',
+      '* * * * *',
+      'select public.recover_queued_pdf_translation_workers();'
+    );
+end
+$$;
 
 do $$
 begin
@@ -203,10 +368,24 @@ begin
     where name = 'github_actions_token'
   ) then
     raise notice
-      'PDF Translator: Vault secret github_actions_token is missing. Add it before testing automatic worker startup.';
+      'PDF Translator: github_actions_token is MISSING from Vault.';
   else
     raise notice
-      'PDF Translator: automatic GitHub worker dispatch trigger is configured.';
+      'PDF Translator: Vault token found.';
   end if;
+
+  if not exists (
+    select 1
+    from pg_trigger
+    where tgrelid = 'public.translation_jobs'::regclass
+      and tgname = 'dispatch_pdf_translation_worker_after_insert'
+      and tgenabled <> 'D'
+  ) then
+    raise exception
+      'PDF Translator: worker INSERT trigger was not installed.';
+  end if;
+
+  raise notice
+    'PDF Translator: immediate trigger + Supabase recovery cron installed.';
 end
 $$;

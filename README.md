@@ -1,30 +1,37 @@
-# PDF Translator v6.7
+# PDF Translator v6.8
 
-## Immediate worker: database-trigger architecture
+## Worker startup hardening
 
-Normal path:
-browser -> INSERT translation_jobs ->
-Postgres AFTER INSERT trigger ->
-pg_net -> GitHub workflow_dispatch(job_id) ->
-GitHub Actions.
+A `queued / 0%` job means the database INSERT trigger did not run at all.
+v6.8 makes the Supabase side self-contained:
 
-The browser no longer depends on a deployed Edge Function, eliminating the
-previous 0%-queued failure mode.
+- explicitly enables `supabase_vault`
+- explicitly enables `pg_net`
+- explicitly enables `pg_cron`
+- installs an AFTER INSERT trigger
+- immediately calls GitHub `workflow_dispatch(job_id)`
+- records dispatch attempts/request id/timestamp in `translation_jobs`
+- reads `pg_net` responses and exposes 401/403/404 errors in the web UI
+- installs a Supabase-side recovery job every 30 seconds
+  - falls back to every minute on older pg_cron versions
+- the existing 15-minute GitHub schedule remains only a tertiary fallback
 
-One-time setup:
+### One-time required setup
+
 1. Supabase Dashboard -> Database -> Vault
-2. Add secret `github_actions_token`
-3. Value = existing GitHub fine-grained PAT with Actions: write for
-   `kkh0412/pdf-translator`
-4. Run the entire latest `supabase/UPDATE_EXISTING_SUPABASE.sql`
+2. Secret name: `github_actions_token`
+3. Value: GitHub fine-grained PAT with repository `kkh0412/pdf-translator`,
+   Actions -> Read and write
+4. Supabase SQL Editor: run the ENTIRE latest
+   `supabase/UPDATE_EXISTING_SUPABASE.sql`
 
-Run `supabase/CHECK_WORKER_TRIGGER.sql` to diagnose token/trigger/pg_net status.
+Then run:
+`supabase/CHECK_WORKER_TRIGGER.sql`
 
-## Math preflight v2
+Expected:
+- `github_token_exists = true`
+- trigger status = enabled
+- recovery cron active = true
 
-- Actual formatting TABs are whitespace; they are no longer blindly converted
-  into `\t`.
-- Standalone `\t\t\t...` spacing garbage is removed.
-- Unicode math glyphs such as `−`, `∈`, `≠`, `∞` are normalized to LaTeX.
-- If a formula still fails preflight, only that formula gets a syntax-only
-  Gemini repair, then preflight is retried.
+For a job already stuck in queued state, run:
+`supabase/RETRY_LATEST_QUEUED_JOB.sql`

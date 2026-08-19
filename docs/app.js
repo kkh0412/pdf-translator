@@ -144,8 +144,9 @@ async function poll(jobId) {
       } else if (queuedForMs >= 8000) {
         updateProgress(
           0,
-          '자동 worker trigger가 실행되지 않았습니다. ' +
-          'Supabase Vault의 github_actions_token과 최신 UPDATE_EXISTING_SUPABASE.sql 설정을 확인하세요.'
+          'DB worker trigger가 설치되지 않았거나 실행되지 않았습니다. ' +
+          'v6.8의 UPDATE_EXISTING_SUPABASE.sql을 전체 실행한 뒤 ' +
+          'CHECK_WORKER_TRIGGER.sql로 상태를 확인하세요.'
         );
       } else {
         updateProgress(
