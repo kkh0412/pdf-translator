@@ -1,21 +1,39 @@
--- 이전 버전 SQL을 이미 실행했다면, 이 파일 전체를 Supabase SQL Editor에서 한 번 실행하세요.
--- 새 프로젝트라면 migrations/202608190001_init.sql만 실행하면 됩니다.
+-- Run this once in Supabase Dashboard > SQL Editor.
+-- Safe to run repeatedly.
 
-alter table public.translation_jobs drop constraint if exists translation_jobs_status_check;
-alter table public.translation_jobs add constraint translation_jobs_status_check
-  check (status in ('uploading','queued','processing','done','failed'));
+-- Supabase Free allows a global maximum object limit of 50 MB.
+-- The original demo set this bucket to only 20 MB, which can reject
+-- a translated result even when the uploaded source PDF was accepted.
+update storage.buckets
+set
+  file_size_limit = 52428800,
+  allowed_mime_types = array['application/pdf'],
+  public = false
+where id = 'documents';
+
+-- Keep the existing job policies.
+alter table public.translation_jobs
+drop constraint if exists translation_jobs_status_check;
+
+alter table public.translation_jobs
+add constraint translation_jobs_status_check
+check (status in ('uploading','queued','processing','done','failed'));
 
 revoke all on table public.translation_jobs from anon, authenticated;
 grant select, insert on table public.translation_jobs to authenticated;
 
-drop policy if exists "users can read their own translation jobs" on public.translation_jobs;
+drop policy if exists "users can read their own translation jobs"
+on public.translation_jobs;
+
 create policy "users can read their own translation jobs"
 on public.translation_jobs
 for select
 to authenticated
 using (auth.uid() = user_id);
 
-drop policy if exists "users can create their own queued jobs" on public.translation_jobs;
+drop policy if exists "users can create their own queued jobs"
+on public.translation_jobs;
+
 create policy "users can create their own queued jobs"
 on public.translation_jobs
 for insert
@@ -32,7 +50,9 @@ with check (
   and finished_at is null
 );
 
-drop policy if exists "users can upload their own document objects" on storage.objects;
+drop policy if exists "users can upload their own document objects"
+on storage.objects;
+
 create policy "users can upload their own document objects"
 on storage.objects
 for insert
@@ -42,7 +62,9 @@ with check (
   and (storage.foldername(name))[1] = auth.uid()::text
 );
 
-drop policy if exists "users can read their own document objects" on storage.objects;
+drop policy if exists "users can read their own document objects"
+on storage.objects;
+
 create policy "users can read their own document objects"
 on storage.objects
 for select

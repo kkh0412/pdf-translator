@@ -3,9 +3,7 @@ name: PDF translation worker
 on:
   workflow_dispatch:
   schedule:
-    # GitHub scheduled workflows support 5-minute granularity.
     - cron: '3-58/5 * * * *'
-    # Keep scheduled workflows active in a public repository.
     - cron: '17 4 1 * *'
 
 permissions:
@@ -20,12 +18,11 @@ jobs:
     if: github.event_name != 'schedule' || github.event.schedule != '17 4 1 * *'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      # Check the queue first using Ubuntu's built-in Python. If there is no work,
-      # the job ends here without setting up Python packages.
       - name: Check Supabase queue
         id: queue
         env:
@@ -59,18 +56,21 @@ jobs:
           SUPABASE_URL: ${{ vars.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: gemini-3.7-flash
+          # Flash-Lite is preferred for low-latency translation/document work.
+          GEMINI_MODEL: gemini-3.5-flash-lite
           MAX_PAGES: '20'
         run: python -m worker.run_pending --max-jobs 3
 
   heartbeat:
     if: github.event_name == 'schedule' && github.event.schedule == '17 4 1 * *'
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
+
       - name: Record monthly activity
         shell: bash
         run: |
