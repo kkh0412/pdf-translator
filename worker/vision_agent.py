@@ -724,33 +724,50 @@ MATH_REPAIR_SCHEMA = {
     "type": "object",
     "properties": {
         "math": {"type": "string"},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
     },
-    "required": ["math"],
+    "required": ["math", "confidence"],
     "additionalProperties": False,
 }
 
 
-def repair_math_formula(latex: str, label: str = "") -> str:
-    """Last-resort LaTeX syntax repair; mathematical content must be preserved."""
+def repair_math_formula(
+    latex: str,
+    label: str = "",
+    source_image: bytes | None = None,
+    compiler_error: str = "",
+) -> str:
+    """Repair one formula using the source image whenever available.
+
+    The image is authoritative. The current LaTeX and compiler error are only
+    hints. This prevents a syntax-repair model from preserving hallucinated
+    custom macros such as ``\\fn`` merely because they appeared in its input.
+    """
     transport = str(latex or "").replace("\\", MATH_BACKSLASH_TOKEN)
 
     prompt = (
-        "Repair ONLY the LaTeX syntax of this one mathematical expression.\n"
-        "Do not translate, simplify, or change mathematical meaning. Preserve every "
-        "variable, index, superscript, subscript, coefficient, operator, equality, "
-        "inequality, and delimiter.\n"
-        "Remove accidental spacing garbage such as standalone §t commands and repair "
-        "TeX grouping so the expression compiles with amsmath/amssymb.\n"
-        "Use § instead of every LaTeX backslash in the output.\n"
+        "You are repairing ONE mathematical expression transcribed from a scientific PDF.\n"
+        "The attached source crop, when present, is AUTHORITATIVE. Read the formula from the image.\n"
+        "The supplied LaTeX is only a fallible transcription hint.\n\n"
+        "Requirements:\n"
+        "- Preserve the mathematical content visible in the image exactly.\n"
+        "- Do not translate, simplify, rename variables, change indices, or invent notation.\n"
+        "- Use only standard LaTeX plus amsmath/amssymb commands. NO custom/undefined macros.\n"
+        "- If visible roman letters occur as a superscript/subscript/label, use §mathrm{...} or §text{...}.\n"
+        "  Example: visible superscript 'fn' -> ^{§mathrm{fn}}, never ^{§fn}.\n"
+        "- Preserve alignment relations, but return only the equation body: no equation/aligned environment.\n"
+        "- Use § instead of EVERY LaTeX backslash in the JSON output.\n"
         f"Context label: {label}\n"
-        f"Expression:\n{transport}"
+        f"XeLaTeX error:\n{compiler_error[-1800:]}\n\n"
+        f"Current transcription:\n{transport}"
     )
 
+    images = [(source_image, "image/jpeg")] if source_image else []
     result = _call_json(
         prompt,
-        [],
+        images,
         MATH_REPAIR_SCHEMA,
-        "math-repair",
+        "math-source-repair",
     )
 
     repaired = _decode_math_transport(str(result.get("math", ""))).strip()
@@ -1085,7 +1102,13 @@ def parse_pages(
         "equation, use a one-element array. For a long equation, split at relations (=, :=, "
         "\\Leftrightarrow) or top-level + / - terms so each line can fit a narrow journal column. "
         "Do not split inside a fraction, radical, exponent, subscript, bra-ket, or paired delimiter.\n"
-        "8. Keep the printed equation number separately in equation_number.\n\n"
+        "8. Keep the printed equation number separately in equation_number.\n"
+        "8A. Use ONLY standard LaTeX/amsmath/amssymb commands. Never invent custom macros "
+        "such as §fn, §clax, §op or source-defined shorthand that would require a preamble definition. "
+        "If the image shows a short roman-text superscript/subscript or label, encode the visible letters "
+        "explicitly with §mathrm{...} or §text{...}; for example a visible superscript fn should be "
+        "^{§mathrm{fn}}, not ^{§fn}. If uncertain, match the image literally using standard commands.\n"
+        "8B. Do not guess abbreviations or silently correct the mathematics. The page image is authoritative.\n\n"
         "LAYOUT RULES:\n"
         "9. flow_columns is the NUMBER OF TEXT COLUMNS in the LOCAL PAGE REGION containing this "
         "block (1, 2, or 3). This is not necessarily constant across a document or even a page.\n"

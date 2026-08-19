@@ -1,24 +1,29 @@
-# PDF Translator v6.9
+# PDF Translator v6.10
 
-## Fixed: multi-line aligned equations in preflight
+## Math pipeline overhaul
 
-The previous preflight compiled raw display math inside `\[ ... \]`.
-That is wrong for formulas containing alignment markers such as:
+v6.10 no longer preflights all formulas in one XeLaTeX document.
 
-    a &:= b
-    \\ &= c
-    \\ &= d
+Each inline/display formula is compiled independently (parallel workers), so one
+bad formula cannot hide later errors and the whole 150+ formula document is not
+recompiled from the beginning after every repair.
 
-The `&` character is valid only inside an alignment environment.
+For every failing formula:
+1. parse the XeLaTeX error;
+2. apply a narrow deterministic repair when the failure is an undefined short
+   text macro used only as a superscript/subscript, e.g. `^{\fn}` ->
+   `^{\mathrm{fn}}`;
+3. otherwise crop the exact source equation/paragraph from the original PDF and
+   send that crop + compiler error + current transcription to Gemini;
+4. reconstruct with standard LaTeX/amsmath/amssymb only;
+5. recompile only that failed formula.
 
-v6.9:
-- preflights display equations through the exact final `_equation_tex()` renderer;
-- therefore preflight and final PDF use the same `equation` / `aligned`
-  environments, line breaking, tags, and width handling;
-- normalizes Vision output `\ &=` to the real line break `\\ &=`;
-- wraps even a one-row display in `aligned` whenever an `&` marker is present;
-- adds `graphicx` to the preflight environment because the final renderer can
-  use `\resizebox` for indivisible long equations;
-- on failure prints the exact rendered LaTeX actually sent to XeLaTeX.
+Every formula gets its own repair budget; the previous document-wide two-repair
+limit has been removed.
 
-The v6.8 Supabase automatic-worker architecture is retained unchanged.
+The initial Vision transcription prompt now explicitly forbids invented custom
+macros such as `\fn` and requires visible roman superscript/subscript labels to
+be represented with `\mathrm{...}` / `\text{...}`.
+
+The v6.9 aligned-equation renderer and automatic Supabase worker architecture
+are retained.

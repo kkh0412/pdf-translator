@@ -715,6 +715,86 @@ def _equation_tex(block: dict) -> str:
 
 
 
+def _math_source_crop(pdf_path: Path, block: dict, dpi: int = 180) -> bytes | None:
+    """Render a padded crop around the source block for formula repair."""
+    bbox = block.get("bbox") or []
+    page_index = int(block.get("page", -1))
+    if len(bbox) != 4 or page_index < 0:
+        return None
+
+    try:
+        doc = pymupdf.open(pdf_path)
+        try:
+            if page_index >= doc.page_count:
+                return None
+            page = doc[page_index]
+            x0, y0, x1, y1 = [float(x) for x in bbox]
+            # normalized 0..1000 -> page points, with enough padding to expose
+            # superscripts/subscripts and nearby equation numbers.
+            rect = pymupdf.Rect(
+                page.rect.width * x0 / 1000.0,
+                page.rect.height * y0 / 1000.0,
+                page.rect.width * x1 / 1000.0,
+                page.rect.height * y1 / 1000.0,
+            )
+            pad_x = max(8.0, rect.width * 0.06)
+            pad_y = max(6.0, rect.height * 0.22)
+            rect = pymupdf.Rect(
+                rect.x0 - pad_x, rect.y0 - pad_y,
+                rect.x1 + pad_x, rect.y1 + pad_y,
+            ) & page.rect
+            if rect.width < 5 or rect.height < 5:
+                return None
+            scale = dpi / 72.0
+            pix = page.get_pixmap(
+                matrix=pymupdf.Matrix(scale, scale),
+                clip=rect,
+                alpha=False,
+            )
+            return pix.tobytes("jpeg", jpg_quality=90)
+        finally:
+            doc.close()
+    except Exception as exc:
+        print(f"Math repair crop unavailable: {exc}", flush=True)
+        return None
+
+
+def _last_control_sequence_from_error(output: str) -> str | None:
+    """Best-effort extraction of the undefined TeX control word."""
+    tail = output[-2500:]
+    if "Undefined control sequence" not in tail:
+        return None
+
+    # The undefined command is normally the final control word on the reported
+    # l.<n> source fragment. This avoids mistaking earlier valid commands.
+    source_lines = re.findall(r"(?:^|\n)l\.\d+\s+([^\n]+)", tail)
+    candidates_source = source_lines[-1] if source_lines else tail
+    commands = re.findall(r"\\([A-Za-z]+)", candidates_source)
+    return commands[-1] if commands else None
+
+
+def _repair_simple_undefined_script(formula: str, command: str | None) -> str | None:
+    """Safely expand an undefined short textual script without guessing math.
+
+    Example: ^{\\fn} cannot compile, but visually it can only typeset the
+    letters 'fn' if that was intended. Convert this narrow shape to
+    ^{\\mathrm{fn}}. Unknown commands elsewhere are *not* guessed and are sent
+    to the source-image repair agent instead.
+    """
+    if not command or not re.fullmatch(r"[A-Za-z]{1,5}", command):
+        return None
+
+    pattern = re.compile(r"([_^])\{\\" + re.escape(command) + r"\}")
+    if not pattern.search(formula):
+        return None
+
+    repaired = pattern.sub(
+        lambda m: m.group(1) + r"{\mathrm{" + command + "}}",
+        formula,
+    )
+    return repaired if repaired != formula else None
+
+
 def _math_preflight_preamble() -> str:
     return r"""\documentclass[10pt]{article}
 \usepackage{amsmath,amssymb}
@@ -736,12 +816,18 @@ def _math_preflight_preamble() -> str:
 """
 
 
-def preflight_math_blocks(blocks: list[dict], work_dir: Path) -> None:
-    """Compile formulas before translation using the same display renderer as final PDF.
+def preflight_math_blocks(
+    blocks: list[dict],
+    work_dir: Path,
+    pdf_path: Path,
+    progress_callback: Callable[[int, str], None] | None = None,
+) -> None:
+    """Preflight every formula independently and repair failures source-faithfully.
 
-    Display equations are rendered through _equation_tex(block), so preflight
-    and the final PDF share aligned environments, line breaking, equation tags,
-    and width handling. This avoids false failures from raw '&' markers.
+    Why independently? A single combined TeX document stops at the first bad
+    formula, forcing the whole document to be recompiled repeatedly. Here all
+    formulas are compiled in parallel, all failures are collected at once, and
+    only the failed formulas are repaired/retested.
     """
     records: list[dict] = []
 
@@ -757,63 +843,57 @@ def preflight_math_blocks(blocks: list[dict], work_dir: Path) -> None:
                     for line in block.get("equation_lines", [])
                     if str(line).strip()
                 ]
-                records.append(
-                    {
-                        "label": f"{block_id}:display",
-                        "formula": formula,
-                        "block": block,
-                        "kind": "display",
-                        "key": None,
-                    }
-                )
+                records.append({
+                    "label": f"{block_id}:display",
+                    "formula": formula,
+                    "block": block,
+                    "kind": "display",
+                    "key": None,
+                    "repair_count": 0,
+                })
 
         for token, formula in (block.get("math_map") or {}).items():
             cleaned = _clean_math(formula)
             if cleaned:
                 block["math_map"][token] = cleaned
-                records.append(
-                    {
-                        "label": f"{block_id}:{token}",
-                        "formula": cleaned,
-                        "block": block,
-                        "kind": "inline",
-                        "key": token,
-                    }
-                )
+                records.append({
+                    "label": f"{block_id}:{token}",
+                    "formula": cleaned,
+                    "block": block,
+                    "kind": "inline",
+                    "key": token,
+                    "repair_count": 0,
+                })
 
     if not records:
         print("Math preflight: no formulas to check.", flush=True)
         return
 
     preflight_dir = work_dir / "math-preflight"
+    if preflight_dir.exists():
+        shutil.rmtree(preflight_dir)
     preflight_dir.mkdir(parents=True, exist_ok=True)
-    tex_path = preflight_dir / "math_preflight.tex"
+
     engine = shutil.which("xelatex")
     if not engine:
         raise RuntimeError("xelatex was not found for math preflight")
 
-    def compile_records() -> subprocess.CompletedProcess:
-        chunks = [_math_preflight_preamble()]
+    def record_tex(record: dict) -> str:
+        if record["kind"] == "display":
+            return _equation_tex(record["block"])
+        return "\\noindent Inline test: \\(" + record["formula"] + "\\)\\par\n"
 
-        for index, record in enumerate(records, start=1):
-            chunks.append(
-                f"\\typeout{{PDFTRANSLATOR-MATH-{index}: {record['label']}}}\n"
-            )
-
-            if record["kind"] == "display":
-                # Use EXACTLY the same equation renderer as the final document.
-                chunks.append(_equation_tex(record["block"]))
-            else:
-                chunks.append(
-                    "\\[\n"
-                    + record["formula"]
-                    + "\n\\]\n"
-                )
-
-        chunks.append("\\end{document}\n")
-        tex_path.write_text("".join(chunks), encoding="utf-8")
-
-        return subprocess.run(
+    def compile_one(index: int, record: dict) -> tuple[int, bool, str, str]:
+        tex_path = preflight_dir / f"formula_{index:04d}.tex"
+        tex = (
+            _math_preflight_preamble().replace("\\begin{document}\n", "")
+            + "\\begin{document}\n"
+            + f"\\typeout{{PDFTRANSLATOR-MATH-{index}: {record['label']}}}\n"
+            + record_tex(record)
+            + "\\end{document}\n"
+        )
+        tex_path.write_text(tex, encoding="utf-8")
+        proc = subprocess.run(
             [
                 engine,
                 "-interaction=nonstopmode",
@@ -825,84 +905,129 @@ def preflight_math_blocks(blocks: list[dict], work_dir: Path) -> None:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            timeout=180,
+            timeout=90,
+        )
+        return index, proc.returncode == 0, proc.stdout, tex
+
+    max_workers = max(1, min(6, int(os.getenv("MATH_PREFLIGHT_WORKERS", "4"))))
+
+    def compile_subset(indices: list[int]) -> dict[int, tuple[bool, str, str]]:
+        results: dict[int, tuple[bool, str, str]] = {}
+        if max_workers == 1 or len(indices) <= 1:
+            for idx in indices:
+                _, ok, out, tex = compile_one(idx, records[idx])
+                results[idx] = (ok, out, tex)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+                future_map = {ex.submit(compile_one, idx, records[idx]): idx for idx in indices}
+                for future in concurrent.futures.as_completed(future_map):
+                    idx, ok, out, tex = future.result()
+                    results[idx] = (ok, out, tex)
+        return results
+
+    all_indices = list(range(len(records)))
+    results = compile_subset(all_indices)
+    failing = [idx for idx in all_indices if not results[idx][0]]
+
+    if progress_callback:
+        passed = len(records) - len(failing)
+        progress_callback(
+            57,
+            f"수식 사전 검사 · {passed}/{len(records)}개 통과"
+            + (f" · {len(failing)}개 자동 복구 중" if failing else ""),
         )
 
-    repaired_labels: list[str] = []
+    # Every failing formula gets its own repair budget. There is intentionally
+    # no document-wide 'two repairs only' cap anymore.
+    for round_no in range(2):
+        if not failing:
+            break
 
-    # Initial attempt + at most two formula-specific syntax repairs.
-    for repair_round in range(3):
-        proc = compile_records()
+        to_recompile: list[int] = []
+        for idx in failing:
+            record = records[idx]
+            ok, compiler_output, _tex = results[idx]
+            if ok:
+                continue
 
-        if proc.returncode == 0:
+            record["repair_count"] += 1
+            command = _last_control_sequence_from_error(compiler_output)
+
+            # Deterministic, semantically conservative repair first.
+            repaired = _repair_simple_undefined_script(record["formula"], command)
+            method = None
+            if repaired:
+                method = f"undefined script \\{command} -> \\mathrm{{{command}}}"
+            else:
+                # Anything less obvious is reconstructed from the original PDF crop.
+                crop = _math_source_crop(pdf_path, record["block"])
+                try:
+                    repaired = _clean_math(
+                        repair_math_formula(
+                            record["formula"],
+                            label=record["label"],
+                            source_image=crop,
+                            compiler_error=compiler_output,
+                        )
+                    )
+                    method = "source-image Gemini repair"
+                except Exception as exc:
+                    print(
+                        f"Math repair failed for {record['label']}: {exc}",
+                        flush=True,
+                    )
+                    continue
+
             print(
-                f"Math preflight: {len(records)} formulas compiled successfully"
-                + (
-                    f" after repairing {', '.join(repaired_labels)}."
-                    if repaired_labels
-                    else "."
-                ),
+                f"Math preflight repair {record['label']}: {method}",
                 flush=True,
             )
-            return
 
-        markers = re.findall(
-            r"PDFTRANSLATOR-MATH-(\d+): ([^\n\r]+)",
-            proc.stdout,
-        )
-        if not markers:
-            raise RuntimeError(
-                "Math preflight failed before body translation.\n"
-                + proc.stdout[-9000:]
+            if record["kind"] == "display":
+                record["block"]["equation_latex"] = repaired
+                # Discard stale line hints after full-expression repair.
+                record["block"]["equation_lines"] = []
+            else:
+                record["block"]["math_map"][record["key"]] = repaired
+
+            record["formula"] = repaired
+            to_recompile.append(idx)
+
+        if not to_recompile:
+            break
+
+        retry_results = compile_subset(to_recompile)
+        results.update(retry_results)
+        failing = [idx for idx in failing if not results[idx][0]]
+
+        if progress_callback:
+            progress_callback(
+                57,
+                f"수식 사전 검사 복구 {round_no + 1}/2 · "
+                f"남은 오류 {len(failing)}개",
             )
 
-        failing_index = int(markers[-1][0]) - 1
-        if failing_index < 0 or failing_index >= len(records):
-            raise RuntimeError(
-                "Math preflight could not identify the failing formula.\n"
-                + proc.stdout[-9000:]
+    if failing:
+        details: list[str] = []
+        for idx in failing[:8]:
+            record = records[idx]
+            ok, output, tex = results[idx]
+            details.append(
+                f"[{record['label']}]\n"
+                f"Formula: {record['formula']}\n"
+                f"Rendered: {record_tex(record)}\n"
+                f"Error: {output[-1800:]}"
             )
 
-        record = records[failing_index]
-        label = record["label"]
-
-        if repair_round >= 2 or label in repaired_labels:
-            rendered = (
-                _equation_tex(record["block"])
-                if record["kind"] == "display"
-                else record["formula"]
-            )
-            raise RuntimeError(
-                "Math preflight failed before body translation. "
-                f"Likely formula: {label}\n"
-                f"Normalized formula:\n{record['formula']}\n\n"
-                f"Rendered LaTeX actually compiled:\n{rendered}\n\n"
-                + proc.stdout[-9000:]
-            )
-
-        print(
-            f"Math preflight: automatically repairing malformed formula {label}",
-            flush=True,
-        )
-
-        repaired = _clean_math(
-            repair_math_formula(
-                record["formula"],
-                label=label,
-            )
+        raise RuntimeError(
+            f"Math preflight still has {len(failing)} unrepaired formula(s) after "
+            "source-aware repair.\n\n" + "\n\n".join(details)
         )
 
-        if record["kind"] == "display":
-            record["block"]["equation_latex"] = repaired
-            # Full-expression repair invalidates old Vision line hints.
-            record["block"]["equation_lines"] = []
-        else:
-            record["block"]["math_map"][record["key"]] = repaired
-
-        record["formula"] = repaired
-        repaired_labels.append(label)
-
-    raise RuntimeError("Unexpected math preflight state.")
+    print(
+        f"Math preflight: all {len(records)} formulas compiled successfully.",
+        flush=True,
+    )
 
 
 def build_latex(
@@ -1315,7 +1440,12 @@ def process_pdf(
     if progress_callback:
         progress_callback(56, "수식 LaTeX 사전 검사를 실행하고 있습니다.")
 
-    preflight_math_blocks(blocks, work_dir)
+    preflight_math_blocks(
+        blocks,
+        work_dir,
+        pdf_path,
+        progress_callback=progress_callback,
+    )
 
     phase = time.perf_counter()
     print(
