@@ -93,7 +93,7 @@ async function poll(jobId) {
       statusText.textContent = '번역 worker가 대기열을 확인하고 있습니다. 보통 몇 분 안에 시작됩니다.';
     } else if (job.status === 'processing') {
       statusTitle.textContent = '번역 및 PDF 생성 중';
-      statusText.textContent = '수식과 레이아웃을 보존하면서 XeLaTeX로 결과 PDF를 만들고 있습니다.';
+      statusText.textContent = 'Gemini로 번역한 뒤 수식과 원본 레이아웃을 보존하면서 결과 PDF를 만들고 있습니다.';
     } else if (job.status === 'done') {
       spinner.classList.add('hidden');
       statusBox.classList.add('hidden');

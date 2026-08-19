@@ -1,37 +1,41 @@
-# PDF Translator — fast GitHub Pages + Supabase demo
+# PDF Translator — GitHub Pages + Supabase + Gemini
 
-This version is optimized for short user wait time.
+이 버전은 GitHub Pages 프런트엔드, Supabase Storage/Database/Auth, GitHub Actions worker, Gemini API를 사용합니다.
 
-## What changed
+## 필요한 설정
 
-- GitHub Pages remains the frontend.
-- Supabase remains the database and private Storage backend.
-- GitHub Actions still polls the Supabase queue every 5 minutes, so no expiring GitHub PAT is required.
-- **XeLaTeX / TeX Live / Noto CJK apt installation has been removed.**
-- PDF text is now overlaid directly on the original vector PDF with PyMuPDF.
-- PyMuPDF's built-in multilingual text engine handles Korean/CJK text, so no 61 MB Noto CJK package download is needed per job.
-- The queue check and processing now happen in one GitHub Actions job, avoiding a second fresh VM startup.
-- Translation requests use larger batches to reduce API round trips.
+### GitHub Pages의 `docs/config.js`
+- `SUPABASE_URL`
+- `SUPABASE_PUBLISHABLE_KEY`
 
-## GitHub settings
+### GitHub Actions → Variables
+- `SUPABASE_URL`
 
-Repository variable:
-
-- `SUPABASE_URL` = `https://YOUR_PROJECT.supabase.co` (do not append `/rest/v1/`)
-
-Repository secrets:
-
+### GitHub Actions → Secrets
 - `SUPABASE_SECRET_KEY`
-- `OPENAI_API_KEY`
+- `GEMINI_API_KEY`
 
-## Supabase
+`OPENAI_API_KEY`는 더 이상 사용하지 않습니다.
 
-Enable anonymous sign-in and run the SQL file in `supabase/migrations/202608190001_init.sql` for a new project, or `supabase/UPDATE_EXISTING_SUPABASE.sql` for the existing demo project.
+## Gemini 모델
 
-## GitHub Pages
+기본값은 `gemini-2.5-flash`입니다. GitHub Actions의 `GEMINI_MODEL` 환경변수에서 변경할 수 있습니다.
 
-Settings → Pages → Deploy from a branch → `main` → `/docs`.
+## 동작
 
-## Remaining latency
+1. 사용자가 GitHub Pages에서 PDF를 업로드합니다.
+2. PDF는 Supabase private Storage에 저장되고 `translation_jobs`에 queued 작업이 생성됩니다.
+3. GitHub Actions worker가 대기 작업을 가져옵니다.
+4. PyMuPDF로 자연어 텍스트 영역을 추출하고 수식으로 판단되는 영역은 건드리지 않습니다.
+5. Gemini가 텍스트 영역을 번역합니다.
+6. 번역문을 원래 텍스트 박스 안에 직접 삽입하고 결과 PDF를 Supabase에 저장합니다.
+7. 웹페이지에서 결과 PDF를 다운로드합니다.
 
-Because this design avoids an expiring GitHub PAT, GitHub Actions discovers new queued jobs on its 5-minute schedule. Once a worker starts, there is no longer a TeX Live / CJK font installation phase. The main remaining time is GitHub runner startup, Python dependency setup, OpenAI translation, and PDF upload/download.
+## 기존 OpenAI 버전에서 바꾸는 경우
+
+GitHub → Settings → Secrets and variables → Actions에서:
+
+1. Secret `GEMINI_API_KEY`를 새로 만듭니다.
+2. Google AI Studio에서 발급받은 Gemini API key를 값으로 넣습니다.
+3. 기존 `OPENAI_API_KEY`는 삭제해도 됩니다.
+4. 나머지 Supabase 설정은 그대로 유지합니다.
