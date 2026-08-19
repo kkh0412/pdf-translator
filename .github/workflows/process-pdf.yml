@@ -2,10 +2,15 @@ name: PDF translation worker
 
 on:
   workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'Supabase translation_jobs UUID. Leave empty to process the queue.'
+        required: false
+        type: string
   schedule:
-    # GitHub Actions scheduled workflows cannot run more often than every
-    # 5 minutes. Offset from minute 0 to reduce top-of-hour congestion.
-    - cron: '3-58/5 * * * *'
+    # Normal jobs start on demand from the Supabase Edge Function.
+    # This 15-minute schedule is only a recovery path.
+    - cron: '7,22,37,52 * * * *'
     - cron: '17 4 1 * *'
 
 permissions:
@@ -25,19 +30,31 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Check Supabase queue
-        id: queue
+      - name: Resolve requested translation job
+        id: target
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_JOB_ID: ${{ inputs.job_id }}
           SUPABASE_URL: ${{ vars.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
         shell: bash
         run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$REQUESTED_JOB_ID" ]; then
+            echo "has_jobs=true" >> "$GITHUB_OUTPUT"
+            echo "mode=single" >> "$GITHUB_OUTPUT"
+            echo "job_id=$REQUESTED_JOB_ID" >> "$GITHUB_OUTPUT"
+            echo "Immediate job requested: $REQUESTED_JOB_ID"
+            exit 0
+          fi
+
           HAS_JOBS="$(python3 worker/check_queue.py)"
           echo "has_jobs=$HAS_JOBS" >> "$GITHUB_OUTPUT"
-          echo "Queued jobs: $HAS_JOBS"
+          echo "mode=queue" >> "$GITHUB_OUTPUT"
+          echo "job_id=" >> "$GITHUB_OUTPUT"
+          echo "Fallback queue check: $HAS_JOBS"
 
       - name: Restore prepared PDF runtime
-        if: steps.queue.outputs.has_jobs == 'true'
+        if: steps.target.outputs.has_jobs == 'true'
         id: runtime-cache
         uses: actions/cache/restore@v5
         with:
@@ -50,11 +67,11 @@ jobs:
             ${{ runner.os }}-${{ runner.arch }}-pdf-translator-runtime-v6-
 
       - name: Build runtime only on first cache miss
-        if: steps.queue.outputs.has_jobs == 'true' && steps.runtime-cache.outputs.cache-hit != 'true'
+        if: steps.target.outputs.has_jobs == 'true' && steps.runtime-cache.outputs.cache-hit != 'true'
         run: bash worker/setup_runtime.sh
 
       - name: Save runtime before document processing
-        if: steps.queue.outputs.has_jobs == 'true' && steps.runtime-cache.outputs.cache-hit != 'true'
+        if: steps.target.outputs.has_jobs == 'true' && steps.runtime-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
         with:
           path: |
@@ -63,9 +80,11 @@ jobs:
             .venv
           key: ${{ steps.runtime-cache.outputs.cache-primary-key }}
 
-      - name: Process queued PDFs
-        if: steps.queue.outputs.has_jobs == 'true'
+      - name: Process requested PDF
+        if: steps.target.outputs.has_jobs == 'true'
         env:
+          MODE: ${{ steps.target.outputs.mode }}
+          JOB_ID: ${{ steps.target.outputs.job_id }}
           SUPABASE_URL: ${{ vars.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -79,16 +98,26 @@ jobs:
         shell: bash
         run: |
           export PATH="$HOME/.TinyTeX/bin/x86_64-linux:$PATH"
-          .venv/bin/python -m worker.run_pending --max-jobs 3
+
+          if [ "$MODE" = "single" ] && [ -n "$JOB_ID" ]; then
+            echo "Processing requested job immediately: $JOB_ID"
+            .venv/bin/python -m worker.run_job "$JOB_ID"
+          else
+            echo "Processing one queued recovery job."
+            .venv/bin/python -m worker.run_pending --max-jobs 1
+          fi
 
   heartbeat:
     if: github.event_name == 'schedule' && github.event.schedule == '17 4 1 * *'
     runs-on: ubuntu-24.04
+
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
       - name: Record monthly activity
+        shell: bash
         run: |
           date -u '+%Y-%m-%dT%H:%M:%SZ' > .github/worker-heartbeat.txt
           git config user.name 'github-actions[bot]'

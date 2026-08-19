@@ -108,6 +108,53 @@ async function ensureAnonymousSession() {
   return signed.session;
 }
 
+async function triggerWorkerNow(jobId) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      updateProgress(
+        3,
+        attempt === 1
+          ? '업로드 완료 · 번역 worker를 즉시 시작하고 있습니다.'
+          : 'Worker 시작 요청을 한 번 더 시도하고 있습니다.'
+      );
+
+      const { data, error } = await supabaseClient.functions.invoke(
+        'trigger-worker',
+        {
+          body: { job_id: jobId },
+        }
+      );
+
+      if (error) throw error;
+      if (!data?.ok) {
+        throw new Error(data?.error || 'Worker 시작 요청에 실패했습니다.');
+      }
+
+      updateProgress(
+        3,
+        data.already_processing
+          ? 'Worker가 이미 이 문서를 처리하고 있습니다.'
+          : 'Worker 실행 요청 완료 · GitHub runner가 시작되기를 기다리고 있습니다.'
+      );
+      return true;
+    } catch (error) {
+      lastError = error;
+      if (attempt < 2) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+    }
+  }
+
+  console.warn('Immediate worker dispatch failed:', lastError);
+  updateProgress(
+    2,
+    '즉시 실행 요청에 실패했습니다. 15분 간격의 복구 worker가 대기열을 확인합니다.'
+  );
+  return false;
+}
+
 async function poll(jobId) {
   while (true) {
     const { data: job, error } = await supabaseClient
@@ -274,12 +321,13 @@ form.addEventListener('submit', async (event) => {
       throw new Error(`작업 생성 실패: ${insertError.message}`);
     }
 
-    statusTitle.textContent = '작업 대기 중';
+    statusTitle.textContent = 'Worker 시작 중';
     updateProgress(
       2,
-      '업로드가 끝났습니다. 번역 worker가 대기열을 확인하고 있습니다.'
+      '업로드가 끝났습니다. 번역 worker를 즉시 호출합니다.'
     );
 
+    await triggerWorkerNow(jobId);
     await poll(jobId);
   } catch (error) {
     showError(error.message || String(error));

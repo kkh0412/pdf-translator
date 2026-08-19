@@ -125,6 +125,26 @@ def main(job_id: str) -> int:
         return 2
 
     job = rows[0]
+
+    # On-demand dispatch, browser retries, and the scheduled recovery path can
+    # occasionally target the same job. Never process it twice.
+    status = str(job.get("status", ""))
+    if status == "done":
+        print(f"Job {job_id} is already done; skipping duplicate dispatch.", flush=True)
+        return 0
+    if status == "processing":
+        print(
+            f"Job {job_id} is already processing; skipping duplicate dispatch.",
+            flush=True,
+        )
+        return 0
+    if status != "queued":
+        print(
+            f"Job {job_id} is in status {status!r}; not processing it.",
+            flush=True,
+        )
+        return 0
+
     db.table("translation_jobs").update(
         {
             "status": "processing",

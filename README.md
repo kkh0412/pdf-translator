@@ -1,27 +1,20 @@
-# PDF Translator v6.4
+# PDF Translator v6.5 — on-demand worker
 
-## Terminology
-- For Korean targets, only broadly standardized textbook/cross-field concepts are
-  automatically translated.
-- Niche or subfield-specific concept names default to English when a Korean
-  rendering would be awkward or nonstandard.
-- The pre-scan glossary records `policy=translate` or `policy=keep_english`.
-- Translation batches must obey that policy consistently.
+Normal flow:
+1. Browser uploads PDF to Supabase.
+2. Browser creates the queued job.
+3. Browser immediately invokes authenticated Supabase Edge Function `trigger-worker`.
+4. Edge Function dispatches GitHub Actions with the exact `job_id`.
+5. GitHub Actions runs `python -m worker.run_job JOB_ID`.
+6. Browser continues polling Supabase progress.
 
-## Detailed progress
-- Supabase progress is updated through document scan, page reconstruction,
-  translation request starts, translation batch completions, LaTeX rendering,
-  optimization, and final upload.
-- Translation batches are smaller (10 blocks / ~4200 chars) so progress updates
-  are more frequent and structured output is easier to validate.
-- The browser polls every 1.5 seconds and also shows elapsed processing time.
-- If the Supabase progress migration has not been applied, the UI explicitly says
-  so instead of displaying a fake 5% forever.
+The 15-minute cron is only a recovery path.
 
-Existing Supabase projects must run:
-`supabase/UPDATE_EXISTING_SUPABASE.sql`
+One-time setup:
+- Create one fine-grained GitHub PAT, restricted to `kkh0412/pdf-translator`,
+  repository permission Actions: Read and write, Expiration: No expiration.
+- Store it in Supabase Edge Function Secrets as `GH_ACTIONS_TOKEN`.
+- Deploy the Edge Function `trigger-worker` using
+  `supabase/functions/trigger-worker/index.ts`.
 
-## Worker schedule
-The automatic GitHub Actions schedule remains every 5 minutes. GitHub's scheduled
-workflow mechanism does not support a shorter interval. `workflow_dispatch`
-remains available for manual immediate tests.
+The GitHub token never appears in browser code or `docs/config.js`.
