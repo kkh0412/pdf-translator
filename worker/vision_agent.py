@@ -895,6 +895,41 @@ PART_SCHEMA = {
     "additionalProperties": False,
 }
 
+TABLE_CELL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "parts": {"type": "array", "items": PART_SCHEMA},
+        "style": {
+            "type": "string",
+            "enum": ["normal", "bold", "italic", "smallcaps"],
+        },
+        "colspan": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20,
+        },
+        "align": {
+            "type": "string",
+            "enum": ["left", "center", "right"],
+        },
+    },
+    "required": ["parts", "style", "colspan", "align"],
+    "additionalProperties": False,
+}
+
+TABLE_ROW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "cells": {
+            "type": "array",
+            "items": TABLE_CELL_SCHEMA,
+        },
+    },
+    "required": ["cells"],
+    "additionalProperties": False,
+}
+
+
 BLOCK_SCHEMA = {
     "type": "object",
     "properties": {
@@ -939,6 +974,23 @@ BLOCK_SCHEMA = {
             "items": {"type": "string"},
         },
         "equation_number": {"type": "string"},
+        "table_header_rows": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10,
+        },
+        "table_alignments": {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "enum": ["left", "center", "right"],
+            },
+            "maxItems": 20,
+        },
+        "table_rows": {
+            "type": "array",
+            "items": TABLE_ROW_SCHEMA,
+        },
         "bbox": {
             "type": "array",
             "items": {"type": "number", "minimum": 0, "maximum": 1000},
@@ -956,6 +1008,9 @@ BLOCK_SCHEMA = {
         "equation_latex",
         "equation_lines",
         "equation_number",
+        "table_header_rows",
+        "table_alignments",
+        "table_rows",
         "bbox",
     ],
     "additionalProperties": False,
@@ -1190,7 +1245,73 @@ def _validate_blocks(
                     )
 
             equation_count += 1
-        elif kind not in {"figure", "table"}:
+        elif kind == "table":
+            rows = block.get("table_rows") or []
+            if not rows:
+                raise GeminiVisionError(
+                    f"Page {page_number}: table block has no semantic rows"
+                )
+
+            row_widths: list[int] = []
+            for row_index, row in enumerate(rows):
+                cells = row.get("cells") or []
+                if not cells:
+                    raise GeminiVisionError(
+                        f"Page {page_number}: table row {row_index} has no cells"
+                    )
+
+                logical_width = 0
+                for cell_index, cell in enumerate(cells):
+                    logical_width += max(1, int(cell.get("colspan", 1)))
+                    parts = cell.get("parts")
+                    if not isinstance(parts, list):
+                        raise GeminiVisionError(
+                            f"Page {page_number}: invalid table cell parts"
+                        )
+
+                    for part in parts:
+                        if part.get("type") == "text":
+                            out_letters += _alphabetic_count(
+                                str(part.get("content", ""))
+                            )
+                        elif part.get("type") == "math":
+                            math = str(part.get("content", "")).strip()
+                            if not math:
+                                raise GeminiVisionError(
+                                    f"Page {page_number}: empty table-cell math"
+                                )
+                            _validate_math_transport(
+                                math,
+                                page_number,
+                                f"table row {row_index} cell {cell_index}",
+                            )
+
+                row_widths.append(logical_width)
+
+            column_count = max(row_widths)
+            if column_count < 1 or column_count > 20:
+                raise GeminiVisionError(
+                    f"Page {page_number}: invalid table width {column_count}"
+                )
+            if any(width != column_count for width in row_widths):
+                raise GeminiVisionError(
+                    f"Page {page_number}: inconsistent table row widths {row_widths}"
+                )
+
+            alignments = block.get("table_alignments") or []
+            if alignments and len(alignments) != column_count:
+                raise GeminiVisionError(
+                    f"Page {page_number}: table_alignments has "
+                    f"{len(alignments)} entries for {column_count} columns"
+                )
+
+            header_rows = int(block.get("table_header_rows", 0) or 0)
+            if header_rows < 0 or header_rows > len(rows):
+                raise GeminiVisionError(
+                    f"Page {page_number}: invalid table_header_rows={header_rows}"
+                )
+
+        elif kind != "figure":
             parts = block.get("parts")
             if not isinstance(parts, list):
                 raise GeminiVisionError(
@@ -1283,6 +1404,9 @@ def parse_pages(
                         "equation_latex": "",
                         "equation_lines": [],
                         "equation_number": "",
+                        "table_header_rows": 0,
+                        "table_alignments": [],
+                        "table_rows": [],
                         "bbox": hint["bbox"],
                     }
                 )
@@ -1353,9 +1477,18 @@ def parse_pages(
         "normally use translate=false. Preserve their spelling and Unicode diacritics exactly, using "
         "the extracted PDF text hint when it is clearer than the image. Title, abstract, headings, "
         "prose and captions normally use translate=true.\n"
-        "15. Real figures/tables may be figure/table blocks. bbox is normalized [x0,y0,x1,y1] "
-        "in 0..1000 and must cover the visual object, not its caption.\n"
-        "16. Omit page-number-only items. Do not omit dense prose or equations.\n\n"
+        "15. TABLES MUST NEVER BE RETURNED AS FIGURES OR CROPPED IMAGES. Every visible table, "
+        "including a rasterized/scanned table, must be kind=table and reconstructed semantically. "
+        "Populate table_rows with every visible row/cell, table_header_rows with the number of "
+        "header rows at the top, and table_alignments with exactly one left/center/right entry per "
+        "logical column. Cell contents use text/math parts exactly like prose. Use colspan for "
+        "horizontally merged cells. Preserve bold/italic cell emphasis. A table caption or table "
+        "footnote is a separate caption/paragraph block, never part of table_rows. For every "
+        "non-table block return table_header_rows=0, table_alignments=[], table_rows=[].\n"
+        "15A. FIGURES use kind=figure. Their bbox is normalized [x0,y0,x1,y1] in 0..1000 and "
+        "must tightly cover only the visual object, excluding its separate caption. Do not convert "
+        "equations or tables into figure blocks.\n"
+        "16. Omit page-number-only items. Do not omit dense prose, equations, or table cells.\n\n"
         "Document domain scan (helps interpret notation but MUST NOT alter source content):\n"
         + json.dumps(
             {

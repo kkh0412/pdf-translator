@@ -471,36 +471,259 @@ def _render_translated_text(text: str, math_map: dict[str, str]) -> str:
     return "".join(out)
 
 
-def _crop_visual_asset(
+def _normalized_bbox_to_rect(
+    page: pymupdf.Page,
+    bbox_norm: list[float],
+) -> pymupdf.Rect:
+    x0, y0, x1, y1 = bbox_norm
+    return (
+        pymupdf.Rect(
+            page.rect.width * x0 / 1000.0,
+            page.rect.height * y0 / 1000.0,
+            page.rect.width * x1 / 1000.0,
+            page.rect.height * y1 / 1000.0,
+        )
+        & page.rect
+    )
+
+
+def _rect_intersection_area(a: pymupdf.Rect, b: pymupdf.Rect) -> float:
+    inter = a & b
+    if inter.is_empty or inter.width <= 0 or inter.height <= 0:
+        return 0.0
+    return float(inter.width * inter.height)
+
+
+def _raster_candidates(
+    doc: pymupdf.Document,
+    page: pymupdf.Page,
+    rect: pymupdf.Rect,
+) -> list[dict]:
+    candidates: list[dict] = []
+    visual_area = max(1.0, float(rect.width * rect.height))
+    seen: set[tuple] = set()
+
+    for image_info in page.get_images(full=True):
+        xref = int(image_info[0])
+        try:
+            placements = page.get_image_rects(xref)
+            extracted = doc.extract_image(xref)
+        except Exception:
+            continue
+
+        for placement in placements:
+            placement = pymupdf.Rect(placement)
+            key = (
+                xref,
+                round(placement.x0, 3),
+                round(placement.y0, 3),
+                round(placement.x1, 3),
+                round(placement.y1, 3),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+
+            intersection = _rect_intersection_area(rect, placement)
+            if intersection <= 0:
+                continue
+
+            placement_area = max(
+                1.0,
+                float(placement.width * placement.height),
+            )
+            candidates.append(
+                {
+                    "xref": xref,
+                    "rect": placement,
+                    "coverage": intersection / visual_area,
+                    "image_coverage": intersection / placement_area,
+                    "width": int(extracted.get("width", 0) or 0),
+                    "height": int(extracted.get("height", 0) or 0),
+                    "ext": str(extracted.get("ext", "") or "").lower(),
+                    "image": extracted.get("image", b""),
+                }
+            )
+
+    candidates.sort(
+        key=lambda item: (item["coverage"], item["image_coverage"]),
+        reverse=True,
+    )
+    return candidates
+
+
+def _source_text_chars_in_rect(
+    page: pymupdf.Page,
+    rect: pymupdf.Rect,
+) -> int:
+    text = page.get_text("text", clip=rect) or ""
+    return sum(1 for char in text if char.isalnum())
+
+
+def _vector_drawing_count_in_rect(
+    page: pymupdf.Page,
+    rect: pymupdf.Rect,
+) -> int:
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return 0
+
+    count = 0
+    for drawing in drawings:
+        drect = drawing.get("rect")
+        if drect is None:
+            continue
+        if _rect_intersection_area(pymupdf.Rect(drect), rect) > 0.5:
+            count += 1
+    return count
+
+
+def _classify_figure_source(
+    doc: pymupdf.Document,
+    page: pymupdf.Page,
+    rect: pymupdf.Rect,
+) -> tuple[str, dict | None]:
+    """Choose raster only for a genuinely bitmap-only visual.
+
+    Any meaningful PDF text/vector drawing, or raster+vector mixture, is kept
+    in a clipped PDF asset so vector objects remain vector.
+    """
+    candidates = _raster_candidates(doc, page, rect)
+    top = candidates[0] if candidates else None
+    text_chars = _source_text_chars_in_rect(page, rect)
+    drawing_count = _vector_drawing_count_in_rect(page, rect)
+
+    if (
+        top is not None
+        and top["coverage"] >= 0.86
+        and text_chars <= 3
+        and drawing_count <= 1
+    ):
+        return "raster", top
+
+    return "vector_or_mixed", top
+
+
+def _save_raster_asset(
+    page: pymupdf.Page,
+    rect: pymupdf.Rect,
+    candidate: dict,
+    assets_dir: Path,
+    index: int,
+) -> Path:
+    placement = pymupdf.Rect(candidate["rect"])
+    requested_area = max(1.0, float(rect.width * rect.height))
+    intersection = _rect_intersection_area(rect, placement)
+
+    almost_exact = (
+        intersection / requested_area >= 0.97
+        and intersection
+        / max(1.0, float(placement.width * placement.height))
+        >= 0.97
+    )
+
+    ext = str(candidate.get("ext", "") or "").lower()
+    raw = candidate.get("image", b"")
+
+    # Exact embedded JPEG/PNG: retain original bytes and compression.
+    if almost_exact and raw and ext in {"png", "jpg", "jpeg"}:
+        suffix = ".jpg" if ext in {"jpg", "jpeg"} else ".png"
+        out = assets_dir / f"figure_{index:04d}_raster{suffix}"
+        out.write_bytes(raw)
+        return out
+
+    # A crop of a bitmap remains bitmap. Render close to the source image's
+    # native displayed sampling density and save losslessly as PNG.
+    source_width = max(1, int(candidate.get("width", 0) or 0))
+    source_height = max(1, int(candidate.get("height", 0) or 0))
+    scale_x = source_width / max(1.0, placement.width)
+    scale_y = source_height / max(1.0, placement.height)
+    scale = max(1.0, min(8.0, max(scale_x, scale_y)))
+
+    pix = page.get_pixmap(
+        matrix=pymupdf.Matrix(scale, scale),
+        clip=rect,
+        alpha=False,
+    )
+    out = assets_dir / f"figure_{index:04d}_raster.png"
+    pix.save(out)
+    return out
+
+
+def _save_vector_asset(
+    doc: pymupdf.Document,
+    page_index: int,
+    rect: pymupdf.Rect,
+    assets_dir: Path,
+    index: int,
+) -> Path:
+    """Clip the source PDF without rasterizing paths, PDF text or mixed media."""
+    out = assets_dir / f"figure_{index:04d}_vector.pdf"
+    clipped = pymupdf.open()
+    try:
+        target = clipped.new_page(width=rect.width, height=rect.height)
+        target.show_pdf_page(
+            target.rect,
+            doc,
+            page_index,
+            clip=rect,
+            keep_proportion=False,
+        )
+        clipped.save(
+            out,
+            garbage=4,
+            deflate=True,
+            clean=True,
+        )
+    finally:
+        clipped.close()
+    return out
+
+
+def _extract_figure_asset(
     doc: pymupdf.Document,
     page_index: int,
     bbox_norm: list[float],
     assets_dir: Path,
     index: int,
-) -> Path:
+) -> tuple[Path, str]:
     page = doc[page_index]
-    x0, y0, x1, y1 = bbox_norm
-    rect = pymupdf.Rect(
-        page.rect.width * x0 / 1000.0,
-        page.rect.height * y0 / 1000.0,
-        page.rect.width * x1 / 1000.0,
-        page.rect.height * y1 / 1000.0,
-    )
-    rect &= page.rect
+    rect = _normalized_bbox_to_rect(page, bbox_norm)
 
     if rect.width < 4 or rect.height < 4:
         raise RuntimeError(
-            f"Vision agent produced an invalid figure/table bbox: {bbox_norm}"
+            f"Vision agent produced an invalid figure bbox: {bbox_norm}"
         )
 
-    pix = page.get_pixmap(
-        matrix=pymupdf.Matrix(2.0, 2.0),
-        clip=rect,
-        alpha=False,
+    source_type, candidate = _classify_figure_source(doc, page, rect)
+
+    if source_type == "raster" and candidate is not None:
+        asset = _save_raster_asset(
+            page,
+            rect,
+            candidate,
+            assets_dir,
+            index,
+        )
+        print(
+            f"Figure asset {index}: bitmap source preserved as {asset.name}",
+            flush=True,
+        )
+        return asset, "raster"
+
+    asset = _save_vector_asset(
+        doc,
+        page_index,
+        rect,
+        assets_dir,
+        index,
     )
-    out = assets_dir / f"visual_{index:04d}.png"
-    pix.save(out)
-    return out
+    print(
+        f"Figure asset {index}: vector/mixed source preserved as {asset.name}",
+        flush=True,
+    )
+    return asset, "vector_or_mixed"
 
 
 def _page_batches(page_count: int, pages_per_call: int) -> list[list[int]]:
@@ -639,15 +862,49 @@ def reconstruct_document(
                     1, min(3, int(block.get("flow_columns", style["columns"])))
                 )
 
-                if block["kind"] in {"figure", "table"}:
-                    block["asset"] = _crop_visual_asset(
+                if block["kind"] == "figure":
+                    asset_path, asset_type = _extract_figure_asset(
                         doc,
                         pno,
                         block["bbox"],
                         assets_dir,
                         asset_index,
                     )
+                    block["asset"] = asset_path
+                    block["asset_type"] = asset_type
                     asset_index += 1
+                    all_blocks.append(block)
+                    continue
+
+                if block["kind"] == "table":
+                    semantic_rows = []
+                    for row_index, row in enumerate(block.get("table_rows") or []):
+                        semantic_cells = []
+                        for cell_index, original_cell in enumerate(row.get("cells") or []):
+                            cell = dict(original_cell)
+                            source_text, math_map = _assemble_source(
+                                {"parts": cell.get("parts", [])}
+                            )
+                            translation_id = (
+                                f"{block_id}__r{row_index}c{cell_index}"
+                            )
+                            cell["source_text"] = source_text
+                            cell["math_map"] = math_map
+                            cell["translation_id"] = translation_id
+                            semantic_cells.append(cell)
+
+                            if block.get("translate") and source_text:
+                                translation_items.append(
+                                    {
+                                        "id": translation_id,
+                                        "kind": "table_cell",
+                                        "text": source_text,
+                                    }
+                                )
+
+                        semantic_rows.append({"cells": semantic_cells})
+
+                    block["table_rows"] = semantic_rows
                     all_blocks.append(block)
                     continue
 
@@ -1328,6 +1585,120 @@ def preflight_math_blocks(
     )
 
 
+
+def _table_column_count(block: dict) -> int:
+    return max(
+        (
+            sum(
+                max(1, int(cell.get("colspan", 1)))
+                for cell in row.get("cells", [])
+            )
+            for row in block.get("table_rows", [])
+        ),
+        default=0,
+    )
+
+
+def _table_column_type(alignment: str) -> str:
+    return {
+        "left": "L",
+        "center": "C",
+        "right": "R",
+    }.get(str(alignment or "").lower(), "L")
+
+
+def _table_multicolumn_type(alignment: str) -> str:
+    return {
+        "left": "l",
+        "center": "c",
+        "right": "r",
+    }.get(str(alignment or "").lower(), "l")
+
+
+def _render_table_tex(
+    block: dict,
+    translations: dict[str, str],
+) -> str:
+    """Convert the semantic table block into actual LaTeX table syntax."""
+    rows = block.get("table_rows") or []
+    column_count = _table_column_count(block)
+    if not rows or column_count <= 0:
+        return ""
+
+    alignments = list(block.get("table_alignments") or [])
+    if len(alignments) != column_count:
+        alignments = ["left"] * column_count
+
+    column_spec = "".join(
+        _table_column_type(alignment)
+        for alignment in alignments
+    )
+
+    header_rows = max(
+        0,
+        min(int(block.get("table_header_rows", 0) or 0), len(rows)),
+    )
+
+    output = [
+        r"\begin{center}",
+        r"\begingroup",
+        r"\small",
+        r"\setlength{\tabcolsep}{3.8pt}",
+        r"\renewcommand{\arraystretch}{1.12}",
+        rf"\begin{{tabularx}}{{\linewidth}}{{@{{}}{column_spec}@{{}}}}",
+        r"\toprule",
+    ]
+
+    for row_index, row in enumerate(rows):
+        cells_tex: list[str] = []
+        logical_column = 0
+
+        for cell in row.get("cells", []):
+            source = cell.get("source_text", "")
+            translation_id = cell.get("translation_id", "")
+            translated = translations.get(translation_id, source)
+
+            rendered = _render_translated_text(
+                translated,
+                cell.get("math_map", {}),
+            )
+            rendered = _style_wrap(
+                cell.get("style", "normal"),
+                rendered,
+            )
+
+            colspan = max(1, int(cell.get("colspan", 1)))
+            alignment = cell.get("align") or (
+                alignments[logical_column]
+                if logical_column < len(alignments)
+                else "left"
+            )
+
+            if colspan > 1:
+                rendered = (
+                    rf"\multicolumn{{{colspan}}}"
+                    rf"{{{_table_multicolumn_type(alignment)}}}"
+                    rf"{{{rendered}}}"
+                )
+
+            cells_tex.append(rendered)
+            logical_column += colspan
+
+        output.append(" & ".join(cells_tex) + r" \\")
+        if header_rows and row_index + 1 == header_rows:
+            output.append(r"\midrule")
+
+    output.extend(
+        [
+            r"\bottomrule",
+            r"\end{tabularx}",
+            r"\endgroup",
+            r"\end{center}",
+        ]
+    )
+    return "\n".join(output) + "\n"
+
+
 def build_latex(
     style: dict,
     blocks: list[dict],
@@ -1365,6 +1736,9 @@ def build_latex(
 \usepackage{{amsmath,amssymb}}
 \usepackage{{enumitem}}
 \usepackage{{multicol}}
+\usepackage{{array}}
+\usepackage{{tabularx}}
+\usepackage{{booktabs}}
 % Compatibility aliases: avoid extra packages for common AI/source notation.
 \providecommand{{\coloneq}}{{\mathrel{{:=}}}}
 \providecommand{{\coloneqq}}{{\mathrel{{:=}}}}
@@ -1389,6 +1763,9 @@ def build_latex(
 }}
 {_font_setup()}
 \definecolor{{SourceAccent}}{{HTML}}{{{accent}}}
+\newcolumntype{{L}}{{>{{\raggedright\arraybackslash}}X}}
+\newcolumntype{{C}}{{>{{\centering\arraybackslash}}X}}
+\newcolumntype{{R}}{{>{{\raggedleft\arraybackslash}}X}}
 \setlength{{\columnsep}}{{{gap:.2f}pt}}
 \setlength{{\parindent}}{{{float(style.get('paragraph_indent_em', 1.0)):.2f}em}}
 \setlength{{\parskip}}{{0pt}}
@@ -1576,8 +1953,12 @@ def build_latex(
             out.append(_equation_tex(block))
             continue
 
-        if kind in {"figure", "table"}:
+        if kind == "figure":
             out.append(render_nonfloat_visual(block))
+            continue
+
+        if kind == "table":
+            out.append(_render_table_tex(block, translations))
             continue
 
         text = block_text(block)
