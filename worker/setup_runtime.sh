@@ -16,7 +16,7 @@ if ! command -v xelatex >/dev/null 2>&1; then
   export PATH="$HOME/.TinyTeX/bin/x86_64-linux:$PATH"
 fi
 
-tlmgr install lm xetexko cjk-ko enumitem geometry graphics xcolor amsmath amsfonts
+tlmgr install lm xetexko cjk-ko enumitem geometry graphics xcolor amsmath amsfonts tools
 
 FONT_DIR="$HOME/.cache/pdf-translator-fonts"
 mkdir -p "$FONT_DIR"
@@ -50,5 +50,6 @@ done
 kpsewhich xetexko.sty >/dev/null
 kpsewhich kolabels-utf.sty >/dev/null
 kpsewhich amsmath.sty >/dev/null
+kpsewhich multicol.sty >/dev/null
 test -x ".venv/bin/python"
 test -x "$HOME/.TinyTeX/bin/x86_64-linux/xelatex"

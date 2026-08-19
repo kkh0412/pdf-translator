@@ -1,7 +1,7 @@
-runtime-cache-version=6.1
+runtime-cache-version=6.2
 runner=ubuntu-24.04
 python=3.12-system
 tinytex=2026.07
-tex-packages=lm,xetexko,cjk-ko,enumitem,geometry,graphics,xcolor,amsmath,amsfonts
+tex-packages=lm,xetexko,cjk-ko,enumitem,geometry,graphics,xcolor,amsmath,amsfonts,tools
 latin-fonts=LatinModernRoman,LatinModernSans
 korean-fonts=NanumMyeongjo,NanumGothic

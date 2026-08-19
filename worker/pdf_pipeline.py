@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import re
 import shutil
 import subprocess
+import time
 import unicodedata
 from pathlib import Path
 
 import pymupdf
 
 from .translator import translate_blocks
-from .vision_agent import analyze_style, parse_page
+from .vision_agent import GeminiVisionError, analyze_document, parse_pages
 
 
 PLACEHOLDER_RE = re.compile(r"\[\[MATH_(\d+)\]\]")
@@ -23,7 +25,8 @@ DANGEROUS_MATH = re.compile(
 def _sanitize_unicode(text: str) -> str:
     text = unicodedata.normalize("NFC", text or "")
     return "".join(
-        ch for ch in text
+        ch
+        for ch in text
         if ch in {"\n", "\t"} or not unicodedata.category(ch).startswith("C")
     )
 
@@ -57,9 +60,17 @@ def _clean_math(latex: str) -> str:
         r"\1",
         latex,
         flags=re.S,
+    )
+    latex = re.sub(
+        r"^\s*\\begin\{aligned\}(.*?)\\end\{aligned\}\s*$",
+        r"\1",
+        latex,
+        flags=re.S,
     ).strip()
+
     if DANGEROUS_MATH.search(latex):
         raise RuntimeError("Unsafe LaTeX command returned by the vision agent")
+
     return latex
 
 
@@ -67,9 +78,11 @@ def _assemble_source(block: dict) -> tuple[str, dict[str, str]]:
     pieces: list[str] = []
     math_map: dict[str, str] = {}
     math_index = 0
+
     for part in block.get("parts", []):
         ptype = part.get("type")
         content = str(part.get("content", ""))
+
         if ptype == "math":
             token = f"[[MATH_{math_index}]]"
             math_map[token] = _clean_math(content)
@@ -77,20 +90,27 @@ def _assemble_source(block: dict) -> tuple[str, dict[str, str]]:
             math_index += 1
         else:
             pieces.append(content)
+
     return "".join(pieces).strip(), math_map
 
 
 def _render_translated_text(text: str, math_map: dict[str, str]) -> str:
     out: list[str] = []
     pos = 0
+
     for match in PLACEHOLDER_RE.finditer(text):
         out.append(_escape_text(text[pos:match.start()]))
         token = match.group(0)
         formula = math_map.get(token)
+
         if formula is None:
             raise RuntimeError(f"Unknown math placeholder in translation: {token}")
+
+        # Inline mathematics is always real LaTeX. Superscripts/subscripts
+        # reconstructed by the vision agent remain untouched here.
         out.append(r"\(" + formula + r"\)")
         pos = match.end()
+
     out.append(_escape_text(text[pos:]))
     return "".join(out)
 
@@ -111,31 +131,103 @@ def _crop_visual_asset(
         page.rect.height * y1 / 1000.0,
     )
     rect &= page.rect
+
     if rect.width < 4 or rect.height < 4:
-        raise RuntimeError(f"Vision agent produced an invalid figure/table bbox: {bbox_norm}")
-    pix = page.get_pixmap(matrix=pymupdf.Matrix(2.0, 2.0), clip=rect, alpha=False)
+        raise RuntimeError(
+            f"Vision agent produced an invalid figure/table bbox: {bbox_norm}"
+        )
+
+    pix = page.get_pixmap(
+        matrix=pymupdf.Matrix(2.0, 2.0),
+        clip=rect,
+        alpha=False,
+    )
     out = assets_dir / f"visual_{index:04d}.png"
     pix.save(out)
     return out
 
 
+def _page_batches(page_count: int, pages_per_call: int) -> list[list[int]]:
+    return [
+        list(range(start, min(page_count, start + pages_per_call)))
+        for start in range(0, page_count, pages_per_call)
+    ]
+
+
 def reconstruct_document(
     pdf_path: Path,
+    target_language: str,
     work_dir: Path,
     max_pages: int,
-) -> tuple[dict, list[dict], list[dict]]:
+) -> tuple[dict, dict, list[dict], list[dict]]:
     doc = pymupdf.open(pdf_path)
     try:
         if doc.page_count == 0:
             raise RuntimeError("PDF has no pages")
         if doc.page_count > max_pages:
-            raise RuntimeError(f"This demo accepts at most {max_pages} pages per PDF")
+            raise RuntimeError(
+                f"This demo accepts at most {max_pages} pages per PDF"
+            )
         source_pages = doc.page_count
     finally:
         doc.close()
 
-    print(f"Vision style agent: analyzing rendered source pages ({source_pages} pages total)", flush=True)
-    style = analyze_style(pdf_path)
+    print(
+        f"Document pre-scan: style + field + terminology strategy "
+        f"({source_pages} pages total)",
+        flush=True,
+    )
+    style, strategy = analyze_document(pdf_path, target_language)
+
+    pages_per_call = max(
+        1, min(3, int(os.getenv("VISION_PAGES_PER_CALL", "2")))
+    )
+    workers = max(1, min(3, int(os.getenv("VISION_WORKERS", "2"))))
+    batches = _page_batches(source_pages, pages_per_call)
+
+    print(
+        f"Vision reconstruction plan: {source_pages} pages -> "
+        f"{len(batches)} calls, up to {pages_per_call} pages/call, workers={workers}",
+        flush=True,
+    )
+
+    def parse_batch(indices: list[int]) -> dict[int, list[dict]]:
+        try:
+            return parse_pages(pdf_path, indices, style, strategy)
+        except Exception as exc:
+            if len(indices) == 1:
+                raise
+            print(
+                f"Vision batch {[i + 1 for i in indices]} failed; "
+                f"retrying pages individually: {exc}",
+                flush=True,
+            )
+            merged: dict[int, list[dict]] = {}
+            for index in indices:
+                merged.update(parse_pages(pdf_path, [index], style, strategy))
+            return merged
+
+    page_results: dict[int, list[dict]] = {}
+
+    if workers == 1 or len(batches) <= 1:
+        for batch in batches:
+            page_results.update(parse_batch(batch))
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {
+                executor.submit(parse_batch, batch): batch for batch in batches
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                page_results.update(future.result())
+
+    missing_pages = [
+        index for index in range(source_pages) if index not in page_results
+    ]
+    if missing_pages:
+        raise RuntimeError(
+            f"Vision reconstruction missed pages: "
+            f"{[index + 1 for index in missing_pages]}"
+        )
 
     all_blocks: list[dict] = []
     translation_items: list[dict] = []
@@ -146,27 +238,36 @@ def reconstruct_document(
     doc = pymupdf.open(pdf_path)
     try:
         for pno in range(source_pages):
-            print(
-                f"Vision content agent: reading page image {pno + 1}/{source_pages}",
-                flush=True,
-            )
-            blocks = parse_page(pdf_path, pno, style)
-            for local_index, block in enumerate(blocks):
-                block = dict(block)
+            for local_index, original_block in enumerate(page_results[pno]):
+                block = dict(original_block)
                 block_id = f"p{pno}_b{local_index}"
                 block["id"] = block_id
                 block["page"] = pno
+                block["flow_columns"] = max(
+                    1, min(3, int(block.get("flow_columns", style["columns"])))
+                )
 
                 if block["kind"] in {"figure", "table"}:
                     block["asset"] = _crop_visual_asset(
-                        doc, pno, block["bbox"], assets_dir, asset_index
+                        doc,
+                        pno,
+                        block["bbox"],
+                        assets_dir,
+                        asset_index,
                     )
                     asset_index += 1
                     all_blocks.append(block)
                     continue
 
                 if block["kind"] == "equation":
-                    block["equation_latex"] = _clean_math(block["equation_latex"])
+                    block["equation_latex"] = _clean_math(
+                        block.get("equation_latex", "")
+                    )
+                    block["equation_lines"] = [
+                        _clean_math(line)
+                        for line in block.get("equation_lines", [])
+                        if str(line).strip()
+                    ]
                     all_blocks.append(block)
                     continue
 
@@ -186,7 +287,7 @@ def reconstruct_document(
     finally:
         doc.close()
 
-    return style, all_blocks, translation_items
+    return style, strategy, all_blocks, translation_items
 
 
 def _hex_color(value: str) -> str:
@@ -197,7 +298,12 @@ def _hex_color(value: str) -> str:
 
 
 def _copy_fonts(work_dir: Path) -> None:
-    source = Path(os.getenv("BOOK_FONT_DIR", "/home/runner/.cache/pdf-translator-fonts"))
+    source = Path(
+        os.getenv(
+            "BOOK_FONT_DIR",
+            "/home/runner/.cache/pdf-translator-fonts",
+        )
+    )
     needed = [
         "lmroman10-regular.otf",
         "lmroman10-bold.otf",
@@ -212,13 +318,16 @@ def _copy_fonts(work_dir: Path) -> None:
         "NanumGothic-Regular.ttf",
         "NanumGothic-Bold.ttf",
     ]
-    missing = [x for x in needed if not (source / x).exists()]
+    missing = [name for name in needed if not (source / name).exists()]
     if missing:
         raise RuntimeError(
-            f"Typography runtime is missing fonts in {source}: {', '.join(missing)}"
+            f"Typography runtime is missing fonts in {source}: "
+            + ", ".join(missing)
         )
+
     target = work_dir / "font"
     target.mkdir(parents=True, exist_ok=True)
+
     for name in needed:
         shutil.copy2(source / name, target / name)
 
@@ -266,27 +375,247 @@ def _style_wrap(style: str, text: str) -> str:
     return text
 
 
+_TOP_LEVEL_BREAK_TOKENS = [
+    r"\Longleftrightarrow",
+    r"\Leftrightarrow",
+    r"\Longrightarrow",
+    r"\Rightarrow",
+    r"\Longleftarrow",
+    r"\Leftarrow",
+    r"\iff",
+    r"\coloneqq",
+    r"\equiv",
+    r"\approx",
+    r"\simeq",
+    r"\neq",
+    r"\leq",
+    r"\geq",
+    ":=",
+    "=",
+    r"\pm",
+    r"\mp",
+    r"\oplus",
+    r"\otimes",
+    "+",
+    "-",
+]
+
+
+def _top_level_breaks(math: str) -> list[tuple[int, str]]:
+    """Return safe operator positions outside {...} and paired delimiters."""
+    breaks: list[tuple[int, str]] = []
+    brace_depth = 0
+    paren_depth = 0
+    i = 0
+
+    while i < len(math):
+        char = math[i]
+
+        if char == "{":
+            brace_depth += 1
+            i += 1
+            continue
+        if char == "}":
+            brace_depth = max(0, brace_depth - 1)
+            i += 1
+            continue
+
+        if brace_depth == 0:
+            if char in "([":
+                paren_depth += 1
+                i += 1
+                continue
+            if char in ")]":
+                paren_depth = max(0, paren_depth - 1)
+                i += 1
+                continue
+
+        if brace_depth == 0 and paren_depth == 0:
+            matched = False
+            for token in _TOP_LEVEL_BREAK_TOKENS:
+                if math.startswith(token, i):
+                    # Avoid interpreting a unary leading minus as a break.
+                    if token == "-" and i < 4:
+                        continue
+                    breaks.append((i, token))
+                    i += len(token)
+                    matched = True
+                    break
+            if matched:
+                continue
+
+        # Skip over TeX command names so their internal letters are untouched.
+        if char == "\\" and i + 1 < len(math) and math[i + 1].isalpha():
+            i += 2
+            while i < len(math) and math[i].isalpha():
+                i += 1
+            continue
+
+        i += 1
+
+    return breaks
+
+
+def _auto_break_equation(math: str, target: int) -> list[str]:
+    math = " ".join(math.split())
+    if len(math) <= target:
+        return [math]
+
+    breaks = _top_level_breaks(math)
+    if not breaks:
+        return [math]
+
+    lines: list[str] = []
+    start = 0
+
+    while len(math) - start > target:
+        candidates = [
+            (pos, token)
+            for pos, token in breaks
+            if start + max(18, int(target * 0.52)) <= pos <= start + target
+        ]
+
+        if not candidates:
+            candidates = [
+                (pos, token)
+                for pos, token in breaks
+                if start + 16 <= pos <= start + int(target * 1.20)
+            ]
+
+        if not candidates:
+            break
+
+        pos, token = max(candidates, key=lambda item: item[0])
+        segment = math[start:pos].strip()
+
+        if segment:
+            lines.append(segment)
+
+        # Keep the relation/operator at the start of the continuation line.
+        start = pos
+
+        # Avoid an infinite loop.
+        if len(lines) > 8:
+            break
+
+    tail = math[start:].strip()
+    if tail:
+        lines.append(tail)
+
+    if len(lines) <= 1:
+        return [math]
+
+    return lines
+
+
+def _align_math_lines(lines: list[str]) -> list[str]:
+    aligned: list[str] = []
+
+    relation_pattern = re.compile(
+        r"(\\Longleftrightarrow|\\Leftrightarrow|\\Longrightarrow|"
+        r"\\Rightarrow|\\Longleftarrow|\\Leftarrow|\\iff|\\coloneqq|"
+        r"\\equiv|\\approx|\\simeq|\\neq|\\leq|\\geq|:=|=)"
+    )
+
+    for index, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if "&" in line:
+            aligned.append(line)
+            continue
+
+        if index > 0:
+            if re.match(
+                r"^(?:=|:=|\+|-|\\pm|\\mp|\\oplus|\\otimes|"
+                r"\\Rightarrow|\\Leftrightarrow|\\iff|\\leq|\\geq|\\neq)",
+                line,
+            ):
+                aligned.append(r"&\quad " + line)
+                continue
+
+        match = relation_pattern.search(line)
+        if match:
+            pos = match.start()
+            aligned.append(line[:pos] + "&" + line[pos:])
+        else:
+            aligned.append(line)
+
+    return aligned
+
+
 def _equation_tex(block: dict) -> str:
     body = _clean_math(block.get("equation_latex", ""))
+    supplied_lines = [
+        _clean_math(line)
+        for line in block.get("equation_lines", [])
+        if str(line).strip()
+    ]
     number = _escape_text(str(block.get("equation_number", "")).strip())
+
+    if not body and supplied_lines:
+        body = " ".join(supplied_lines)
     if not body:
         return ""
 
-    # Vision extraction may return a multiline body. Use aligned for explicit line breaks.
-    if r"\\" in body and r"\begin{" not in body:
-        body = r"\begin{aligned}" + body + r"\end{aligned}"
+    flow_columns = max(1, min(3, int(block.get("flow_columns", 1))))
+    is_full = block.get("column") == "full"
+
+    # Approximate target TeX length for one visual line. Narrower local flows
+    # get more aggressive breaking.
+    if is_full or flow_columns == 1:
+        target = 118
+    elif flow_columns == 2:
+        target = 70
+    else:
+        target = 52
+
+    if supplied_lines:
+        lines = supplied_lines
+        # A vision-provided line can still be too wide. Subdivide only that line.
+        refined: list[str] = []
+        for line in lines:
+            refined.extend(_auto_break_equation(line, target))
+        lines = refined
+    elif r"\\" in body and r"\begin{" not in body:
+        lines = [part.strip() for part in body.split(r"\\") if part.strip()]
+    else:
+        lines = _auto_break_equation(body, target)
 
     tag = rf"\tag{{{number}}}" if number else ""
-    if len(body) > 170 and r"\\" not in body and r"\begin{" not in body:
+
+    if len(lines) > 1:
+        lines = _align_math_lines(lines)
         return (
             "\\begin{equation}\n"
-            "\\resizebox{0.98\\columnwidth}{!}{$\\displaystyle "
-            + body
+            "\\begin{aligned}\n"
+            + " \\\\\n".join(lines)
+            + "\n\\end{aligned}"
+            + tag
+            + "\n\\end{equation}\n"
+        )
+
+    single = lines[0]
+
+    # Last resort only: if there is no safe mathematical breakpoint at all,
+    # scale that indivisible expression instead of letting it leave the column.
+    if len(single) > int(target * 1.30):
+        return (
+            "\\begin{equation}\n"
+            "\\resizebox{0.98\\linewidth}{!}{$\\displaystyle "
+            + single
             + "$}"
             + tag
             + "\n\\end{equation}\n"
         )
-    return "\\begin{equation}\n" + body + tag + "\n\\end{equation}\n"
+
+    return (
+        "\\begin{equation}\n"
+        + single
+        + tag
+        + "\n\\end{equation}\n"
+    )
 
 
 def build_latex(
@@ -297,15 +626,22 @@ def build_latex(
 ) -> str:
     _copy_fonts(work_dir)
 
-    columns = int(style.get("columns", 1))
-    class_options = "10pt,twocolumn" if columns == 2 else "10pt"
-    body_size = float(style.get("body_size_pt", 9.3))
+    # User-facing readability adjustment:
+    # slightly smaller body type, slightly more leading than the detected source.
+    detected_body = float(style.get("body_size_pt", 9.3))
+    body_size = max(7.6, min(10.2, detected_body * 0.94))
+    leading_factor = max(
+        1.24,
+        min(1.32, float(style.get("line_spacing", 1.04)) * 1.20),
+    )
+    baseline = body_size * leading_factor
+
     title_size = float(style.get("title_size_pt", 20.0))
-    section_size = float(style.get("section_size_pt", 11.5))
+    section_size = float(style.get("section_size_pt", 11.5)) * 0.97
     accent = _hex_color(style.get("title_color", "#333333"))
     gap = float(style.get("column_gap_pt", 18.0))
 
-    preamble = rf"""\documentclass[{class_options}]{{article}}
+    preamble = rf"""\documentclass[10pt]{{article}}
 \usepackage{{fontspec}}
 \usepackage{{xetexko}}
 \usepackage{{geometry}}
@@ -313,6 +649,7 @@ def build_latex(
 \usepackage{{xcolor}}
 \usepackage{{amsmath,amssymb}}
 \usepackage{{enumitem}}
+\usepackage{{multicol}}
 \geometry{{
   paperwidth={style['page_width_pt']:.2f}pt,
   paperheight={style['page_height_pt']:.2f}pt,
@@ -326,10 +663,13 @@ def build_latex(
 \setlength{{\columnsep}}{{{gap:.2f}pt}}
 \setlength{{\parindent}}{{{float(style.get('paragraph_indent_em', 1.0)):.2f}em}}
 \setlength{{\parskip}}{{0pt}}
-\setlength{{\emergencystretch}}{{1.5em}}
-\linespread{{{float(style.get('line_spacing', 1.04)):.3f}}}
-\AtBeginDocument{{\fontsize{{{body_size:.2f}pt}}{{{body_size*1.18:.2f}pt}}\selectfont}}
-\setlist[itemize]{{leftmargin=1.6em,itemsep=0.1em,topsep=0.2em,parsep=0pt}}
+\setlength{{\emergencystretch}}{{1.7em}}
+\setlength{{\multicolsep}}{{0.35em}}
+\setlength{{\premulticols}}{{0.2em}}
+\setlength{{\postmulticols}}{{0.2em}}
+\AtBeginDocument{{\fontsize{{{body_size:.2f}pt}}{{{baseline:.2f}pt}}\selectfont}}
+\setlist[itemize]{{leftmargin=1.5em,itemsep=0.12em,topsep=0.25em,parsep=0pt}}
+\allowdisplaybreaks[2]
 \raggedbottom
 \makeatletter
 \def\ps@sourcepage{{%
@@ -340,20 +680,26 @@ def build_latex(
 \makeatother
 \pagestyle{{sourcepage}}
 \newcommand{{\SourceSection}}[1]{{%
-  \par\vspace{{0.55em}}\noindent
-  {{\sffamily\fontsize{{{section_size:.2f}pt}}{{{section_size*1.15:.2f}pt}}\selectfont #1}}
+  \par\vspace{{0.52em}}\noindent
+  {{\sffamily\fontsize{{{section_size:.2f}pt}}{{{section_size*1.18:.2f}pt}}\selectfont #1}}
   \par\vspace{{0.25em}}}}
 \newcommand{{\SourceSubsection}}[1]{{%
-  \par\vspace{{0.42em}}\noindent
-  {{\sffamily\bfseries #1}}\par\vspace{{0.15em}}}}
+  \par\vspace{{0.40em}}\noindent
+  {{\sffamily\bfseries #1}}\par\vspace{{0.16em}}}}
 \begin{{document}}
 """
 
-    title_blocks = []
-    body_blocks = []
+    title_blocks: list[dict] = []
+    body_blocks: list[dict] = []
     in_front = True
+
     for block in blocks:
-        if in_front and block["kind"] in {"title", "author", "affiliation", "metadata"}:
+        if in_front and block["kind"] in {
+            "title",
+            "author",
+            "affiliation",
+            "metadata",
+        }:
             title_blocks.append(block)
         else:
             in_front = False
@@ -362,20 +708,38 @@ def build_latex(
     def block_text(block: dict) -> str:
         source = block.get("source_text", "")
         translated = translations.get(block["id"], source)
-        return _render_translated_text(translated, block.get("math_map", {}))
+        return _render_translated_text(
+            translated,
+            block.get("math_map", {}),
+        )
 
-    front_tex: list[str] = []
+    out = [preamble]
+
     for block in title_blocks:
         kind = block["kind"]
         text = block_text(block)
+
         if not text:
             continue
+
         if kind == "title":
             align = style.get("title_alignment", "left")
-            begin = r"\begin{center}" if align == "center" else r"\begin{flushleft}"
-            end = r"\end{center}" if align == "center" else r"\end{flushleft}"
-            family = r"\sffamily" if style.get("title_family") == "sans" else r"\rmfamily"
-            front_tex.append(
+            begin = (
+                r"\begin{center}"
+                if align == "center"
+                else r"\begin{flushleft}"
+            )
+            end = (
+                r"\end{center}"
+                if align == "center"
+                else r"\end{flushleft}"
+            )
+            family = (
+                r"\sffamily"
+                if style.get("title_family") == "sans"
+                else r"\rmfamily"
+            )
+            out.append(
                 begin
                 + "\n{"
                 + family
@@ -383,47 +747,92 @@ def build_latex(
                 + text
                 + "}\n"
                 + end
-                + "\n\\vspace{0.25em}\n"
+                + "\n\\vspace{0.20em}\n"
             )
+
         elif kind == "author":
-            front_tex.append(
+            out.append(
                 "\\begin{center}{\\sffamily\\small "
                 + text
-                + "}\\end{center}\\vspace{0.15em}\n"
+                + "}\\end{center}\\vspace{0.12em}\n"
             )
+
         elif kind == "affiliation":
-            front_tex.append(
-                "\\noindent{\\sffamily\\fontsize{7.6pt}{9.0pt}\\selectfont "
+            out.append(
+                "\\noindent{\\sffamily\\fontsize{7.4pt}{8.8pt}\\selectfont "
                 + text
                 + "}\\par\n"
             )
+
         else:
-            front_tex.append(
+            out.append(
                 "\\noindent{\\sffamily\\scriptsize "
                 + text
                 + "}\\par\n"
             )
 
-    out = [preamble]
-    if title_blocks and columns == 2 and style.get("title_full_width", True):
-        out.append("\\twocolumn[{\\begin{@twocolumnfalse}\n")
-        out.extend(front_tex)
-        out.append("\\vspace{0.55em}\\end{@twocolumnfalse}}]\n")
-    else:
-        out.extend(front_tex)
-
+    current_columns = 1
     in_items = False
 
-    def close_items():
+    def close_items() -> None:
         nonlocal in_items
         if in_items:
             out.append("\\end{itemize}\n")
             in_items = False
 
+    def close_columns() -> None:
+        nonlocal current_columns
+        close_items()
+        if current_columns > 1:
+            out.append("\\end{multicols}\n")
+        current_columns = 1
+
+    def set_columns(desired: int) -> None:
+        nonlocal current_columns
+        desired = max(1, min(3, desired))
+        if desired == current_columns:
+            return
+
+        close_items()
+
+        if current_columns > 1:
+            out.append("\\end{multicols}\n")
+
+        current_columns = desired
+
+        if current_columns > 1:
+            out.append(
+                rf"\begin{{multicols}}{{{current_columns}}}\raggedcolumns" + "\n"
+            )
+
+    def render_nonfloat_visual(block: dict) -> str:
+        asset = Path(block["asset"]).relative_to(work_dir).as_posix()
+        full = block.get("column") == "full"
+        width = r"0.93\linewidth" if not full else r"0.90\textwidth"
+        return (
+            "\\begin{center}\n"
+            rf"\includegraphics[width={width}]{{\detokenize{{{asset}}}}}"
+            "\n\\end{center}\n"
+        )
+
     for block in body_blocks:
         kind = block["kind"]
-        if kind in {"footer"}:
+
+        if kind == "footer":
             continue
+
+        desired_columns = max(
+            1,
+            min(3, int(block.get("flow_columns", style.get("columns", 1)))),
+        )
+        full_width = block.get("column") == "full" and desired_columns > 1
+
+        if full_width:
+            # A wide equation/figure/title-like block temporarily leaves the
+            # local column flow. The next ordinary block reopens its own flow.
+            close_columns()
+        else:
+            set_columns(desired_columns)
 
         if kind == "list_item":
             if not in_items:
@@ -439,15 +848,7 @@ def build_latex(
             continue
 
         if kind in {"figure", "table"}:
-            asset = Path(block["asset"]).relative_to(work_dir).as_posix()
-            full = columns == 2 and block.get("column") == "full"
-            env = "figure*" if full else "figure"
-            width = r"0.92\textwidth" if full else r"0.96\columnwidth"
-            out.append(
-                rf"\begin{{{env}}}[!ht]\centering"
-                rf"\includegraphics[width={width}]{{\detokenize{{{asset}}}}}"
-                rf"\end{{{env}}}" + "\n"
-            )
+            out.append(render_nonfloat_visual(block))
             continue
 
         text = block_text(block)
@@ -461,26 +862,42 @@ def build_latex(
                 text = r"\textbf{" + text + "}"
             elif emphasis == "italic":
                 text = r"\textit{" + text + "}"
-            out.append("\\noindent " + text + "\\par\\vspace{0.55em}\n")
+            out.append(
+                "\\noindent " + text + "\\par\\vspace{0.48em}\n"
+            )
+
         elif kind == "section":
             out.append("\\SourceSection{" + text + "}\n")
+
         elif kind == "subsection":
             out.append("\\SourceSubsection{" + text + "}\n")
+
         elif kind == "caption":
-            out.append("\\noindent{\\small " + text + "}\\par\\vspace{0.35em}\n")
+            out.append(
+                "\\noindent{\\small "
+                + text
+                + "}\\par\\vspace{0.32em}\n"
+            )
+
         elif kind == "reference":
             out.append("\\noindent{\\small " + text + "}\\par\n")
+
         elif kind in {"author", "affiliation", "metadata"}:
             out.append("\\noindent{\\small " + text + "}\\par\n")
+
         else:
             out.append(text + "\\par\n")
 
-    close_items()
+    close_columns()
     out.append("\\end{document}\n")
     return "".join(out)
 
 
-def compile_latex(tex_source: str, work_dir: Path, output_path: Path) -> None:
+def compile_latex(
+    tex_source: str,
+    work_dir: Path,
+    output_path: Path,
+) -> None:
     work_dir.mkdir(parents=True, exist_ok=True)
     tex_path = work_dir / "translated.tex"
     tex_source = _sanitize_unicode(tex_source)
@@ -489,6 +906,8 @@ def compile_latex(tex_source: str, work_dir: Path, output_path: Path) -> None:
     engine = shutil.which("xelatex")
     if not engine:
         raise RuntimeError("xelatex was not found in the prepared runtime")
+
+    final_stdout = ""
 
     for run_no in range(2):
         proc = subprocess.run(
@@ -505,6 +924,8 @@ def compile_latex(tex_source: str, work_dir: Path, output_path: Path) -> None:
             text=True,
             timeout=240,
         )
+        final_stdout = proc.stdout
+
         if proc.returncode != 0:
             raise RuntimeError(
                 f"XeLaTeX compilation failed on pass {run_no + 1}:\n"
@@ -514,29 +935,22 @@ def compile_latex(tex_source: str, work_dir: Path, output_path: Path) -> None:
     generated = work_dir / "translated.pdf"
     if not generated.exists():
         raise RuntimeError("XeLaTeX produced no translated.pdf")
+
+    # Do not fail for ordinary line-adjustment warnings, but surface meaningful
+    # overfull boxes so equation/layout regressions are visible in Actions.
+    overfull = re.findall(
+        r"Overfull \\hbox \(([\d.]+)pt too wide\)",
+        final_stdout,
+    )
+    serious = [float(value) for value in overfull if float(value) >= 8.0]
+    if serious:
+        print(
+            "Warning: XeLaTeX reported serious overfull boxes: "
+            + ", ".join(f"{value:.1f}pt" for value in serious[:12]),
+            flush=True,
+        )
+
     shutil.copy2(generated, output_path)
-
-
-def _column_guess(pdf_path: Path) -> int:
-    doc = pymupdf.open(pdf_path)
-    try:
-        votes = 0
-        considered = 0
-        width = float(doc[0].rect.width)
-        for pno in range(min(doc.page_count, 6)):
-            blocks = [
-                b for b in doc[pno].get_text("blocks")
-                if len(str(b[4]).strip()) >= 30
-            ]
-            left = [b for b in blocks if b[2] <= width * 0.58]
-            right = [b for b in blocks if b[0] >= width * 0.42]
-            if blocks:
-                considered += 1
-                if len(left) >= 2 and len(right) >= 2:
-                    votes += 1
-        return 2 if considered and votes / considered >= 0.40 else 1
-    finally:
-        doc.close()
 
 
 def process_pdf(
@@ -546,6 +960,7 @@ def process_pdf(
     output_path: Path,
     max_pages: int,
 ) -> dict:
+    started = time.perf_counter()
     work_dir.mkdir(parents=True, exist_ok=True)
 
     src_doc = pymupdf.open(pdf_path)
@@ -554,19 +969,53 @@ def process_pdf(
     finally:
         src_doc.close()
 
-    style, blocks, translation_items = reconstruct_document(
-        pdf_path, work_dir, max_pages=max_pages
+    phase = time.perf_counter()
+    style, strategy, blocks, translation_items = reconstruct_document(
+        pdf_path,
+        target_language,
+        work_dir,
+        max_pages=max_pages,
     )
+    vision_seconds = time.perf_counter() - phase
 
+    flow_counts = sorted(
+        {
+            int(block.get("flow_columns", 1))
+            for block in blocks
+            if block.get("kind") not in {"title", "author", "affiliation", "metadata"}
+        }
+    )
     print(
-        f"Translation agent: translating {len(translation_items)} semantic text blocks; "
-        "all math remains protected LaTeX",
+        f"Detected local column flows: {flow_counts}",
         flush=True,
     )
-    translations = translate_blocks(translation_items, target_language)
 
-    tex_source = build_latex(style, blocks, translations, work_dir)
-    compile_latex(tex_source, work_dir, output_path)
+    phase = time.perf_counter()
+    print(
+        f"Translation agent: translating {len(translation_items)} semantic text blocks; "
+        "all inline/display math remains protected LaTeX",
+        flush=True,
+    )
+    translations = translate_blocks(
+        translation_items,
+        target_language,
+        strategy,
+    )
+    translation_seconds = time.perf_counter() - phase
+
+    phase = time.perf_counter()
+    tex_source = build_latex(
+        style,
+        blocks,
+        translations,
+        work_dir,
+    )
+    compile_latex(
+        tex_source,
+        work_dir,
+        output_path,
+    )
+    latex_seconds = time.perf_counter() - phase
 
     out_doc = pymupdf.open(output_path)
     try:
@@ -574,22 +1023,31 @@ def process_pdf(
     finally:
         out_doc.close()
 
-    if style.get("columns") == 2 and _column_guess(output_path) != 2:
+    if source_pages >= 3 and output_pages > max(
+        source_pages * 2.4,
+        source_pages + 12,
+    ):
         raise RuntimeError(
-            "Style validation failed: source is two-column but generated PDF is not."
+            f"Style/content validation failed: {source_pages} source pages "
+            f"became {output_pages} output pages, which is implausibly large."
         )
 
-    # Reflow is allowed, but an extreme page explosion usually means malformed reconstruction.
-    if source_pages >= 3 and output_pages > max(source_pages * 2.4, source_pages + 12):
-        raise RuntimeError(
-            f"Style/content validation failed: {source_pages} source pages became "
-            f"{output_pages} output pages, which is implausibly large."
-        )
+    total_seconds = time.perf_counter() - started
+    print(
+        "Timing summary: "
+        f"vision+structure={vision_seconds:.1f}s, "
+        f"translation={translation_seconds:.1f}s, "
+        f"latex={latex_seconds:.1f}s, total={total_seconds:.1f}s",
+        flush=True,
+    )
 
     return {
         "pages": output_pages,
         "translated_segments": len(translation_items),
         "source_pages": source_pages,
         "columns": style.get("columns"),
-        "render_mode": "vision-first-semantic-latex",
+        "column_flows": flow_counts,
+        "field": strategy.get("field"),
+        "subfield": strategy.get("subfield"),
+        "render_mode": "vision-first-dynamic-columns-latex-v6.2",
     }

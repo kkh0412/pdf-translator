@@ -32,6 +32,8 @@ jobs:
             ~/.cache/pdf-translator-fonts
             .venv
           key: ${{ runner.os }}-${{ runner.arch }}-pdf-translator-runtime-v6-${{ hashFiles('worker/requirements.txt', 'worker/latex_requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-pdf-translator-runtime-v6-
 
       - name: Build on cache miss
         if: steps.runtime-cache.outputs.cache-hit != 'true'
@@ -46,19 +48,31 @@ jobs:
           mkdir -p "$TMP/font"
           cp "$HOME/.cache/pdf-translator-fonts/"* "$TMP/font/"
           cat > "$TMP/smoke.tex" <<'EOF'
-          \documentclass[10pt,twocolumn]{article}
+          \documentclass[10pt]{article}
           \usepackage{fontspec}
           \usepackage{xetexko}
           \usepackage{amsmath,amssymb}
+          \usepackage{multicol}
           \setmainfont[Path={font/},UprightFont=lmroman10-regular.otf,BoldFont=lmroman10-bold.otf,ItalicFont=lmroman10-italic.otf]{lmroman10-regular.otf}
           \setmainhangulfont[Path={font/},UprightFont=NanumMyeongjo-Regular.ttf,BoldFont=NanumMyeongjo-Bold.ttf]{NanumMyeongjo-Regular.ttf}
           \begin{document}
-          \twocolumn[{\begin{@twocolumnfalse}\Large A translated scientific article\par\vspace{1em}\end{@twocolumnfalse}}]
-          양자 상태 $\rho$와 기준 상태 $\gamma$에 대해
+          {\Large A translated scientific article\par\vspace{1em}}
+          \begin{multicols}{2}
+          양자 상태 $\rho^T$와 기준 상태 $\gamma_x$에 대해
+          $S_{\mathcal M,\gamma}^{(j)}(\rho)$를 고려한다.
           \begin{equation}
-          S_{\mathcal M,\gamma}(\rho)=S(\rho)+D(\rho\Vert\gamma)-D(\mathcal M(\rho)\Vert\mathcal M(\gamma)).
+          \begin{aligned}
+          S_{\mathcal M,\gamma}^{(j)}(\rho)
+          &= S(\rho)+D(\rho\Vert\gamma) \\
+          &\quad -D(\mathcal M(\rho)\Vert\mathcal M(\gamma)).
+          \end{aligned}
           \end{equation}
-          본문은 실제 LaTeX 수식과 함께 두 단으로 흐른다.
+          실제 LaTeX 수식과 함께 두 단으로 흐른다.
+          \end{multicols}
+          이제 이 부분은 한 단이다. 컬럼 수 전환도 정상적으로 컴파일되어야 한다.
+          \begin{multicols}{2}
+          다시 두 단으로 전환한다.
+          \end{multicols}
           \end{document}
           EOF
           (cd "$TMP" && xelatex -interaction=nonstopmode -halt-on-error smoke.tex >/dev/null)

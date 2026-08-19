@@ -44,6 +44,8 @@ jobs:
             ~/.cache/pdf-translator-fonts
             .venv
           key: ${{ runner.os }}-${{ runner.arch }}-pdf-translator-runtime-v6-${{ hashFiles('worker/requirements.txt', 'worker/latex_requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-pdf-translator-runtime-v6-
 
       - name: Build runtime only on first cache miss
         if: steps.queue.outputs.has_jobs == 'true' && steps.runtime-cache.outputs.cache-hit != 'true'
@@ -67,6 +69,9 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_VISION_MODEL: gemini-3.6-flash
           GEMINI_TRANSLATION_MODEL: gemini-3.6-flash
+          VISION_PAGES_PER_CALL: '2'
+          VISION_WORKERS: '2'
+          TRANSLATION_WORKERS: '2'
           BOOK_FONT_DIR: /home/runner/.cache/pdf-translator-fonts
           MAX_PAGES: '20'
         shell: bash

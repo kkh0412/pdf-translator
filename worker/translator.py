@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import re
@@ -47,25 +48,27 @@ def _sanitize(value: str) -> str:
 
 def _candidate_models() -> list[str]:
     primary = os.getenv("GEMINI_TRANSLATION_MODEL", "gemini-3.6-flash").strip()
-    models = [
-        primary,
-        "gemini-3.6-flash",
-        "gemini-3.5-flash-lite",
-    ]
+    models = [primary, "gemini-3.6-flash", "gemini-3.5-flash-lite"]
     out = []
-    for m in models:
-        if m and m not in out:
-            out.append(m)
+    for model in models:
+        if model and model not in out:
+            out.append(model)
     return out
 
 
-def _chunks(items: list[dict], max_items: int = 28, max_chars: int = 9000) -> Iterable[list[dict]]:
-    batch, chars = [], 0
+def _chunks(
+    items: list[dict],
+    max_items: int = 30,
+    max_chars: int = 10000,
+) -> Iterable[list[dict]]:
+    batch = []
+    chars = 0
     for item in items:
         n = len(item.get("text", ""))
         if batch and (len(batch) >= max_items or chars + n > max_chars):
             yield batch
-            batch, chars = [], 0
+            batch = []
+            chars = 0
         batch.append(item)
         chars += n
     if batch:
@@ -114,15 +117,16 @@ def _call(api_key: str, model: str, prompt: str, count: int) -> dict:
             "mime_type": "application/json",
             "schema": _schema(count),
         },
-        "generation_config": {
-            "thinking_level": "low",
-        },
+        "generation_config": {"thinking_level": "low"},
     }
     req = urllib.request.Request(
         endpoint,
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
         method="POST",
-        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        },
     )
     try:
         with urllib.request.urlopen(req, timeout=150) as response:
@@ -134,11 +138,43 @@ def _call(api_key: str, model: str, prompt: str, count: int) -> dict:
         raise RuntimeError(f"TRANSIENT_GEMINI_ERROR: {exc}") from exc
 
 
+def _strategy_prompt(strategy: dict) -> str:
+    glossary = strategy.get("terminology", [])
+    glossary_lines = []
+    for term in glossary:
+        source = str(term.get("source", "")).strip()
+        target = str(term.get("target", "")).strip()
+        note = str(term.get("note", "")).strip()
+        if source and target:
+            glossary_lines.append(
+                f"- {source} => {target}" + (f" ({note})" if note else "")
+            )
+
+    principles = "\n".join(
+        f"- {item}" for item in strategy.get("translation_principles", [])
+    )
+    do_not = ", ".join(strategy.get("do_not_translate", []))
+
+    return (
+        f"Document field: {strategy.get('field', 'unknown')}\n"
+        f"Subfield: {strategy.get('subfield', 'unknown')}\n"
+        f"Document type: {strategy.get('document_type', 'academic document')}\n"
+        f"Register: {strategy.get('register', 'formal academic')}\n"
+        "MANDATORY TERMINOLOGY GLOSSARY:\n"
+        + ("\n".join(glossary_lines) if glossary_lines else "- none supplied")
+        + "\nTRANSLATION PRINCIPLES:\n"
+        + (principles if principles else "- Use established specialist terminology.")
+        + "\nDO NOT TRANSLATE / PRESERVE:\n"
+        + (do_not if do_not else "author names, formulas, citations, URLs, DOIs")
+    )
+
+
 def _translate_once(
     api_key: str,
     model: str,
     batch: list[dict],
     target_language: str,
+    strategy: dict,
 ) -> list[str]:
     compact = [
         {
@@ -150,18 +186,25 @@ def _translate_once(
     ]
 
     prompt = (
-        "Translate ordered semantic blocks from a scientific/academic document.\n"
+        "Translate ordered semantic blocks from a scientific/academic publication.\n"
         f"Target language: {LANGUAGE_NAMES[target_language]}.\n"
-        "Write as if the ORIGINAL AUTHOR had written the publication directly in the target language: "
-        "formal, natural, publication-quality academic prose.\n"
-        "Use standard terminology of physics/mathematics/quantum information where applicable.\n"
-        "Examples for Korean: coarse-graining -> 조대화, quantum state -> 양자 상태, "
-        "relative entropy -> 상대 엔트로피, retrodiction -> 역추론 unless context strongly requires another standard term.\n"
-        "Do not translate author names, citation numbers, equation numbers, URLs, DOIs, variable names, or acronyms.\n"
-        "CRITICAL: tokens of the form [[MATH_0]], [[MATH_1]], ... are protected mathematical expressions. "
-        "Preserve every such token EXACTLY, character-for-character. You may move a token to a grammatically "
-        "natural position, but never edit, merge, duplicate, translate, or delete it.\n"
-        "Do not add Markdown or commentary.\n"
+        "The document was pre-scanned before translation. Follow the domain strategy and "
+        "glossary below consistently throughout the paper.\n\n"
+        + _strategy_prompt(strategy)
+        + "\n\n"
+        "Write as if the ORIGINAL AUTHOR had written the publication directly in the target "
+        "language. Use polished specialist prose, not literal machine-translation phrasing.\n"
+        "When a glossary entry applies, use its target term consistently unless the supplied "
+        "note explicitly permits another rendering.\n"
+        "For Korean: avoid mechanical parenthesized particles such as 은(는), 이(가), 을(를), "
+        "와(과). Recast the sentence naturally. Do not create awkward hybrids such as "
+        "'측도 M' when the quantum-mechanical meaning is '측정 M'.\n"
+        "Do not translate author names, citation numbers, equation numbers, URLs, DOIs, "
+        "variable names, or acronyms unless the strategy explicitly says otherwise.\n"
+        "CRITICAL: [[MATH_0]], [[MATH_1]], ... are protected mathematical expressions. "
+        "Preserve every placeholder EXACTLY, character-for-character. You may move it for "
+        "natural grammar, but never edit, merge, duplicate, translate, or delete it.\n"
+        "Do not add Markdown, commentary, or explanations.\n"
         f"Return exactly {len(batch)} strings in the same order.\n\n"
         + json.dumps(compact, ensure_ascii=False)
     )
@@ -190,12 +233,20 @@ def _translate_once(
             raise GeminiOutputError(
                 f"Math placeholders changed: expected={expected}, actual={actual}"
             )
+
         out.append(value)
+
     return out
 
 
-def _request_batch(api_key: str, batch: list[dict], target_language: str) -> list[str]:
+def _request_batch(
+    api_key: str,
+    batch: list[dict],
+    target_language: str,
+    strategy: dict,
+) -> list[str]:
     last_error = None
+
     for model in _candidate_models():
         for attempt in range(2):
             try:
@@ -204,7 +255,13 @@ def _request_batch(api_key: str, batch: list[dict], target_language: str) -> lis
                     f"blocks={len(batch)}",
                     flush=True,
                 )
-                return _translate_once(api_key, model, batch, target_language)
+                return _translate_once(
+                    api_key,
+                    model,
+                    batch,
+                    target_language,
+                    strategy,
+                )
             except GeminiOutputError as exc:
                 last_error = exc
                 if attempt == 0:
@@ -221,27 +278,39 @@ def _request_batch(api_key: str, batch: list[dict], target_language: str) -> lis
                         continue
                     break
                 raise
+
     raise RuntimeError(f"TRANSIENT_GEMINI_ERROR: {last_error}")
 
 
-def _recover(api_key: str, batch: list[dict], target_language: str) -> list[str]:
+def _recover(
+    api_key: str,
+    batch: list[dict],
+    target_language: str,
+    strategy: dict,
+) -> list[str]:
     try:
-        return _request_batch(api_key, batch, target_language)
+        return _request_batch(api_key, batch, target_language, strategy)
     except Exception as exc:
         if len(batch) == 1:
             print(
-                f"Translation fallback: preserving original block after repeated failure: {exc}",
+                "Translation fallback: preserving the original block after "
+                f"repeated failure: {exc}",
                 flush=True,
             )
             return [batch[0]["text"]]
+
         mid = len(batch) // 2
         return (
-            _recover(api_key, batch[:mid], target_language)
-            + _recover(api_key, batch[mid:], target_language)
+            _recover(api_key, batch[:mid], target_language, strategy)
+            + _recover(api_key, batch[mid:], target_language, strategy)
         )
 
 
-def translate_blocks(items: list[dict], target_language: str) -> dict[str, str]:
+def translate_blocks(
+    items: list[dict],
+    target_language: str,
+    strategy: dict,
+) -> dict[str, str]:
     if not items:
         return {}
 
@@ -254,9 +323,40 @@ def translate_blocks(items: list[dict], target_language: str) -> dict[str, str]:
     if target_language not in LANGUAGE_NAMES:
         raise RuntimeError(f"Unsupported target language: {target_language}")
 
+    batches = list(_chunks(items))
+    workers = max(1, min(2, int(os.getenv("TRANSLATION_WORKERS", "2"))))
+    print(
+        f"Translation plan: {len(batches)} batches, workers={workers}",
+        flush=True,
+    )
+
+    translated_batches: list[list[str] | None] = [None] * len(batches)
+
+    if workers == 1 or len(batches) <= 1:
+        for index, batch in enumerate(batches):
+            translated_batches[index] = _recover(
+                api_key, batch, target_language, strategy
+            )
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_index = {
+                executor.submit(
+                    _recover,
+                    api_key,
+                    batch,
+                    target_language,
+                    strategy,
+                ): index
+                for index, batch in enumerate(batches)
+            }
+            for future in concurrent.futures.as_completed(future_to_index):
+                index = future_to_index[future]
+                translated_batches[index] = future.result()
+
     result: dict[str, str] = {}
-    for batch in _chunks(items):
-        translated = _recover(api_key, batch, target_language)
+    for batch, translated in zip(batches, translated_batches):
+        assert translated is not None
         for item, value in zip(batch, translated):
             result[item["id"]] = value
+
     return result
