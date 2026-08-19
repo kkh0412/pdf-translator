@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="description" content="원본 레이아웃과 수식을 최대한 유지하는 PDF 번역 데모" />
+  <meta name="description" content="원본의 활자와 문서 스타일을 최대한 유지하는 LaTeX PDF 번역 데모" />
   <title>PDF Translator</title>
   <link rel="stylesheet" href="./style.css" />
 </head>
@@ -14,9 +14,9 @@
     </nav>
 
     <section class="hero">
-      <div class="eyebrow">LAYOUT-PRESERVING TRANSLATION</div>
-      <h1>PDF의 형식을 유지하며<br />문서만 번역합니다.</h1>
-      <p>원본의 그림·표·수식을 보존하고, 번역문을 같은 영역에 맞춰 다시 배치합니다.</p>
+      <div class="eyebrow">STYLE-PRESERVING LATEX TRANSLATION</div>
+      <h1>PDF의 스타일을 살려<br />번역본을 다시 조판합니다.</h1>
+      <p>원본의 제목 계층·글꼴 분위기·목록·그림·수식을 분석하고, 번역문 전체를 LaTeX로 자연스럽게 다시 조판합니다.</p>
     </section>
 
     <section class="card">
@@ -30,7 +30,7 @@
           <input id="pdfInput" type="file" accept="application/pdf,.pdf" required />
           <div class="pdf-icon">PDF</div>
           <strong id="fileLabel">PDF 파일을 선택하거나 여기에 놓으세요</strong>
-          <span id="serverLimits">최대 20 MB · 최대 20페이지</span>
+          <span id="serverLimits">최대 50 MB · 최대 20페이지</span>
         </label>
 
         <div class="form-row">
@@ -78,13 +78,13 @@
       </article>
       <article>
         <span>02</span>
-        <h3>겹침 방지</h3>
-        <p>번역문이 원래 텍스트 영역을 벗어나지 않도록 자동으로 맞춥니다.</p>
+        <h3>책다운 조판</h3>
+        <p>본문은 명조 계열의 출판용 글꼴을 사용하고, 제목·소제목·인용문·목록의 위계를 LaTeX로 재현합니다.</p>
       </article>
       <article>
         <span>03</span>
-        <h3>Supabase 저장</h3>
-        <p>원본 PDF, 번역 결과와 작업 상태를 Supabase에 저장합니다.</p>
+        <h3>자연스러운 재배치</h3>
+        <p>원래 좌표에 억지로 끼워 넣지 않고 내용 길이에 맞춰 문단과 그림을 자연스럽게 재배치합니다.</p>
       </article>
     </section>
 

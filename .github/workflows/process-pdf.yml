@@ -50,16 +50,55 @@ jobs:
         if: steps.queue.outputs.has_jobs == 'true'
         run: pip install --disable-pip-version-check -r worker/requirements.txt
 
+      - name: Restore LaTeX and book-font cache
+        if: steps.queue.outputs.has_jobs == 'true'
+        id: latex-cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.TinyTeX
+            ~/.cache/pdf-translator-fonts
+          key: ${{ runner.os }}-pdf-translator-latex-v5-2026-07
+
+      - name: Install LaTeX environment once
+        if: steps.queue.outputs.has_jobs == 'true' && steps.latex-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export TINYTEX_VERSION=2026.07
+          export TINYTEX_INSTALLER=TinyTeX-1
+          curl -fsSL https://yihui.org/tinytex/install-unx.sh | sh
+          export PATH="$HOME/.TinyTeX/bin/x86_64-linux:$PATH"
+          tlmgr install kpfonts-otf xetexko enumitem
+
+          mkdir -p "$HOME/.cache/pdf-translator-fonts"
+          curl -fL --retry 3 \
+            -o "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Regular.ttf" \
+            https://raw.githubusercontent.com/google/fonts/main/ofl/nanummyeongjo/NanumMyeongjo-Regular.ttf
+          curl -fL --retry 3 \
+            -o "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Bold.ttf" \
+            https://raw.githubusercontent.com/google/fonts/main/ofl/nanummyeongjo/NanumMyeongjo-Bold.ttf
+
+      - name: Add cached TinyTeX to PATH
+        if: steps.queue.outputs.has_jobs == 'true'
+        shell: bash
+        run: |
+          echo "$HOME/.TinyTeX/bin/x86_64-linux" >> "$GITHUB_PATH"
+          test -f "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Regular.ttf"
+          test -f "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Bold.ttf"
+
       - name: Process queued PDFs
         if: steps.queue.outputs.has_jobs == 'true'
         env:
           SUPABASE_URL: ${{ vars.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          # Flash-Lite is preferred for low-latency translation/document work.
           GEMINI_MODEL: gemini-3.5-flash-lite
+          KOREAN_FONT_DIR: /home/runner/.cache/pdf-translator-fonts
           MAX_PAGES: '20'
-        run: python -m worker.run_pending --max-jobs 3
+        run: |
+          xelatex --version | head -1
+          python -m worker.run_pending --max-jobs 3
 
   heartbeat:
     if: github.event_name == 'schedule' && github.event.schedule == '17 4 1 * *'

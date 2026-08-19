@@ -136,7 +136,7 @@ def _translate_batch(
     batch: list[dict],
     target_language: str,
 ) -> list[dict]:
-    compact = [{"id": x["id"], "text": x["text"]} for x in batch]
+    compact = [{"id": x["id"], "text": x["text"], "kind": x.get("kind", "paragraph")} for x in batch]
     prompt = (
         "You are translating text segments extracted from a PDF document.\n"
         f"Translate every item into {LANGUAGE_NAMES[target_language]}.\n"
@@ -146,9 +146,11 @@ def _translate_batch(
         "- Preserve citation markers, bracketed reference numbers, URLs, DOIs, "
         "acronyms, proper names, equations, symbols, and numeric values.\n"
         "- Do not add explanations, notes, Markdown, or commentary.\n"
-        "- Prefer compact wording because each translation must fit inside the "
-        "original PDF text box.\n"
-        "- Do not omit meaning merely to shorten the translation.\n\n"
+        "- Preserve the document role indicated by kind (title, section, topic, bullet, verse, paragraph).\n"
+        "- For kind=verse, preserve the original line breaks and line count as closely as Korean/target-language grammar allows.\n"
+        "- For headings and bullets, translate only the wording; do not invent new numbering or bullet symbols.\n"
+        "- Use natural professional book/document prose rather than terse UI language.\n"
+        "- Do not omit meaning.\n\n"
         "INPUT JSON:\n"
         + json.dumps(compact, ensure_ascii=False)
     )

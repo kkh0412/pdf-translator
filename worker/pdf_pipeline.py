@@ -1,7 +1,11 @@
 from __future__ import annotations
 
-import html
+import math
+import os
 import re
+import shutil
+import statistics
+import subprocess
 from pathlib import Path
 
 import pymupdf
@@ -12,22 +16,39 @@ from .translator import translate_segments
 MATH_FONT_MARKERS = (
     "math", "symbol", "cmsy", "cmmi", "cmex", "stix", "mtmi", "msam", "msbm",
 )
+BOLD_MARKERS = ("bold", "black", "demi", "semibold", "medium")
+ITALIC_MARKERS = ("italic", "oblique", "slanted")
+SMALLCAP_MARKERS = ("smallcaps", "small-caps", "smallcap", "largesmallcaps")
+SERIF_MARKERS = (
+    "kp-", "times", "serif", "roman", "cmr", "minion", "palatino", "pagella",
+    "garamond", "libertinus", "baskerville", "bookman",
+)
+
+
+def _clean_text(text: str, keep_newlines: bool = False) -> str:
+    if keep_newlines:
+        lines = [" ".join(x.split()) for x in text.splitlines()]
+        return "\n".join(x for x in lines if x)
+    return " ".join(text.split())
 
 
 def _looks_like_math(text: str, font: str) -> bool:
     t = text.strip()
     if not t:
         return True
-    f = font.lower()
+    f = (font or "").lower()
     if any(marker in f for marker in MATH_FONT_MARKERS):
         return True
     if re.fullmatch(r"[\d\s.,;:()\[\]{}+\-*/=<>|_^%°′″]+", t):
         return any(ch in "+-*/=<>|_^" for ch in t)
-    if len(t) <= 120 and ("=" in t or "^" in t or "_" in t):
+    if len(t) <= 180 and ("=" in t or "^" in t or "_" in t):
         if re.search(r"[A-Za-zΑ-Ωα-ω]\s*(?:[=_^]|[+\-*/]\s*[A-Za-z0-9(])", t):
             return True
     letters = sum(ch.isalpha() for ch in t)
-    mathish = sum(ch in "=<>±×÷∑∫√∞≈≃≤≥∂∇αβγδεζηθικλμνξοπρστυφχψωΓΔΘΛΞΠΣΦΨΩ" for ch in t)
+    mathish = sum(
+        ch in "=<>±×÷∑∫√∞≈≃≤≥∂∇αβγδεζηθικλμνξοπρστυφχψωΓΔΘΛΞΠΣΦΨΩ"
+        for ch in t
+    )
     if letters == 0 and mathish > 0:
         return True
     if mathish >= 2 and mathish >= max(1, letters // 2):
@@ -35,222 +56,608 @@ def _looks_like_math(text: str, font: str) -> bool:
     return False
 
 
-def _is_translatable(text: str, font: str) -> bool:
-    t = " ".join(text.split())
-    if len(t) < 2:
+def _is_page_number(text: str, bbox, page_height: float) -> bool:
+    t = text.strip()
+    if not re.fullmatch(r"\d{1,4}", t):
         return False
-    if _looks_like_math(t, font):
+    return float(bbox[1]) > page_height * 0.86
+
+
+def _weighted_median(values: list[tuple[float, int]], default: float) -> float:
+    if not values:
+        return default
+    ordered = sorted(values)
+    total = sum(max(1, w) for _, w in ordered)
+    halfway = total / 2
+    acc = 0
+    for value, weight in ordered:
+        acc += max(1, weight)
+        if acc >= halfway:
+            return value
+    return ordered[-1][0]
+
+
+def _font_style(spans: list[dict]) -> dict:
+    if not spans:
+        return {"font": "", "size": 10.0, "bold": 0.0, "italic": 0.0, "smallcaps": False}
+    total = sum(max(1, len(s.get("text", "").strip())) for s in spans)
+    font_weight: dict[str, int] = {}
+    size_values: list[tuple[float, int]] = []
+    bold = italic = 0
+    smallcaps = False
+    for s in spans:
+        text = s.get("text", "").strip()
+        w = max(1, len(text))
+        font = s.get("font", "") or ""
+        f = font.lower()
+        font_weight[font] = font_weight.get(font, 0) + w
+        size_values.append((float(s.get("size", 10.0)), w))
+        if any(x in f for x in BOLD_MARKERS):
+            bold += w
+        if any(x in f for x in ITALIC_MARKERS):
+            italic += w
+        normalized_font = f.replace("-", "")
+        if any(x.replace("-", "") in normalized_font for x in SMALLCAP_MARKERS):
+            smallcaps = True
+    dominant_font = max(font_weight, key=font_weight.get)
+    return {
+        "font": dominant_font,
+        "size": _weighted_median(size_values, 10.0),
+        "bold": bold / max(1, total),
+        "italic": italic / max(1, total),
+        "smallcaps": smallcaps,
+    }
+
+
+def _is_display_math(text: str, spans: list[dict]) -> bool:
+    if not spans:
         return False
-    if re.fullmatch(r"https?://\S+|www\.\S+|\S+@\S+", t):
-        return False
-    return any(ch.isalpha() for ch in t)
+    total = sum(max(1, len(s.get("text", "").strip())) for s in spans)
+    math_weight = sum(
+        max(1, len(s.get("text", "").strip()))
+        for s in spans
+        if _looks_like_math(s.get("text", ""), s.get("font", ""))
+    )
+    natural_letters = sum(ch.isalpha() for ch in text)
+    if math_weight / max(1, total) >= 0.55:
+        return True
+    if len(text) <= 180 and natural_letters <= 12 and re.search(r"[=∑∫√_^]", text):
+        return True
+    return False
 
 
-def _style_from_font(font_name: str) -> tuple[str, str, str]:
-    """Return CSS family, weight, style inferred from the source span font name."""
-    f = (font_name or "").lower()
-    serif_markers = ("times", "serif", "roman", "cmr", "minion", "palatino", "garamond")
-    family = "serif" if any(x in f for x in serif_markers) else "sans-serif"
-    weight = "700" if any(x in f for x in ("bold", "black", "demi", "semibold")) else "400"
-    style = "italic" if any(x in f for x in ("italic", "oblique", "slanted")) else "normal"
-    return family, weight, style
+def _classify_text_node(node: dict, profile: dict) -> str:
+    text = node["text"].strip()
+    font_size = node["font_size"]
+    page_width = node["page_width"]
+    page_height = node["page_height"]
+    x0, y0, x1, _ = node["bbox"]
+    width = x1 - x0
+    center = (x0 + x1) / 2
+    centered = abs(center - page_width / 2) < page_width * 0.075 and width < page_width * 0.82
+    near_top = y0 < page_height * 0.18
+    very_top = y0 < page_height * 0.10
+    short = len(text) <= 120
+
+    if very_top and short and (node["smallcaps"] or text.isupper() or text.lower() in {"contents", "content"}):
+        return "header"
+    if near_top and short and centered and (node["smallcaps"] or font_size >= profile["base_font_size"] * 1.08):
+        return "title"
+    if text.startswith(("—", "–", "-")) and node["italic_ratio"] > 0.45 and width < page_width * 0.55:
+        return "attribution"
+    if node["italic_ratio"] > 0.62 and len(text) > 150 and width < page_width * 0.72:
+        return "verse"
+    if re.match(r"^\s*\d+(?:\.\d+)*\.\s+", text) and short:
+        # Bold numbered lines are list/topic headings even when their text box
+        # happens to be geometrically centered. Centered italic numbered lines
+        # are higher-level section headings.
+        if node["bold_ratio"] > 0.18:
+            return "topic"
+        if centered or node["italic_ratio"] > 0.45:
+            return "section"
+    if re.match(r"^\s*[•▪◦‣●○]\s*", text):
+        return "bullet"
+    if font_size >= profile["base_font_size"] * 1.22 and short:
+        return "title" if centered else "section"
+    return "paragraph"
 
 
-def extract_layout(pdf_path: Path, max_pages: int) -> tuple[list[dict], list[dict]]:
-    """Extract only geometry/text metadata. No page rasterization is performed."""
+def _percentile(values: list[float], q: float, default: float) -> float:
+    if not values:
+        return default
+    vals = sorted(values)
+    idx = max(0, min(len(vals) - 1, round((len(vals) - 1) * q)))
+    return vals[idx]
+
+
+def _infer_profile(raw_text_nodes: list[dict], page_width: float, page_height: float) -> dict:
+    size_values: list[tuple[float, int]] = []
+    font_weights: dict[str, int] = {}
+    lefts: list[float] = []
+    rights: list[float] = []
+    tops: list[float] = []
+    bottoms: list[float] = []
+
+    for node in raw_text_nodes:
+        text = node["text"].strip()
+        if not text or _is_page_number(text, node["bbox"], node["page_height"]):
+            continue
+        w = max(1, len(text))
+        size_values.append((node["font_size"], w))
+        font = node["font"]
+        font_weights[font] = font_weights.get(font, 0) + w
+        x0, y0, x1, y1 = node["bbox"]
+        # Narrow centered blocks (titles / poems) should not define page margins.
+        if not (abs((x0 + x1) / 2 - node["page_width"] / 2) < node["page_width"] * 0.08 and (x1 - x0) < node["page_width"] * 0.65):
+            lefts.append(x0)
+            rights.append(node["page_width"] - x1)
+        tops.append(y0)
+        bottoms.append(node["page_height"] - y1)
+
+    base_size = _weighted_median(size_values, 10.5)
+    dominant_font = max(font_weights, key=font_weights.get) if font_weights else ""
+    serif = any(x in dominant_font.lower() for x in SERIF_MARKERS)
+
+    left = _percentile(lefts, 0.08, 72.0)
+    right = _percentile(rights, 0.08, 72.0)
+    top = _percentile(tops, 0.08, 64.0)
+    bottom = _percentile(bottoms, 0.08, 64.0)
+
+    # Keep geometry book-like rather than allowing extreme OCR boxes to dominate.
+    def clamp(v: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, v))
+
+    return {
+        "base_font_size": clamp(base_size, 9.0, 12.5),
+        "dominant_font": dominant_font,
+        "serif": serif,
+        "page_width": page_width,
+        "page_height": page_height,
+        "left_margin": clamp(left, 52.0, 100.0),
+        "right_margin": clamp(right, 52.0, 100.0),
+        "top_margin": clamp(top, 48.0, 82.0),
+        "bottom_margin": clamp(bottom, 48.0, 82.0),
+    }
+
+
+def extract_document(pdf_path: Path, work_dir: Path, max_pages: int) -> tuple[dict, list[dict], list[dict]]:
     doc = pymupdf.open(pdf_path)
+    assets_dir = work_dir / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
     try:
         if doc.page_count > max_pages:
             raise RuntimeError(f"This demo accepts at most {max_pages} pages per PDF")
+        if doc.page_count == 0:
+            raise RuntimeError("PDF has no pages")
 
-        pages: list[dict] = []
-        segments: list[dict] = []
-
-        def add_segment(pno: int, sid: int, text: str, bbox, font_size: float, font: str) -> int:
-            text = " ".join(text.split())
-            if not text:
-                return sid
-            x0, y0, x1, y1 = map(float, bbox)
-            if x1 - x0 < 3 or y1 - y0 < 3:
-                return sid
-            segments.append(
-                {
-                    "id": f"p{pno}_s{sid}",
-                    "page": pno,
-                    "text": text,
-                    "bbox": [x0, y0, x1, y1],
-                    "font_size": float(font_size or 9.0),
-                    "font": font,
-                }
-            )
-            return sid + 1
+        first = doc[0].rect
+        raw_text_nodes: list[dict] = []
+        nontext_nodes: list[dict] = []
+        segment_counter = 0
+        asset_counter = 0
 
         for pno, page in enumerate(doc):
-            rect = page.rect
-            pages.append({"index": pno, "width": float(rect.width), "height": float(rect.height)})
-
-            data = page.get_text("dict", flags=pymupdf.TEXTFLAGS_TEXT)
-            sid = 0
+            data = page.get_text("dict", flags=pymupdf.TEXTFLAGS_DICT)
             for block in data.get("blocks", []):
+                bbox = [float(v) for v in block.get("bbox", (0, 0, 0, 0))]
+                if block.get("type") == 1:
+                    x0, y0, x1, y1 = bbox
+                    if x1 - x0 < 8 or y1 - y0 < 8:
+                        continue
+                    asset = assets_dir / f"asset_{asset_counter:04d}.png"
+                    pix = page.get_pixmap(matrix=pymupdf.Matrix(1.7, 1.7), clip=pymupdf.Rect(*bbox), alpha=False)
+                    pix.save(asset)
+                    nontext_nodes.append({
+                        "kind": "figure",
+                        "page": pno,
+                        "bbox": bbox,
+                        "asset": asset,
+                        "width_ratio": min(1.0, max(0.18, (x1 - x0) / max(1.0, page.rect.width))),
+                    })
+                    asset_counter += 1
+                    continue
                 if block.get("type") != 0:
                     continue
 
-                block_spans = [
+                spans = [
                     span
                     for line in block.get("lines", [])
                     for span in line.get("spans", [])
                     if span.get("text", "").strip()
                 ]
-                if not block_spans:
+                if not spans:
                     continue
-
-                has_math = any(
-                    _looks_like_math(span.get("text", ""), span.get("font", ""))
-                    for span in block_spans
-                )
-                translatable = [
-                    span
-                    for span in block_spans
-                    if _is_translatable(span.get("text", ""), span.get("font", ""))
-                ]
-
-                # Whole paragraph/heading blocks are best for translation context and reflow.
-                if translatable and not has_math:
-                    line_texts = []
-                    for line in block.get("lines", []):
-                        parts = [
-                            span.get("text", "").strip()
-                            for span in line.get("spans", [])
-                            if span.get("text", "").strip()
-                        ]
-                        if parts:
-                            line_texts.append(" ".join(parts))
-                    text = " ".join(line_texts)
-                    sizes = sorted(float(span.get("size", 9.0)) for span in translatable)
-                    font_size = sizes[len(sizes) // 2]
-                    sid = add_segment(
-                        pno,
-                        sid,
-                        text,
-                        block["bbox"],
-                        font_size,
-                        translatable[0].get("font", ""),
-                    )
-                    continue
-
-                # Mixed math/text block: only replace contiguous language spans.
+                line_texts = []
                 for line in block.get("lines", []):
-                    group = []
-                    for span in line.get("spans", []):
-                        if _is_translatable(span.get("text", ""), span.get("font", "")):
-                            if group:
-                                prev = group[-1]
-                                gap = float(span["bbox"][0]) - float(prev["bbox"][2])
-                                threshold = max(8.0, float(span.get("size", 9.0)) * 2.2)
-                                if gap > threshold:
-                                    sid = _flush_group(pno, sid, group, add_segment)
-                                    group = []
-                            group.append(span)
-                        else:
-                            if group:
-                                sid = _flush_group(pno, sid, group, add_segment)
-                                group = []
-                    if group:
-                        sid = _flush_group(pno, sid, group, add_segment)
+                    # Span boundaries frequently reflect font/ligature changes, not
+                    # real word boundaries (e.g. Kp-Expert's ``ff`` ligature).
+                    # Preserve the spaces already present in the PDF instead of
+                    # inserting new ones between every span.
+                    parts = [span.get("text", "") for span in line.get("spans", []) if span.get("text", "").strip()]
+                    if parts:
+                        line_texts.append("".join(parts).strip())
 
-        return pages, segments
-    finally:
-        doc.close()
-
-
-def _flush_group(pno: int, sid: int, group: list[dict], add_segment) -> int:
-    x0 = min(float(x["bbox"][0]) for x in group)
-    y0 = min(float(x["bbox"][1]) for x in group)
-    x1 = max(float(x["bbox"][2]) for x in group)
-    y1 = max(float(x["bbox"][3]) for x in group)
-    text = " ".join(x.get("text", "").strip() for x in group)
-    sizes = sorted(float(x.get("size", 9.0)) for x in group)
-    font_size = sizes[len(sizes) // 2]
-    return add_segment(pno, sid, text, [x0, y0, x1, y1], font_size, group[0].get("font", ""))
-
-
-def render_pdf(
-    pdf_path: Path,
-    output_path: Path,
-    segments: list[dict],
-    translations: dict[str, str],
-) -> dict:
-    """Overlay translations directly onto the original vector PDF using MuPDF.
-
-    This avoids TeX Live / CJK font package installation entirely. The original page,
-    figures, equations, and vector graphics stay untouched underneath the translated
-    text boxes.
-    """
-    doc = pymupdf.open(pdf_path)
-    scales: list[float] = []
-    try:
-        by_page: dict[int, list[dict]] = {}
-        for seg in segments:
-            by_page.setdefault(seg["page"], []).append(seg)
-
-        for pno, page in enumerate(doc):
-            for seg in by_page.get(pno, []):
-                translated = translations.get(seg["id"], seg["text"]).strip()
-                if not translated:
+                # Undo soft hyphenation caused only by a PDF line break.
+                merged_lines: list[str] = []
+                for line_text in line_texts:
+                    if (
+                        merged_lines
+                        and merged_lines[-1].endswith("-")
+                        and line_text
+                        and line_text[0].islower()
+                    ):
+                        merged_lines[-1] = merged_lines[-1][:-1] + line_text
+                    else:
+                        merged_lines.append(line_text)
+                line_texts = merged_lines
+                plain = _clean_text(" ".join(line_texts))
+                if not plain:
                     continue
+                style = _font_style(spans)
+                raw_text_nodes.append({
+                    "id": f"t{segment_counter}",
+                    "page": pno,
+                    "bbox": bbox,
+                    "text": plain,
+                    "line_text": "\n".join(line_texts),
+                    "font": style["font"],
+                    "font_size": style["size"],
+                    "bold_ratio": style["bold"],
+                    "italic_ratio": style["italic"],
+                    "smallcaps": style["smallcaps"],
+                    "page_width": float(page.rect.width),
+                    "page_height": float(page.rect.height),
+                    "spans": spans,
+                })
+                segment_counter += 1
 
-                x0, y0, x1, y1 = seg["bbox"]
-                bw = max(4.0, x1 - x0)
-                bh = max(4.0, y1 - y0)
+        profile = _infer_profile(raw_text_nodes, float(first.width), float(first.height))
 
-                # Small padding masks antialiasing from the original glyphs.
-                pad_x = min(0.7, bw * 0.012)
-                pad_y = min(0.5, bh * 0.035)
-                mask = pymupdf.Rect(
-                    max(0.0, x0 - pad_x),
-                    max(0.0, y0 - pad_y),
-                    min(page.rect.width, x1 + pad_x),
-                    min(page.rect.height, y1 + pad_y),
-                )
+        # Preserve book-like mirrored margins when the source clearly uses them.
+        # This is a style cue, not an attempt to pin every paragraph to an exact x/y.
+        source_page_numbers: list[tuple[int, int]] = []
+        page_edges: dict[int, tuple[float, float]] = {}
+        for pno in range(doc.page_count):
+            candidates = [
+                n for n in raw_text_nodes
+                if n["page"] == pno and not _is_page_number(n["text"], n["bbox"], n["page_height"])
+            ]
+            if candidates:
+                left_edge = min(float(n["bbox"][0]) for n in candidates)
+                right_edge = min(float(n["page_width"] - n["bbox"][2]) for n in candidates)
+                page_edges[pno] = (left_edge, right_edge)
 
-                # Preserve the previous demo's conservative behavior: visually cover
-                # language glyphs without deleting nearby formula/vector objects.
-                page.draw_rect(mask, color=None, fill=(1, 1, 1), overlay=True)
+        for n in raw_text_nodes:
+            if _is_page_number(n["text"], n["bbox"], n["page_height"]):
+                try:
+                    source_page_numbers.append((n["page"], int(n["text"].strip())))
+                except ValueError:
+                    pass
+        source_page_numbers.sort()
+        profile["start_page_number"] = source_page_numbers[0][1] if source_page_numbers else 1
+        profile["twoside"] = False
 
-                font_size = max(5.0, min(float(seg["font_size"]), bh * 0.86))
-                family, weight, style = _style_from_font(seg.get("font", ""))
-                css = (
-                    "* { margin: 0; padding: 0; } "
-                    f"body {{ font-family: {family}; font-size: {font_size:.2f}pt; "
-                    f"font-weight: {weight}; font-style: {style}; line-height: 1.05; "
-                    "color: #000; }"
-                )
+        if 0 in page_edges and 1 in page_edges:
+            l0, r0 = page_edges[0]
+            l1, r1 = page_edges[1]
+            mirrored = abs(l0 - r1) < 28.0 and abs(r0 - l1) < 28.0
+            if mirrored:
+                profile["twoside"] = True
+                first_number = profile["start_page_number"]
+                if first_number % 2 == 0:
+                    profile["outer_margin"] = (l0 + r1) / 2
+                    profile["inner_margin"] = (r0 + l1) / 2
+                else:
+                    profile["inner_margin"] = (l0 + r1) / 2
+                    profile["outer_margin"] = (r0 + l1) / 2
 
-                # insert_htmlbox uses HarfBuzz, supports CJK without an external font
-                # package, and scales content down until it fits inside the rectangle.
-                spare_height, scale = page.insert_htmlbox(
-                    pymupdf.Rect(x0, y0, x1, y1),
-                    html.escape(translated),
-                    css=css,
-                    scale_low=0.42,
-                    overlay=True,
-                )
-                if spare_height < 0:
-                    raise RuntimeError(
-                        f"Translated text could not fit inside source box {seg['id']}. "
-                        "Try a shorter translation or larger layout box."
-                    )
-                scales.append(float(scale))
+        nodes: list[dict] = []
+        translation_items: list[dict] = []
 
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        doc.save(output_path, garbage=3, deflate=True)
+        for raw in raw_text_nodes:
+            if _is_page_number(raw["text"], raw["bbox"], raw["page_height"]):
+                continue
+            if _is_display_math(raw["text"], raw["spans"]):
+                page = doc[raw["page"]]
+                x0, y0, x1, y1 = raw["bbox"]
+                pad = 3.0
+                rect = pymupdf.Rect(max(0, x0-pad), max(0, y0-pad), min(page.rect.width, x1+pad), min(page.rect.height, y1+pad))
+                asset = assets_dir / f"asset_{asset_counter:04d}.png"
+                pix = page.get_pixmap(matrix=pymupdf.Matrix(2.0, 2.0), clip=rect, alpha=False)
+                pix.save(asset)
+                nodes.append({
+                    "kind": "equation",
+                    "page": raw["page"],
+                    "bbox": raw["bbox"],
+                    "asset": asset,
+                    "width_ratio": min(0.92, max(0.16, (x1-x0) / max(1.0, page.rect.width))),
+                })
+                asset_counter += 1
+                continue
+
+            kind = _classify_text_node(raw, profile)
+            text = raw["line_text"] if kind == "verse" else raw["text"]
+            text = _clean_text(text, keep_newlines=(kind == "verse"))
+            if kind == "bullet":
+                text = re.sub(r"^\s*[•▪◦‣●○]\s*", "", text)
+            node = {
+                "kind": kind,
+                "id": raw["id"],
+                "page": raw["page"],
+                "bbox": raw["bbox"],
+                "font_size": raw["font_size"],
+                "bold_ratio": raw["bold_ratio"],
+                "italic_ratio": raw["italic_ratio"],
+                "smallcaps": raw["smallcaps"],
+                "text": text,
+            }
+            nodes.append(node)
+            translation_items.append({"id": raw["id"], "text": text, "kind": kind})
+
+        nodes.extend(nontext_nodes)
+        nodes.sort(key=lambda x: (x["page"], float(x["bbox"][1]), float(x["bbox"][0]), 0 if x["kind"] in {"figure", "equation"} else 1))
+        return profile, nodes, translation_items
     finally:
         doc.close()
 
-    return {
-        "min_text_scale": min(scales) if scales else 1.0,
-        "avg_text_scale": (sum(scales) / len(scales)) if scales else 1.0,
-    }
+
+LATEX_REPLACEMENTS = {
+    "\\": r"\textbackslash{}",
+    "&": r"\&",
+    "%": r"\%",
+    "$": r"\$",
+    "#": r"\#",
+    "_": r"\_",
+    "{": r"\{",
+    "}": r"\}",
+    "~": r"\textasciitilde{}",
+    "^": r"\textasciicircum{}",
+}
+
+
+def _latex_escape(text: str) -> str:
+    return "".join(LATEX_REPLACEMENTS.get(ch, ch) for ch in text)
+
+
+def _latex_text(text: str, preserve_lines: bool = False) -> str:
+    if preserve_lines:
+        return r" \\ ".join(_latex_escape(line) for line in text.splitlines())
+    return _latex_escape(text)
+
+
+def _pt(v: float) -> str:
+    return f"{v:.2f}pt"
+
+
+def _font_setup(profile: dict, korean_font_dir: Path) -> str:
+    # The sample source uses Kp fonts. For other serif documents, Kp remains a
+    # book-oriented fallback; sans sources use TeX Gyre Heros for Latin text.
+    if profile["serif"]:
+        latin = r"\usepackage{kpfonts-otf}"
+    else:
+        latin = r"\setmainfont{TeX Gyre Heros}"
+
+    path = str(korean_font_dir.resolve()).replace("\\", "/") + "/"
+    return rf"""
+{latin}
+\setmainhangulfont[
+  Path={{{path}}},
+  UprightFont=NanumMyeongjo-Regular.ttf,
+  BoldFont=NanumMyeongjo-Bold.ttf,
+  ItalicFont=NanumMyeongjo-Regular.ttf,
+  ItalicFeatures={{FakeSlant=0.13}},
+  BoldItalicFont=NanumMyeongjo-Bold.ttf,
+  BoldItalicFeatures={{FakeSlant=0.13}}
+]{{NanumMyeongjo-Regular.ttf}}
+"""
+
+
+def _latex_topic(text: str) -> str:
+    """Keep topic numbering and trailing lecture count light, with only the title bold."""
+    match = re.match(r"^(\d+(?:\.\d+)*\.\s*)(.*?)(\s*\([^)]*\))$", text.strip())
+    if match:
+        prefix, title, suffix = match.groups()
+        return _latex_escape(prefix) + r"\textbf{" + _latex_escape(title.strip()) + "}" + _latex_escape(suffix)
+
+    # If translation changed the parenthesis style, at least keep the numeric prefix light.
+    match = re.match(r"^(\d+(?:\.\d+)*\.\s*)(.*)$", text.strip())
+    if match:
+        prefix, title = match.groups()
+        return _latex_escape(prefix) + r"\textbf{" + _latex_escape(title.strip()) + "}"
+    return r"\textbf{" + _latex_escape(text.strip()) + "}"
+
+
+def build_latex(profile: dict, nodes: list[dict], translations: dict[str, str], work_dir: Path) -> str:
+    korean_font_dir = Path(os.getenv("KOREAN_FONT_DIR", "/usr/share/fonts/truetype/nanum"))
+    regular = korean_font_dir / "NanumMyeongjo-Regular.ttf"
+    bold = korean_font_dir / "NanumMyeongjo-Bold.ttf"
+    # Debian/Ubuntu uses slightly different filenames locally; support both.
+    if not regular.exists():
+        regular = korean_font_dir / "NanumMyeongjo.ttf"
+    if not bold.exists():
+        bold = korean_font_dir / "NanumMyeongjoBold.ttf"
+    if not regular.exists() or not bold.exists():
+        raise RuntimeError(
+            f"Korean book font files were not found in {korean_font_dir}. "
+            "The GitHub workflow should cache/download NanumMyeongjo-Regular.ttf and NanumMyeongjo-Bold.ttf."
+        )
+
+    # Put canonical names in work/font so the TeX template is independent of host filenames.
+    font_dir = work_dir / "font"
+    font_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(regular, font_dir / "NanumMyeongjo-Regular.ttf")
+    shutil.copy2(bold, font_dir / "NanumMyeongjo-Bold.ttf")
+
+    base = profile["base_font_size"]
+    class_options = "10pt,twoside" if profile.get("twoside") else "10pt"
+    if profile.get("twoside"):
+        geometry_lines = (
+            f"paperwidth={_pt(profile['page_width'])},\n"
+            f"  paperheight={_pt(profile['page_height'])},\n"
+            f"  inner={_pt(profile.get('inner_margin', profile['left_margin']))},\n"
+            f"  outer={_pt(profile.get('outer_margin', profile['right_margin']))},\n"
+            f"  top={_pt(profile['top_margin'])},\n"
+            f"  bottom={_pt(profile['bottom_margin'])}"
+        )
+    else:
+        geometry_lines = (
+            f"paperwidth={_pt(profile['page_width'])},\n"
+            f"  paperheight={_pt(profile['page_height'])},\n"
+            f"  left={_pt(profile['left_margin'])},\n"
+            f"  right={_pt(profile['right_margin'])},\n"
+            f"  top={_pt(profile['top_margin'])},\n"
+            f"  bottom={_pt(profile['bottom_margin'])}"
+        )
+
+    latin_setup = r"\usepackage{kpfonts-otf}" if profile.get("serif", True) else r"\setmainfont{TeX Gyre Heros}"
+
+    preamble = rf"""\documentclass[{class_options}]{{article}}
+\usepackage{{fontspec}}
+\usepackage{{xetexko}}
+\usepackage{{geometry}}
+\usepackage{{graphicx}}
+\usepackage{{enumitem}}
+\usepackage{{amsmath,amssymb}}
+\usepackage{{ragged2e}}
+\usepackage{{url}}
+\geometry{{
+  {geometry_lines}
+}}
+{latin_setup}
+\setmainhangulfont[
+  Path={{font/}},
+  UprightFont=NanumMyeongjo-Regular.ttf,
+  BoldFont=NanumMyeongjo-Bold.ttf,
+  ItalicFont=NanumMyeongjo-Regular.ttf,
+  ItalicFeatures={{FakeSlant=0.13}},
+  BoldItalicFont=NanumMyeongjo-Bold.ttf,
+  BoldItalicFeatures={{FakeSlant=0.13}}
+]{{NanumMyeongjo-Regular.ttf}}
+\AtBeginDocument{{\fontsize{{{base:.2f}pt}}{{{base*1.27:.2f}pt}}\selectfont}}
+\setlength{{\parindent}}{{0pt}}
+\setlength{{\parskip}}{{0.43em}}
+\setlength{{\emergencystretch}}{{2em}}
+\linespread{{1.07}}
+\setlist[itemize]{{leftmargin=2.1em,itemsep=0.24em,topsep=0.28em,parsep=0pt}}
+\raggedbottom
+\makeatletter
+\def\ps@bookish{{%
+  \def\@oddhead{{}}\def\@evenhead{{}}%
+  \def\@oddfoot{{\hfill\thepage}}%
+  \def\@evenfoot{{\thepage\hfill}}%
+}}
+\makeatother
+\pagestyle{{bookish}}
+\setcounter{{page}}{{{int(profile.get('start_page_number', 1))}}}
+\newcommand{{\DocHeader}}[1]{{\noindent{{\small\scshape #1}}\par\vspace{{2pt}}\hrule\vspace{{1.45em}}}}
+\newcommand{{\DocTitle}}[1]{{\begin{{center}}\large\scshape #1\end{{center}}\vspace{{0.45em}}}}
+\newcommand{{\DocSection}}[1]{{\vspace{{0.85em}}\begin{{center}}\large\itshape #1\end{{center}}\vspace{{0.20em}}}}
+\newcommand{{\DocTopic}}[1]{{\par\vspace{{0.42em}}\noindent #1\par\vspace{{0.08em}}}}
+\begin{{document}}
+"""
+
+    out: list[str] = [preamble]
+    in_items = False
+
+    def close_items() -> None:
+        nonlocal in_items
+        if in_items:
+            out.append("\\end{itemize}\n")
+            in_items = False
+
+    for node in nodes:
+        kind = node["kind"]
+        if kind == "bullet":
+            if not in_items:
+                out.append("\\begin{itemize}\n")
+                in_items = True
+            text = translations.get(node["id"], node["text"]).strip()
+            out.append(f"\\item {_latex_text(text)}\n")
+            continue
+
+        close_items()
+
+        if kind in {"figure", "equation"}:
+            rel = Path(node["asset"]).relative_to(work_dir).as_posix()
+            width = min(0.96, max(0.22, float(node.get("width_ratio", 0.7))))
+            if kind == "equation":
+                out.append(
+                    f"\\begin{{center}}\\includegraphics[width={width:.2f}\\linewidth]{{\\detokenize{{{rel}}}}}\\end{{center}}\n"
+                )
+            else:
+                out.append(
+                    f"\\begin{{center}}\\includegraphics[width={width:.2f}\\linewidth]{{\\detokenize{{{rel}}}}}\\end{{center}}\n"
+                )
+            continue
+
+        text = translations.get(node["id"], node["text"]).strip()
+        if not text:
+            continue
+        escaped = _latex_text(text, preserve_lines=(kind == "verse"))
+
+        if kind == "header":
+            out.append(f"\\DocHeader{{{escaped}}}\n")
+        elif kind == "title":
+            out.append(f"\\DocTitle{{{escaped}}}\n")
+        elif kind == "section":
+            out.append(f"\\DocSection{{{escaped}}}\n")
+        elif kind == "topic":
+            out.append(f"\\DocTopic{{{_latex_topic(text)}}}\n")
+        elif kind == "verse":
+            out.append(
+                "\\begin{center}\\begin{minipage}{0.62\\linewidth}"
+                "\\itshape\\small " + escaped +
+                "\\end{minipage}\\end{center}\\vspace{0.25em}\n"
+            )
+        elif kind == "attribution":
+            out.append(f"\\begin{{flushright}}\\itshape\\small {escaped}\\end{{flushright}}\\vspace{{0.35em}}\n")
+        else:
+            prefix = "\\textbf{" if node.get("bold_ratio", 0.0) > 0.55 else ""
+            suffix = "}" if prefix else ""
+            if node.get("italic_ratio", 0.0) > 0.60:
+                out.append(f"\\textit{{{escaped}}}\n\n")
+            else:
+                out.append(f"{prefix}{escaped}{suffix}\n\n")
+
+    close_items()
+    out.append("\\end{document}\n")
+    return "".join(out)
+
+
+def compile_latex(tex_source: str, work_dir: Path, output_path: Path) -> None:
+    work_dir.mkdir(parents=True, exist_ok=True)
+    tex_path = work_dir / "translated.tex"
+    tex_path.write_text(tex_source, encoding="utf-8")
+
+    engine = shutil.which("xelatex")
+    if not engine:
+        raise RuntimeError(
+            "xelatex was not found. The GitHub worker must restore/install the cached TinyTeX environment."
+        )
+
+    proc = subprocess.run(
+        [
+            engine,
+            "-interaction=nonstopmode",
+            "-halt-on-error",
+            "-file-line-error",
+            tex_path.name,
+        ],
+        cwd=work_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=180,
+    )
+    if proc.returncode != 0:
+        log = proc.stdout[-12000:]
+        raise RuntimeError(f"XeLaTeX compilation failed:\n{log}")
+
+    generated = work_dir / "translated.pdf"
+    if not generated.exists():
+        raise RuntimeError("XeLaTeX finished without producing translated.pdf")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(generated, output_path)
 
 
 def process_pdf(
@@ -260,23 +667,27 @@ def process_pdf(
     output_path: Path,
     max_pages: int,
 ) -> dict:
-    # work_dir is kept in the function signature for compatibility with run_job.py.
     work_dir.mkdir(parents=True, exist_ok=True)
-    pages, segments = extract_layout(pdf_path, max_pages=max_pages)
-    if not segments:
+    profile, nodes, translation_items = extract_document(pdf_path, work_dir, max_pages=max_pages)
+    if not translation_items and not any(n["kind"] in {"figure", "equation"} for n in nodes):
         raise RuntimeError(
-            "No selectable natural-language text was detected. This demo supports "
-            "born-digital PDFs; scanned/image-only PDFs need OCR support."
+            "No selectable document content was detected. This demo currently supports born-digital PDFs; "
+            "scanned/image-only PDFs need OCR support."
         )
 
-    translations = translate_segments(
-        [{"id": s["id"], "text": s["text"]} for s in segments],
-        target_language,
-    )
-    render_info = render_pdf(pdf_path, output_path, segments, translations)
+    translations = translate_segments(translation_items, target_language)
+    tex_source = build_latex(profile, nodes, translations, work_dir)
+    compile_latex(tex_source, work_dir, output_path)
+
+    out_doc = pymupdf.open(output_path)
+    try:
+        output_pages = out_doc.page_count
+    finally:
+        out_doc.close()
 
     return {
-        "pages": len(pages),
-        "translated_segments": len(segments),
-        **render_info,
+        "pages": output_pages,
+        "translated_segments": len(translation_items),
+        "source_font": profile["dominant_font"],
+        "render_mode": "semantic-latex",
     }

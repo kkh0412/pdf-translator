@@ -42,8 +42,8 @@ function setSelectedFile(file) {
     return;
   }
 
-  if (file.size > 20 * 1024 * 1024) {
-    showError('현재 데모에서는 20 MB 이하 PDF만 업로드할 수 있습니다.');
+  if (file.size > 50 * 1024 * 1024) {
+    showError('현재 데모에서는 50 MB 이하 PDF만 업로드할 수 있습니다.');
     return;
   }
 
@@ -93,7 +93,7 @@ async function poll(jobId) {
       statusText.textContent = '번역 worker가 대기열을 확인하고 있습니다. 보통 몇 분 안에 시작됩니다.';
     } else if (job.status === 'processing') {
       statusTitle.textContent = '번역 및 PDF 생성 중';
-      statusText.textContent = 'Gemini로 번역한 뒤 수식과 원본 레이아웃을 보존하면서 결과 PDF를 만들고 있습니다.';
+      statusText.textContent = 'Gemini로 번역한 뒤 원본의 활자 계층과 문서 스타일을 반영해 LaTeX로 다시 조판하고 있습니다.';
     } else if (job.status === 'done') {
       spinner.classList.add('hidden');
       statusBox.classList.add('hidden');
