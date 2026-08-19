@@ -1,37 +1,24 @@
-# PDF Translator v6.8
+# PDF Translator v6.9
 
-## Worker startup hardening
+## Fixed: multi-line aligned equations in preflight
 
-A `queued / 0%` job means the database INSERT trigger did not run at all.
-v6.8 makes the Supabase side self-contained:
+The previous preflight compiled raw display math inside `\[ ... \]`.
+That is wrong for formulas containing alignment markers such as:
 
-- explicitly enables `supabase_vault`
-- explicitly enables `pg_net`
-- explicitly enables `pg_cron`
-- installs an AFTER INSERT trigger
-- immediately calls GitHub `workflow_dispatch(job_id)`
-- records dispatch attempts/request id/timestamp in `translation_jobs`
-- reads `pg_net` responses and exposes 401/403/404 errors in the web UI
-- installs a Supabase-side recovery job every 30 seconds
-  - falls back to every minute on older pg_cron versions
-- the existing 15-minute GitHub schedule remains only a tertiary fallback
+    a &:= b
+    \\ &= c
+    \\ &= d
 
-### One-time required setup
+The `&` character is valid only inside an alignment environment.
 
-1. Supabase Dashboard -> Database -> Vault
-2. Secret name: `github_actions_token`
-3. Value: GitHub fine-grained PAT with repository `kkh0412/pdf-translator`,
-   Actions -> Read and write
-4. Supabase SQL Editor: run the ENTIRE latest
-   `supabase/UPDATE_EXISTING_SUPABASE.sql`
+v6.9:
+- preflights display equations through the exact final `_equation_tex()` renderer;
+- therefore preflight and final PDF use the same `equation` / `aligned`
+  environments, line breaking, tags, and width handling;
+- normalizes Vision output `\ &=` to the real line break `\\ &=`;
+- wraps even a one-row display in `aligned` whenever an `&` marker is present;
+- adds `graphicx` to the preflight environment because the final renderer can
+  use `\resizebox` for indivisible long equations;
+- on failure prints the exact rendered LaTeX actually sent to XeLaTeX.
 
-Then run:
-`supabase/CHECK_WORKER_TRIGGER.sql`
-
-Expected:
-- `github_token_exists = true`
-- trigger status = enabled
-- recovery cron active = true
-
-For a job already stuck in queued state, run:
-`supabase/RETRY_LATEST_QUEUED_JOB.sql`
+The v6.8 Supabase automatic-worker architecture is retained unchanged.

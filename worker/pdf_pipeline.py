@@ -87,6 +87,14 @@ def _clean_math(latex: str) -> str:
     # do not match this word-boundary pattern.
     latex = re.sub(r"(?:\\t\b\s*)+", " ", latex)
 
+    # Vision can emit a multi-line alignment separator as a SINGLE backslash:
+    #
+    #     ... D(...) \ &= ...
+    #
+    # In TeX a line break is "\\", so normalize only the narrow pattern
+    # "single backslash + whitespace + &". Literal \& remains untouched.
+    latex = re.sub(r"(?<!\\)\\\s+(?=&)", r"\\\\ ", latex)
+
     # Defensive cleanup for isolated legacy one-letter transport prefixes.
     latex = re.sub(r"(?:\\r\b\s*)+", " ", latex)
     latex = re.sub(r"(?:\\f\b\s*)+", " ", latex)
@@ -671,7 +679,9 @@ def _equation_tex(block: dict) -> str:
 
     tag = rf"\tag{{{number}}}" if number else ""
 
-    if len(lines) > 1:
+    needs_aligned = len(lines) > 1 or any("&" in line for line in lines)
+
+    if needs_aligned:
         lines = _align_math_lines(lines)
         return (
             "\\begin{equation}\n"
@@ -708,6 +718,7 @@ def _equation_tex(block: dict) -> str:
 def _math_preflight_preamble() -> str:
     return r"""\documentclass[10pt]{article}
 \usepackage{amsmath,amssymb}
+\usepackage{graphicx}
 \providecommand{\coloneq}{\mathrel{:=}}
 \providecommand{\coloneqq}{\mathrel{:=}}
 \providecommand{\eqqcolon}{\mathrel{=:}}
@@ -726,7 +737,12 @@ def _math_preflight_preamble() -> str:
 
 
 def preflight_math_blocks(blocks: list[dict], work_dir: Path) -> None:
-    """Compile formulas before translation and repair only a failing formula."""
+    """Compile formulas before translation using the same display renderer as final PDF.
+
+    Display equations are rendered through _equation_tex(block), so preflight
+    and the final PDF share aligned environments, line breaking, equation tags,
+    and width handling. This avoids false failures from raw '&' markers.
+    """
     records: list[dict] = []
 
     for block in blocks:
@@ -735,6 +751,12 @@ def preflight_math_blocks(blocks: list[dict], work_dir: Path) -> None:
         if block.get("kind") == "equation":
             formula = _clean_math(block.get("equation_latex", ""))
             if formula:
+                block["equation_latex"] = formula
+                block["equation_lines"] = [
+                    _clean_math(line)
+                    for line in block.get("equation_lines", [])
+                    if str(line).strip()
+                ]
                 records.append(
                     {
                         "label": f"{block_id}:display",
@@ -748,6 +770,7 @@ def preflight_math_blocks(blocks: list[dict], work_dir: Path) -> None:
         for token, formula in (block.get("math_map") or {}).items():
             cleaned = _clean_math(formula)
             if cleaned:
+                block["math_map"][token] = cleaned
                 records.append(
                     {
                         "label": f"{block_id}:{token}",
@@ -771,13 +794,22 @@ def preflight_math_blocks(blocks: list[dict], work_dir: Path) -> None:
 
     def compile_records() -> subprocess.CompletedProcess:
         chunks = [_math_preflight_preamble()]
+
         for index, record in enumerate(records, start=1):
             chunks.append(
                 f"\\typeout{{PDFTRANSLATOR-MATH-{index}: {record['label']}}}\n"
-                "\\[\n"
-                + record["formula"]
-                + "\n\\]\n"
             )
+
+            if record["kind"] == "display":
+                # Use EXACTLY the same equation renderer as the final document.
+                chunks.append(_equation_tex(record["block"]))
+            else:
+                chunks.append(
+                    "\\[\n"
+                    + record["formula"]
+                    + "\n\\]\n"
+                )
+
         chunks.append("\\end{document}\n")
         tex_path.write_text("".join(chunks), encoding="utf-8")
 
@@ -798,7 +830,7 @@ def preflight_math_blocks(blocks: list[dict], work_dir: Path) -> None:
 
     repaired_labels: list[str] = []
 
-    # Initial attempt + at most two formula-specific AI syntax repairs.
+    # Initial attempt + at most two formula-specific syntax repairs.
     for repair_round in range(3):
         proc = compile_records()
 
@@ -835,10 +867,16 @@ def preflight_math_blocks(blocks: list[dict], work_dir: Path) -> None:
         label = record["label"]
 
         if repair_round >= 2 or label in repaired_labels:
+            rendered = (
+                _equation_tex(record["block"])
+                if record["kind"] == "display"
+                else record["formula"]
+            )
             raise RuntimeError(
                 "Math preflight failed before body translation. "
                 f"Likely formula: {label}\n"
                 f"Normalized formula:\n{record['formula']}\n\n"
+                f"Rendered LaTeX actually compiled:\n{rendered}\n\n"
                 + proc.stdout[-9000:]
             )
 
@@ -856,6 +894,7 @@ def preflight_math_blocks(blocks: list[dict], work_dir: Path) -> None:
 
         if record["kind"] == "display":
             record["block"]["equation_latex"] = repaired
+            # Full-expression repair invalidates old Vision line hints.
             record["block"]["equation_lines"] = []
         else:
             record["block"]["math_map"][record["key"]] = repaired
