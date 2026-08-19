@@ -37,3 +37,16 @@ v6부터는 style agent와 page reconstruction agent가 실제 렌더된 페이�
 - inline math -> LaTeX math part
 - display equation -> LaTeX equation environment
 - 실제 figure/table만 원본 PDF에서 crop하여 이미지로 유지합니다.
+
+
+## v6.1 Gemini REST fix
+
+- `generateContent` vision requests now use `responseFormat.text.mimeType = "APPLICATION_JSON"`.
+  The raw API field is an enum; the Interactions-style `"application/json"` string caused HTTP 400.
+- If Google serves the legacy GenerateContent structured-output shape instead, the worker automatically retries with:
+  - `responseMimeType = "application/json"`
+  - `responseJsonSchema = ...`
+- Deprecated Gemini 3.6 sampling parameter `temperature` has been removed.
+- Model fallback is restricted to the currently documented GA models:
+  - `gemini-3.6-flash`
+  - `gemini-3.5-flash-lite`

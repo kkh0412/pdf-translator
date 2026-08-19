@@ -21,7 +21,6 @@ def _model_candidates() -> list[str]:
     models = [
         primary,
         "gemini-3.6-flash",
-        "gemini-3.5-flash",
         "gemini-3.5-flash-lite",
     ]
     out: list[str] = []
@@ -42,6 +41,51 @@ def _response_text(response: dict) -> str:
     return text
 
 
+def _generation_config(schema: dict, mode: str) -> dict:
+    """Build structured-output config for raw generateContent REST.
+
+    Current GenerateContent API uses an enum in responseFormat.text.mimeType:
+    APPLICATION_JSON, not the Interactions-style string "application/json".
+
+    A legacy responseMimeType / responseJsonSchema variant is retained as an
+    automatic compatibility fallback because Google is actively migrating the
+    GenerateContent and Interactions surfaces.
+    """
+    base = {
+        "thinkingConfig": {"thinkingLevel": "low"},
+    }
+
+    if mode == "enum_response_format":
+        base["responseFormat"] = {
+            "text": {
+                "mimeType": "APPLICATION_JSON",
+                "schema": schema,
+            }
+        }
+        return base
+
+    if mode == "legacy_json_schema":
+        base["responseMimeType"] = "application/json"
+        base["responseJsonSchema"] = schema
+        return base
+
+    raise ValueError(f"Unknown structured-output mode: {mode}")
+
+
+def _is_schema_format_400(detail: str) -> bool:
+    lowered = detail.lower()
+    markers = (
+        "response_format",
+        "responseformat",
+        "mime_type",
+        "mimetype",
+        "responsemimetype",
+        "responsejsonschema",
+        "invalid_argument",
+    )
+    return any(marker in lowered for marker in markers)
+
+
 def _call_json(
     prompt: str,
     images: list[tuple[bytes, str]],
@@ -53,73 +97,102 @@ def _call_json(
         raise RuntimeError("GEMINI_API_KEY is not configured")
 
     last_error: Exception | None = None
+    structured_modes = (
+        "enum_response_format",
+        "legacy_json_schema",
+    )
 
     for model in _model_candidates():
-        for attempt in range(2):
-            parts = [{"text": prompt}]
-            for data, mime in images:
-                parts.append(
-                    {
-                        "inlineData": {
-                            "mimeType": mime,
-                            "data": base64.b64encode(data).decode("ascii"),
+        for format_mode in structured_modes:
+            for attempt in range(2):
+                parts = [{"text": prompt}]
+                for data, mime in images:
+                    parts.append(
+                        {
+                            "inlineData": {
+                                "mimeType": mime,
+                                "data": base64.b64encode(data).decode("ascii"),
+                            }
                         }
-                    }
-                )
+                    )
 
-            body = {
-                "contents": [{"role": "user", "parts": parts}],
-                "generationConfig": {
-                    "temperature": 0.0,
-                    "thinkingConfig": {"thinkingLevel": "low"},
-                    "responseFormat": {
-                        "text": {
-                            "mimeType": "application/json",
-                            "schema": schema,
-                        }
+                body = {
+                    "contents": [{"role": "user", "parts": parts}],
+                    "generationConfig": _generation_config(schema, format_mode),
+                }
+
+                endpoint = (
+                    "https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"{model}:generateContent"
+                )
+                request = urllib.request.Request(
+                    endpoint,
+                    data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                    method="POST",
+                    headers={
+                        "Content-Type": "application/json",
+                        "x-goog-api-key": api_key,
                     },
-                },
-            }
-            endpoint = (
-                "https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{model}:generateContent"
-            )
-            request = urllib.request.Request(
-                endpoint,
-                data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-                method="POST",
-                headers={
-                    "Content-Type": "application/json",
-                    "x-goog-api-key": api_key,
-                },
-            )
-
-            try:
-                print(
-                    f"Vision agent {label}: model={model}, attempt={attempt + 1}",
-                    flush=True,
                 )
-                with urllib.request.urlopen(request, timeout=180) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-                return json.loads(_response_text(payload))
 
-            except urllib.error.HTTPError as exc:
-                detail = exc.read().decode("utf-8", errors="replace")
-                last_error = RuntimeError(f"Gemini vision HTTP {exc.code}: {detail}")
-                if exc.code == 404:
-                    break
-                if exc.code in {429, 500, 502, 503, 504}:
+                try:
+                    print(
+                        f"Vision agent {label}: model={model}, "
+                        f"format={format_mode}, attempt={attempt + 1}",
+                        flush=True,
+                    )
+                    with urllib.request.urlopen(request, timeout=180) as response:
+                        payload = json.loads(response.read().decode("utf-8"))
+                    return json.loads(_response_text(payload))
+
+                except urllib.error.HTTPError as exc:
+                    detail = exc.read().decode("utf-8", errors="replace")
+                    last_error = RuntimeError(
+                        f"Gemini vision HTTP {exc.code}: {detail}"
+                    )
+
+                    # Wrong/changed structured-output request shape: try the
+                    # compatibility shape before falling back to another model.
+                    if exc.code == 400 and _is_schema_format_400(detail):
+                        print(
+                            f"Vision structured-output format rejected "
+                            f"({format_mode}); trying compatibility format.",
+                            flush=True,
+                        )
+                        break
+
+                    if exc.code == 404:
+                        # Model unavailable: do not retry this model.
+                        format_mode = structured_modes[-1]
+                        break
+
+                    if exc.code in {429, 500, 502, 503, 504}:
+                        if attempt == 0:
+                            time.sleep(2)
+                            continue
+                        break
+
+                    raise last_error
+
+                except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+                    last_error = exc
                     if attempt == 0:
                         time.sleep(2)
                         continue
                     break
-                raise last_error
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-                last_error = exc
-                if attempt == 0:
-                    time.sleep(2)
+
+            # If we exhausted this format because of a schema-related 400,
+            # continue to the next structured-output format.
+            if isinstance(last_error, RuntimeError):
+                message = str(last_error)
+                if "HTTP 400" in message and _is_schema_format_400(message):
                     continue
+
+            # For non-schema errors, a second format is unlikely to help.
+            if last_error and "HTTP 404" in str(last_error):
                 break
+
+        # Continue to fallback model after 404 or transient exhaustion.
 
     raise GeminiVisionError(f"Vision agent failed for {label}: {last_error}")
 

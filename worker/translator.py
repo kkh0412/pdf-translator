@@ -50,7 +50,6 @@ def _candidate_models() -> list[str]:
     models = [
         primary,
         "gemini-3.6-flash",
-        "gemini-3.5-flash",
         "gemini-3.5-flash-lite",
     ]
     out = []
@@ -117,7 +116,6 @@ def _call(api_key: str, model: str, prompt: str, count: int) -> dict:
         },
         "generation_config": {
             "thinking_level": "low",
-            "temperature": 0.1,
         },
     }
     req = urllib.request.Request(
