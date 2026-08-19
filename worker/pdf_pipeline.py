@@ -4,7 +4,7 @@ import html
 import re
 from pathlib import Path
 
-import fitz
+import pymupdf
 
 from .translator import translate_segments
 
@@ -58,7 +58,7 @@ def _style_from_font(font_name: str) -> tuple[str, str, str]:
 
 def extract_layout(pdf_path: Path, max_pages: int) -> tuple[list[dict], list[dict]]:
     """Extract only geometry/text metadata. No page rasterization is performed."""
-    doc = fitz.open(pdf_path)
+    doc = pymupdf.open(pdf_path)
     try:
         if doc.page_count > max_pages:
             raise RuntimeError(f"This demo accepts at most {max_pages} pages per PDF")
@@ -89,7 +89,7 @@ def extract_layout(pdf_path: Path, max_pages: int) -> tuple[list[dict], list[dic
             rect = page.rect
             pages.append({"index": pno, "width": float(rect.width), "height": float(rect.height)})
 
-            data = page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT)
+            data = page.get_text("dict", flags=pymupdf.TEXTFLAGS_TEXT)
             sid = 0
             for block in data.get("blocks", []):
                 if block.get("type") != 0:
@@ -186,7 +186,7 @@ def render_pdf(
     figures, equations, and vector graphics stay untouched underneath the translated
     text boxes.
     """
-    doc = fitz.open(pdf_path)
+    doc = pymupdf.open(pdf_path)
     scales: list[float] = []
     try:
         by_page: dict[int, list[dict]] = {}
@@ -206,7 +206,7 @@ def render_pdf(
                 # Small padding masks antialiasing from the original glyphs.
                 pad_x = min(0.7, bw * 0.012)
                 pad_y = min(0.5, bh * 0.035)
-                mask = fitz.Rect(
+                mask = pymupdf.Rect(
                     max(0.0, x0 - pad_x),
                     max(0.0, y0 - pad_y),
                     min(page.rect.width, x1 + pad_x),
@@ -229,7 +229,7 @@ def render_pdf(
                 # insert_htmlbox uses HarfBuzz, supports CJK without an external font
                 # package, and scales content down until it fits inside the rectangle.
                 spare_height, scale = page.insert_htmlbox(
-                    fitz.Rect(x0, y0, x1, y1),
+                    pymupdf.Rect(x0, y0, x1, y1),
                     html.escape(translated),
                     css=css,
                     scale_low=0.42,

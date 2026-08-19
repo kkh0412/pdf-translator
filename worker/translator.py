@@ -68,6 +68,28 @@ def _is_retryable_error(exc: Exception) -> bool:
     return any(marker in text for marker in markers)
 
 
+def _is_model_unavailable_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "404" in text
+        and (
+            "not_found" in text
+            or "no longer available" in text
+            or "model" in text
+        )
+    )
+
+
+def _candidate_models() -> list[str]:
+    primary = os.getenv("GEMINI_MODEL", "gemini-3.7-flash").strip()
+    fallbacks = ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
+    models: list[str] = []
+    for model in [primary, *fallbacks]:
+        if model and model not in models:
+            models.append(model)
+    return models
+
+
 def _extract_model_text(response: dict) -> str:
     # Interactions API REST responses expose model output as timeline steps.
     chunks: list[str] = []
@@ -173,27 +195,41 @@ def translate_segments(items: list[dict], target_language: str) -> dict[str, str
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured")
 
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    models = _candidate_models()
+    active_model = models[0]
     result: dict[str, str] = {}
 
     for batch in _chunks(items):
         parsed_items = None
         last_error = None
 
-        # Free-tier rate limits can occasionally return 429. Retry briefly
-        # rather than failing an entire document immediately.
-        for attempt in range(4):
-            try:
-                parsed_items = _translate_batch(api_key, model, batch, target_language)
+        # Prefer the newest model, but automatically fall back if Google
+        # retires it or the current API key cannot access it. Once a model
+        # succeeds, reuse it for the rest of the document.
+        ordered_models = [active_model] + [m for m in models if m != active_model]
+        for model in ordered_models:
+            model_unavailable = False
+            for attempt in range(4):
+                try:
+                    parsed_items = _translate_batch(api_key, model, batch, target_language)
+                    active_model = model
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if _is_model_unavailable_error(exc):
+                        model_unavailable = True
+                        break
+                    if attempt >= 3 or not _is_retryable_error(exc):
+                        raise
+                    time.sleep(2 ** attempt)
+
+            if parsed_items is not None:
                 break
-            except Exception as exc:
-                last_error = exc
-                if attempt >= 3 or not _is_retryable_error(exc):
-                    raise
-                time.sleep(2 ** attempt)
+            if model_unavailable:
+                continue
 
         if parsed_items is None:
-            raise RuntimeError(f"Gemini translation failed: {last_error}")
+            raise RuntimeError(f"Gemini translation failed on all configured models: {last_error}")
 
         for item in parsed_items:
             item_id = item.get("id")
