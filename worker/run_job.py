@@ -69,6 +69,48 @@ def main(job_id: str) -> int:
     key = os.environ["SUPABASE_SECRET_KEY"]
     db = create_client(url, key)
 
+    progress_updates_enabled = True
+    last_progress = -1
+    last_progress_message = None
+
+    def update_progress(percent: int, message: str) -> None:
+        nonlocal progress_updates_enabled, last_progress, last_progress_message
+
+        if not progress_updates_enabled:
+            return
+
+        percent = max(0, min(100, int(percent)))
+        message = str(message)[:500]
+
+        if percent == last_progress and message == last_progress_message:
+            return
+
+        try:
+            (
+                db.table("translation_jobs")
+                .update(
+                    {
+                        "progress": percent,
+                        "progress_message": message,
+                    }
+                )
+                .eq("id", job_id)
+                .execute()
+            )
+            last_progress = percent
+            last_progress_message = message
+            print(f"Progress {percent}%: {message}", flush=True)
+        except Exception as exc:
+            # Backward compatible: an old database without the progress columns
+            # must not make the actual PDF job fail.
+            progress_updates_enabled = False
+            print(
+                "Live progress is disabled until "
+                "supabase/UPDATE_EXISTING_SUPABASE.sql is applied: "
+                f"{exc}",
+                flush=True,
+            )
+
     rows = (
         db.table("translation_jobs")
         .select("*")
@@ -89,6 +131,7 @@ def main(job_id: str) -> int:
             "error": None,
         }
     ).eq("id", job_id).execute()
+    update_progress(4, "Worker가 작업을 시작했습니다. 원본 PDF를 불러오고 있습니다.")
 
     temp = Path(tempfile.mkdtemp(prefix=f"pdfjob-{job_id[:8]}-"))
 
@@ -104,6 +147,7 @@ def main(job_id: str) -> int:
             f"Input PDF: {_mb(input_path.stat().st_size):.2f} MB",
             flush=True,
         )
+        update_progress(6, "원본 PDF 로드 완료 · 문서 분석을 준비하고 있습니다.")
 
         output_path = temp / "translated.pdf"
         info = process_pdf(
@@ -112,8 +156,10 @@ def main(job_id: str) -> int:
             temp / "work",
             output_path,
             max_pages=int(os.getenv("MAX_PAGES", "20")),
+            progress_callback=update_progress,
         )
 
+        update_progress(95, "생성된 PDF를 최적화하고 있습니다.")
         _optimize_pdf(output_path)
         output_size = output_path.stat().st_size
 
@@ -124,6 +170,7 @@ def main(job_id: str) -> int:
             )
 
         result_path = f"{job['user_id']}/{job_id}/translated.pdf"
+        update_progress(97, "최종 PDF를 Supabase Storage에 업로드하고 있습니다.")
 
         try:
             db.storage.from_("documents").upload(
@@ -145,16 +192,23 @@ def main(job_id: str) -> int:
                 ) from upload_exc
             raise
 
-        db.table("translation_jobs").update(
-            {
-                "status": "done",
-                "result_path": result_path,
-                "pages": info["pages"],
-                "translated_segments": info["translated_segments"],
-                "finished_at": now(),
-                "error": None,
-            }
-        ).eq("id", job_id).execute()
+        done_payload = {
+            "status": "done",
+            "result_path": result_path,
+            "pages": info["pages"],
+            "translated_segments": info["translated_segments"],
+            "finished_at": now(),
+            "error": None,
+        }
+        if progress_updates_enabled:
+            done_payload.update(
+                {
+                    "progress": 100,
+                    "progress_message": "번역 PDF가 준비되었습니다.",
+                }
+            )
+
+        db.table("translation_jobs").update(done_payload).eq("id", job_id).execute()
 
         print(f"Completed {job_id}: {info}", flush=True)
         return 0

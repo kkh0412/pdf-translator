@@ -16,6 +16,9 @@ const submitBtn = document.getElementById('submitBtn');
 const statusBox = document.getElementById('statusBox');
 const statusTitle = document.getElementById('statusTitle');
 const statusText = document.getElementById('statusText');
+const progressValue = document.getElementById('progressValue');
+const progressTrack = document.getElementById('progressTrack');
+const progressFill = document.getElementById('progressFill');
 const spinner = document.getElementById('spinner');
 const resultBox = document.getElementById('resultBox');
 const resultMeta = document.getElementById('resultMeta');
@@ -25,6 +28,19 @@ const setupWarning = document.getElementById('setupWarning');
 
 let currentJob = null;
 let supabaseClient = null;
+
+function updateProgress(value, message = null) {
+  const numeric = Number(value);
+  const progress = Number.isFinite(numeric)
+    ? Math.max(0, Math.min(100, Math.round(numeric)))
+    : 0;
+
+  progressValue.textContent = `${progress}%`;
+  progressFill.style.width = `${progress}%`;
+  progressTrack.setAttribute('aria-valuenow', String(progress));
+
+  if (message) statusText.textContent = message;
+}
 
 function showError(message) {
   errorBox.textContent = message;
@@ -80,7 +96,7 @@ async function poll(jobId) {
   while (true) {
     const { data: job, error } = await supabaseClient
       .from('translation_jobs')
-      .select('id,status,original_name,target_language,pages,translated_segments,error,result_path')
+      .select('*')
       .eq('id', jobId)
       .single();
 
@@ -90,11 +106,20 @@ async function poll(jobId) {
 
     if (job.status === 'queued') {
       statusTitle.textContent = '작업 대기 중';
-      statusText.textContent = '번역 worker가 대기열을 확인하고 있습니다. 보통 몇 분 안에 시작됩니다.';
+      updateProgress(
+        job.progress ?? 2,
+        job.progress_message ||
+          '번역 worker가 대기열을 확인하고 있습니다. 작업이 시작되면 단계별 진행률이 표시됩니다.'
+      );
     } else if (job.status === 'processing') {
       statusTitle.textContent = '번역 및 PDF 생성 중';
-      statusText.textContent = 'Gemini로 번역한 뒤 원본의 활자 계층과 문서 스타일을 반영해 LaTeX로 다시 조판하고 있습니다.';
+      updateProgress(
+        job.progress ?? 5,
+        job.progress_message ||
+          '문서 구조와 수식을 분석하고 번역한 뒤 LaTeX로 다시 조판하고 있습니다.'
+      );
     } else if (job.status === 'done') {
+      updateProgress(100, '번역 PDF가 준비되었습니다.');
       spinner.classList.add('hidden');
       statusBox.classList.add('hidden');
       resultBox.classList.remove('hidden');
@@ -175,7 +200,7 @@ form.addEventListener('submit', async (event) => {
   spinner.classList.remove('hidden');
   statusBox.classList.remove('hidden');
   statusTitle.textContent = 'PDF 업로드 중';
-  statusText.textContent = '원본 PDF를 Supabase Storage에 저장하고 있습니다.';
+  updateProgress(1, '원본 PDF를 Supabase Storage에 저장하고 있습니다.');
   submitBtn.disabled = true;
 
   try {
@@ -212,7 +237,10 @@ form.addEventListener('submit', async (event) => {
     }
 
     statusTitle.textContent = '작업 대기 중';
-    statusText.textContent = '업로드가 끝났습니다. 번역 worker가 대기열을 확인하고 있습니다.';
+    updateProgress(
+      2,
+      '업로드가 끝났습니다. 번역 worker가 대기열을 확인하고 있습니다.'
+    );
 
     await poll(jobId);
   } catch (error) {

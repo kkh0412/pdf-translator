@@ -67,8 +67,8 @@ jobs:
           SUPABASE_URL: ${{ vars.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_VISION_MODEL: gemini-3.6-flash
-          GEMINI_TRANSLATION_MODEL: gemini-3.6-flash
+          GEMINI_VISION_MODEL: gemini-3.5-flash-lite
+          GEMINI_TRANSLATION_MODEL: gemini-3.5-flash-lite
           VISION_PAGES_PER_CALL: '2'
           VISION_WORKERS: '2'
           TRANSLATION_WORKERS: '2'

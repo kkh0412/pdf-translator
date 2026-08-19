@@ -8,6 +8,7 @@ import subprocess
 import time
 import unicodedata
 from pathlib import Path
+from typing import Callable
 
 import pymupdf
 
@@ -70,6 +71,18 @@ def _clean_math(latex: str) -> str:
 
     if DANGEROUS_MATH.search(latex):
         raise RuntimeError("Unsafe LaTeX command returned by the vision agent")
+
+    # Normalize notation aliases that are not guaranteed to exist in a minimal
+    # TeX installation. This keeps the mathematical meaning while avoiding
+    # package-specific commands emitted by the vision model.
+    replacements = (
+        (r"\\coloneqq\b", r"\\mathrel{:=}"),
+        (r"\\coloneq\b", r"\\mathrel{:=}"),
+        (r"\\eqqcolon\b", r"\\mathrel{=:}"),
+        (r"\\eqcolon\b", r"\\mathrel{=:}"),
+    )
+    for pattern, replacement in replacements:
+        latex = re.sub(pattern, replacement, latex)
 
     return latex
 
@@ -159,6 +172,7 @@ def reconstruct_document(
     target_language: str,
     work_dir: Path,
     max_pages: int,
+    progress_callback: Callable[[int, str], None] | None = None,
 ) -> tuple[dict, dict, list[dict], list[dict]]:
     doc = pymupdf.open(pdf_path)
     try:
@@ -177,7 +191,26 @@ def reconstruct_document(
         f"({source_pages} pages total)",
         flush=True,
     )
+    if progress_callback:
+        progress_callback(
+            8,
+            "문서 분야·스타일·전문용어 번역 전략을 먼저 분석하고 있습니다.",
+        )
+
     style, strategy = analyze_document(pdf_path, target_language)
+
+    if progress_callback:
+        field_label = " / ".join(
+            x for x in (
+                str(strategy.get("field", "")).strip(),
+                str(strategy.get("subfield", "")).strip(),
+            )
+            if x
+        )
+        progress_callback(
+            15,
+            f"사전 분석 완료 · {field_label or '문서 구조 분석 준비'}",
+        )
 
     pages_per_call = max(
         1, min(3, int(os.getenv("VISION_PAGES_PER_CALL", "2")))
@@ -208,17 +241,33 @@ def reconstruct_document(
             return merged
 
     page_results: dict[int, list[dict]] = {}
+    completed_pages = 0
+
+    def report_vision_progress(done_pages: int) -> None:
+        if not progress_callback:
+            return
+        fraction = done_pages / max(1, source_pages)
+        percent = 15 + int(round(40 * fraction))
+        progress_callback(
+            min(55, percent),
+            f"페이지 구조·수식·컬럼 분석 중 · {done_pages}/{source_pages}페이지",
+        )
 
     if workers == 1 or len(batches) <= 1:
         for batch in batches:
             page_results.update(parse_batch(batch))
+            completed_pages += len(batch)
+            report_vision_progress(completed_pages)
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             future_map = {
                 executor.submit(parse_batch, batch): batch for batch in batches
             }
             for future in concurrent.futures.as_completed(future_map):
+                batch = future_map[future]
                 page_results.update(future.result())
+                completed_pages += len(batch)
+                report_vision_progress(completed_pages)
 
     missing_pages = [
         index for index in range(source_pages) if index not in page_results
@@ -650,6 +699,20 @@ def build_latex(
 \usepackage{{amsmath,amssymb}}
 \usepackage{{enumitem}}
 \usepackage{{multicol}}
+% Compatibility aliases: avoid extra packages for common AI/source notation.
+\providecommand{{\coloneq}}{{\mathrel{{:=}}}}
+\providecommand{{\coloneqq}}{{\mathrel{{:=}}}}
+\providecommand{{\eqqcolon}}{{\mathrel{{=:}}}}
+\providecommand{{\eqcolon}}{{\mathrel{{=:}}}}
+\providecommand{{\Tr}}{{\operatorname{{Tr}}}}
+\providecommand{{\rank}}{{\operatorname{{rank}}}}
+\providecommand{{\supp}}{{\operatorname{{supp}}}}
+\providecommand{{\diag}}{{\operatorname{{diag}}}}
+\providecommand{{\ket}}[1]{{\left\lvert #1\right\rangle}}
+\providecommand{{\bra}}[1]{{\left\langle #1\right\rvert}}
+\providecommand{{\braket}}[2]{{\left\langle #1\middle|#2\right\rangle}}
+\providecommand{{\mel}}[3]{{\left\langle #1\middle|#2\middle|#3\right\rangle}}
+\providecommand{{\dd}}{{\mathrm{{d}}}}
 \geometry{{
   paperwidth={style['page_width_pt']:.2f}pt,
   paperheight={style['page_height_pt']:.2f}pt,
@@ -927,9 +990,28 @@ def compile_latex(
         final_stdout = proc.stdout
 
         if proc.returncode != 0:
+            context = ""
+            match = re.search(
+                r"(?:^|\n)(?:\./)?translated\.tex:(\d+):",
+                proc.stdout,
+            )
+            if match:
+                line_no = int(match.group(1))
+                source_lines = tex_source.splitlines()
+                lo = max(0, line_no - 4)
+                hi = min(len(source_lines), line_no + 3)
+                context = (
+                    "\n\nGenerated LaTeX near the failing line:\n"
+                    + "\n".join(
+                        f"{i + 1:04d}: {source_lines[i]}"
+                        for i in range(lo, hi)
+                    )
+                )
+
             raise RuntimeError(
                 f"XeLaTeX compilation failed on pass {run_no + 1}:\n"
-                + proc.stdout[-14000:]
+                + proc.stdout[-12000:]
+                + context
             )
 
     generated = work_dir / "translated.pdf"
@@ -959,6 +1041,7 @@ def process_pdf(
     work_dir: Path,
     output_path: Path,
     max_pages: int,
+    progress_callback: Callable[[int, str], None] | None = None,
 ) -> dict:
     started = time.perf_counter()
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -975,6 +1058,7 @@ def process_pdf(
         target_language,
         work_dir,
         max_pages=max_pages,
+        progress_callback=progress_callback,
     )
     vision_seconds = time.perf_counter() - phase
 
@@ -996,12 +1080,33 @@ def process_pdf(
         "all inline/display math remains protected LaTeX",
         flush=True,
     )
+    if progress_callback:
+        progress_callback(
+            58,
+            f"전문용어 전략을 적용해 본문 번역을 시작합니다 · "
+            f"{len(translation_items)}개 텍스트 블록",
+        )
+
+    def translation_progress(done: int, total: int) -> None:
+        if not progress_callback:
+            return
+        fraction = done / max(1, total)
+        percent = 58 + int(round(27 * fraction))
+        progress_callback(
+            min(85, percent),
+            f"본문 번역 중 · {done}/{total}개 묶음 완료",
+        )
+
     translations = translate_blocks(
         translation_items,
         target_language,
         strategy,
+        progress_callback=translation_progress,
     )
     translation_seconds = time.perf_counter() - phase
+
+    if progress_callback:
+        progress_callback(88, "번역 완료 · LaTeX 문서를 조립하고 있습니다.")
 
     phase = time.perf_counter()
     tex_source = build_latex(
@@ -1010,12 +1115,19 @@ def process_pdf(
         translations,
         work_dir,
     )
+
+    if progress_callback:
+        progress_callback(91, "XeLaTeX로 최종 PDF를 조판하고 있습니다.")
+
     compile_latex(
         tex_source,
         work_dir,
         output_path,
     )
     latex_seconds = time.perf_counter() - phase
+
+    if progress_callback:
+        progress_callback(94, "PDF 조판 완료 · 결과 파일을 정리하고 있습니다.")
 
     out_doc = pymupdf.open(output_path)
     try:

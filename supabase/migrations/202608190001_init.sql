@@ -12,6 +12,9 @@ create table if not exists public.translation_jobs (
   result_path text,
   pages integer,
   translated_segments integer,
+  progress smallint not null default 0
+    check (progress between 0 and 100),
+  progress_message text,
   error text,
   created_at timestamptz not null default now(),
   started_at timestamptz,
@@ -46,6 +49,8 @@ with check (
   and result_path is null
   and pages is null
   and translated_segments is null
+  and progress = 0
+  and progress_message is null
   and error is null
   and started_at is null
   and finished_at is null

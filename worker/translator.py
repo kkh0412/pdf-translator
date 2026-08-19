@@ -8,7 +8,7 @@ import time
 import unicodedata
 import urllib.error
 import urllib.request
-from typing import Iterable
+from typing import Callable, Iterable
 
 
 LANGUAGE_NAMES = {
@@ -47,8 +47,11 @@ def _sanitize(value: str) -> str:
 
 
 def _candidate_models() -> list[str]:
-    primary = os.getenv("GEMINI_TRANSLATION_MODEL", "gemini-3.6-flash").strip()
-    models = [primary, "gemini-3.6-flash", "gemini-3.5-flash-lite"]
+    primary = os.getenv(
+        "GEMINI_TRANSLATION_MODEL",
+        "gemini-3.5-flash-lite",
+    ).strip()
+    models = [primary, "gemini-3.5-flash-lite", "gemini-3.6-flash"]
     out = []
     for model in models:
         if model and model not in out:
@@ -58,8 +61,8 @@ def _candidate_models() -> list[str]:
 
 def _chunks(
     items: list[dict],
-    max_items: int = 30,
-    max_chars: int = 10000,
+    max_items: int = 20,
+    max_chars: int = 7000,
 ) -> Iterable[list[dict]]:
     batch = []
     chars = 0
@@ -245,14 +248,44 @@ def _request_batch(
     target_language: str,
     strategy: dict,
 ) -> list[str]:
-    last_error = None
+    """Translate one batch without burning fallback models on content errors."""
+    models = _candidate_models()
+    primary = models[0]
+    last_error: Exception | None = None
 
-    for model in _candidate_models():
-        for attempt in range(2):
+    for attempt in range(2):
+        try:
+            print(
+                f"Translation agent: model={primary}, attempt={attempt + 1}, "
+                f"blocks={len(batch)}",
+                flush=True,
+            )
+            return _translate_once(
+                api_key,
+                primary,
+                batch,
+                target_language,
+                strategy,
+            )
+        except GeminiOutputError as exc:
+            last_error = exc
+            if attempt == 0:
+                time.sleep(0.5)
+                continue
+            # Wrong count / changed math placeholders are not service outages.
+            # Let recursive splitting recover the content instead.
+            raise
+        except GeminiHTTPError as exc:
+            last_error = exc
+            if exc.status not in {404, 429, 500, 502, 503, 504}:
+                raise
+            break
+
+    if isinstance(last_error, GeminiHTTPError):
+        for model in models[1:]:
             try:
                 print(
-                    f"Translation agent: model={model}, attempt={attempt + 1}, "
-                    f"blocks={len(batch)}",
+                    f"Translation fallback model={model}, blocks={len(batch)}",
                     flush=True,
                 )
                 return _translate_once(
@@ -262,22 +295,16 @@ def _request_batch(
                     target_language,
                     strategy,
                 )
-            except GeminiOutputError as exc:
-                last_error = exc
-                if attempt == 0:
-                    time.sleep(1)
-                    continue
-                break
+            except GeminiOutputError:
+                raise
             except GeminiHTTPError as exc:
                 last_error = exc
-                if exc.status == 404:
-                    break
-                if exc.status in {429, 500, 502, 503, 504}:
-                    if attempt == 0:
-                        time.sleep(2)
-                        continue
-                    break
-                raise
+                if exc.status not in {404, 429, 500, 502, 503, 504}:
+                    raise
+                continue
+
+    if isinstance(last_error, GeminiOutputError):
+        raise last_error
 
     raise RuntimeError(f"TRANSIENT_GEMINI_ERROR: {last_error}")
 
@@ -310,6 +337,7 @@ def translate_blocks(
     items: list[dict],
     target_language: str,
     strategy: dict,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> dict[str, str]:
     if not items:
         return {}
@@ -331,12 +359,19 @@ def translate_blocks(
     )
 
     translated_batches: list[list[str] | None] = [None] * len(batches)
+    completed_batches = 0
+
+    def report_done() -> None:
+        if progress_callback:
+            progress_callback(completed_batches, len(batches))
 
     if workers == 1 or len(batches) <= 1:
         for index, batch in enumerate(batches):
             translated_batches[index] = _recover(
                 api_key, batch, target_language, strategy
             )
+            completed_batches += 1
+            report_done()
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_index = {
@@ -352,6 +387,8 @@ def translate_blocks(
             for future in concurrent.futures.as_completed(future_to_index):
                 index = future_to_index[future]
                 translated_batches[index] = future.result()
+                completed_batches += 1
+                report_done()
 
     result: dict[str, str] = {}
     for batch, translated in zip(batches, translated_batches):
