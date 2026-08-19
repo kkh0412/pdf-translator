@@ -13,7 +13,12 @@ from typing import Callable
 import pymupdf
 
 from .translator import translate_blocks
-from .vision_agent import GeminiVisionError, analyze_document, parse_pages
+from .vision_agent import (
+    GeminiVisionError,
+    _decode_math_transport,
+    analyze_document,
+    parse_pages,
+)
 
 
 PLACEHOLDER_RE = re.compile(r"\[\[MATH_(\d+)\]\]")
@@ -52,6 +57,9 @@ def _escape_text(text: str) -> str:
 
 
 def _clean_math(latex: str) -> str:
+    # Decode § transport / repair JSON controls before generic sanitation.
+    # This is the critical ordering: sanitation must not delete the evidence first.
+    latex = _decode_math_transport(latex)
     latex = _sanitize_unicode(latex).strip()
     latex = re.sub(r"^\s*\$\$(.*?)\$\$\s*$", r"\1", latex, flags=re.S)
     latex = re.sub(r"^\s*\\\[(.*?)\\\]\s*$", r"\1", latex, flags=re.S)
@@ -667,6 +675,100 @@ def _equation_tex(block: dict) -> str:
     )
 
 
+
+def _math_preflight_preamble() -> str:
+    return r"""\documentclass[10pt]{article}
+\usepackage{amsmath,amssymb}
+\providecommand{\coloneq}{\mathrel{:=}}
+\providecommand{\coloneqq}{\mathrel{:=}}
+\providecommand{\eqqcolon}{\mathrel{=:}}
+\providecommand{\eqcolon}{\mathrel{=:}}
+\providecommand{\Tr}{\operatorname{Tr}}
+\providecommand{\rank}{\operatorname{rank}}
+\providecommand{\supp}{\operatorname{supp}}
+\providecommand{\diag}{\operatorname{diag}}
+\providecommand{\ket}[1]{\left\lvert #1\right\rangle}
+\providecommand{\bra}[1]{\left\langle #1\right\rvert}
+\providecommand{\braket}[2]{\left\langle #1\middle|#2\right\rangle}
+\providecommand{\mel}[3]{\left\langle #1\middle|#2\middle|#3\right\rangle}
+\providecommand{\dd}{\mathrm{d}}
+\begin{document}
+"""
+
+
+def preflight_math_blocks(blocks: list[dict], work_dir: Path) -> None:
+    """Compile reconstructed formulas before the expensive translation stage."""
+    formulas: list[tuple[str, str]] = []
+
+    for block in blocks:
+        block_id = str(block.get("id", "?"))
+
+        if block.get("kind") == "equation":
+            formula = _clean_math(block.get("equation_latex", ""))
+            if formula:
+                formulas.append((f"{block_id}:display", formula))
+
+        for token, formula in (block.get("math_map") or {}).items():
+            cleaned = _clean_math(formula)
+            if cleaned:
+                formulas.append((f"{block_id}:{token}", cleaned))
+
+    if not formulas:
+        print("Math preflight: no formulas to check.", flush=True)
+        return
+
+    preflight_dir = work_dir / "math-preflight"
+    preflight_dir.mkdir(parents=True, exist_ok=True)
+    tex_path = preflight_dir / "math_preflight.tex"
+
+    chunks = [_math_preflight_preamble()]
+    for index, (label, formula) in enumerate(formulas, start=1):
+        chunks.append(
+            f"\\typeout{{PDFTRANSLATOR-MATH-{index}: {label}}}\n"
+            "\\[\n"
+            + formula
+            + "\n\\]\n"
+        )
+    chunks.append("\\end{document}\n")
+    tex_path.write_text("".join(chunks), encoding="utf-8")
+
+    engine = shutil.which("xelatex")
+    if not engine:
+        raise RuntimeError("xelatex was not found for math preflight")
+
+    proc = subprocess.run(
+        [
+            engine,
+            "-interaction=nonstopmode",
+            "-halt-on-error",
+            "-file-line-error",
+            tex_path.name,
+        ],
+        cwd=preflight_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=180,
+    )
+
+    if proc.returncode != 0:
+        markers = re.findall(
+            r"PDFTRANSLATOR-MATH-(\d+): ([^\n\r]+)",
+            proc.stdout,
+        )
+        failing = markers[-1][1] if markers else "unknown formula"
+        raise RuntimeError(
+            "Math preflight failed before body translation. "
+            f"Likely formula: {failing}\n"
+            + proc.stdout[-9000:]
+        )
+
+    print(
+        f"Math preflight: {len(formulas)} formulas compiled successfully.",
+        flush=True,
+    )
+
+
 def build_latex(
     style: dict,
     blocks: list[dict],
@@ -1074,6 +1176,11 @@ def process_pdf(
         flush=True,
     )
 
+    if progress_callback:
+        progress_callback(56, "수식 LaTeX 사전 검사를 실행하고 있습니다.")
+
+    preflight_math_blocks(blocks, work_dir)
+
     phase = time.perf_counter()
     print(
         f"Translation agent: translating {len(translation_items)} semantic text blocks; "
@@ -1082,17 +1189,16 @@ def process_pdf(
     )
     if progress_callback:
         progress_callback(
-            56,
-            f"전문용어 전략을 적용해 본문 번역을 시작합니다 · "
+            58,
+            f"수식 사전 검사 완료 · 전문용어 전략을 적용해 본문 번역을 시작합니다 · "
             f"{len(translation_items)}개 텍스트 블록",
         )
 
     def translation_progress(fraction: float, detail: str) -> None:
         if not progress_callback:
             return
-        # Translation receives the widest progress interval because it is
-        # typically the longest stage. 56% -> 90%.
-        percent = 56 + int(round(34 * max(0.0, min(1.0, fraction))))
+        # Translation remains the longest visible interval: 58% -> 90%.
+        percent = 58 + int(round(32 * max(0.0, min(1.0, fraction))))
         progress_callback(min(90, percent), detail)
 
     translations = translate_blocks(

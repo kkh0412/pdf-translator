@@ -668,6 +668,83 @@ def analyze_document(pdf_path: Path, target_language: str) -> tuple[dict, dict]:
     return style, strategy
 
 
+MATH_BACKSLASH_TOKEN = "§"
+
+
+def _decode_math_transport(value: str) -> str:
+    """Decode JSON-safe math transport and repair legacy JSON escape damage."""
+    value = str(value or "")
+    value = value.replace(MATH_BACKSLASH_TOKEN, "\\")
+
+    # Legacy malformed JSON math could decode TeX command prefixes as controls.
+    # Recover them while we still know this string is mathematical content.
+    value = value.replace("\x08", r"\b")  # \boldsymbol, \beta, ...
+    value = value.replace("\x0c", r"\f")  # \frac, \forall, ...
+    value = value.replace("\r", r"\r")    # \rho, \right, \rangle, ...
+    value = value.replace("\t", r"\t")    # \text, \theta, \times, ...
+
+    # JSON \n can damage commands such as \nabla / \neq / \nu / \notin.
+    # Repair recognizable command tails; ordinary formatting line breaks become spaces.
+    pieces = value.split("\n")
+    if len(pieces) > 1:
+        common_n_tails = ("abla", "eq", "u", "otin", "eg", "i")
+        rebuilt = [pieces[0]]
+        for piece in pieces[1:]:
+            if piece.startswith(common_n_tails):
+                rebuilt.append(r"\n" + piece)
+            else:
+                rebuilt.append(" " + piece)
+        value = "".join(rebuilt)
+
+    return value
+
+
+def _brace_balance_error(math: str) -> str | None:
+    """Conservative TeX group balance check, ignoring escaped literal braces."""
+    depth = 0
+    i = 0
+
+    while i < len(math):
+        ch = math[i]
+
+        if ch == "\\":
+            # \{ and \} print literal braces and do not open/close a TeX group.
+            if i + 1 < len(math) and math[i + 1] in "{}":
+                i += 2
+                continue
+
+            i += 1
+            while i < len(math) and math[i].isalpha():
+                i += 1
+            continue
+
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth < 0:
+                return "extra closing brace"
+
+        i += 1
+
+    if depth:
+        return f"{depth} unmatched opening brace(s)"
+    return None
+
+
+def _validate_math_transport(math: str, page_number: int, label: str) -> None:
+    decoded = _decode_math_transport(math).strip()
+    if not decoded:
+        raise GeminiVisionError(f"Page {page_number}: empty LaTeX in {label}")
+
+    error = _brace_balance_error(decoded)
+    if error:
+        raise GeminiVisionError(
+            f"Page {page_number}: malformed LaTeX in {label}: "
+            f"{error}: {decoded[:180]}"
+        )
+
+
 PART_SCHEMA = {
     "type": "object",
     "properties": {
@@ -801,6 +878,22 @@ def _validate_blocks(
                 raise GeminiVisionError(
                     f"Page {page_number}: equation block has no LaTeX"
                 )
+
+            if latex:
+                _validate_math_transport(
+                    latex,
+                    page_number,
+                    "equation_latex",
+                )
+
+            for line_index, line in enumerate(lines):
+                if str(line).strip():
+                    _validate_math_transport(
+                        str(line),
+                        page_number,
+                        f"equation_lines[{line_index}]",
+                    )
+
             equation_count += 1
         elif kind not in {"figure", "table"}:
             parts = block.get("parts")
@@ -817,6 +910,11 @@ def _validate_blocks(
                         raise GeminiVisionError(
                             f"Page {page_number}: empty inline math"
                         )
+                    _validate_math_transport(
+                        math,
+                        page_number,
+                        f"inline math in {kind}",
+                    )
 
         bbox = block.get("bbox", [])
         if len(bbox) != 4:
@@ -903,12 +1001,18 @@ def parse_pages(
         "Reconstruct each page into semantic blocks in actual READING ORDER.\n\n"
         "CRITICAL MATHEMATICS RULES:\n"
         "1. DO NOT TRANSLATE anything in this stage.\n"
-        "2. Every inline mathematical expression is a part with type=math and VALID LaTeX, "
+        "1A. JSON-SAFE LATEX TRANSPORT: in every math field use the literal character § "
+        "instead of every LaTeX backslash. NEVER emit a literal backslash inside inline math, "
+        "equation_latex, or equation_lines. Examples: §rho, §frac{a}{b}, "
+        "§boldsymbol{§textsf{C}}^d, S_{§mathcal M,§gamma}^{(j)}. "
+        "The renderer converts § back to a real LaTeX backslash after JSON parsing.\n"
+        "2. Every inline mathematical expression is a part with type=math and VALID LaTeX "
+        "under this § transport convention, "
         "without $ delimiters. Natural prose must remain type=text.\n"
         "3. Read superscripts and subscripts from their VISUAL vertical position. "
         "Never flatten them into baseline text. Use ^ and _ explicitly; use braces for multi-token "
-        "scripts. Examples: P_R^\\gamma, S_{\\mathcal M,\\gamma}^{(j)}, \\rho^T, q_y, "
-        "\\gamma_x, Q_R^\\gamma.\n"
+        "scripts. Using the § transport convention, examples are "
+        "P_R^§gamma, S_{§mathcal M,§gamma}^{(j)}, §rho^T, q_y, §gamma_x, Q_R^§gamma.\n"
         "4. Preserve bra-ket notation correctly, e.g. "
         "\\lvert\\psi_x\\rangle\\langle\\psi_x\\rvert, not OCR-like '|ψxihψx|'.\n"
         "5. Preserve operator typography: \\operatorname{Tr}, \\mathcal M, \\Vert, \\otimes, "

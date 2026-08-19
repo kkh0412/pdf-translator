@@ -1,20 +1,26 @@
-# PDF Translator v6.5 — on-demand worker
+# PDF Translator v6.6
 
-Normal flow:
-1. Browser uploads PDF to Supabase.
-2. Browser creates the queued job.
-3. Browser immediately invokes authenticated Supabase Edge Function `trigger-worker`.
-4. Edge Function dispatches GitHub Actions with the exact `job_id`.
-5. GitHub Actions runs `python -m worker.run_job JOB_ID`.
-6. Browser continues polling Supabase progress.
+## Fixed: JSON-damaged LaTeX
 
-The 15-minute cron is only a recovery path.
+Math fields now use a transport character `§` instead of raw LaTeX backslashes
+while inside Gemini structured JSON.
 
-One-time setup:
-- Create one fine-grained GitHub PAT, restricted to `kkh0412/pdf-translator`,
-  repository permission Actions: Read and write, Expiration: No expiration.
-- Store it in Supabase Edge Function Secrets as `GH_ACTIONS_TOKEN`.
-- Deploy the Edge Function `trigger-worker` using
-  `supabase/functions/trigger-worker/index.ts`.
+Example:
+`§boldsymbol{§textsf{C}}^d`
+becomes
+`\boldsymbol{\textsf{C}}^d`
+only after JSON parsing.
 
-The GitHub token never appears in browser code or `docs/config.js`.
+Legacy malformed responses are repaired before Unicode control-character
+sanitation, so `\boldsymbol`, `\textsf`, `\frac`, `\rho`, etc. no longer lose
+their command prefixes.
+
+Math brace balance is checked during page reconstruction.
+
+## Early formula preflight
+
+Every inline/display formula is XeLaTeX-compiled before body translation starts.
+A malformed formula therefore fails around the structure-analysis stage rather
+than after the expensive full translation.
+
+The on-demand worker architecture from v6.5 is unchanged.
