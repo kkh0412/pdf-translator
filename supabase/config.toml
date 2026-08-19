@@ -1,0 +1,10 @@
+project_id = "pdf-translator"
+
+[functions.create-job]
+verify_jwt = false
+
+[functions.start-job]
+verify_jwt = false
+
+[functions.admin-jobs]
+verify_jwt = false
