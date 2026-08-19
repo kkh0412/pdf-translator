@@ -5,6 +5,7 @@ import json
 import os
 import re
 import time
+import threading
 import unicodedata
 import urllib.error
 import urllib.request
@@ -61,8 +62,8 @@ def _candidate_models() -> list[str]:
 
 def _chunks(
     items: list[dict],
-    max_items: int = 20,
-    max_chars: int = 7000,
+    max_items: int = 10,
+    max_chars: int = 4200,
 ) -> Iterable[list[dict]]:
     batch = []
     chars = 0
@@ -148,9 +149,14 @@ def _strategy_prompt(strategy: dict) -> str:
         source = str(term.get("source", "")).strip()
         target = str(term.get("target", "")).strip()
         note = str(term.get("note", "")).strip()
+        policy = str(term.get("policy", "translate")).strip()
         if source and target:
+            if policy == "keep_english":
+                rendered = f"- {source} => KEEP ENGLISH EXACTLY AS: {source}"
+            else:
+                rendered = f"- {source} => {target}"
             glossary_lines.append(
-                f"- {source} => {target}" + (f" ({note})" if note else "")
+                rendered + (f" ({note})" if note else "")
             )
 
     principles = "\n".join(
@@ -197,8 +203,14 @@ def _translate_once(
         + "\n\n"
         "Write as if the ORIGINAL AUTHOR had written the publication directly in the target "
         "language. Use polished specialist prose, not literal machine-translation phrasing.\n"
-        "When a glossary entry applies, use its target term consistently unless the supplied "
-        "note explicitly permits another rendering.\n"
+        "When a glossary entry applies, obey its policy consistently.\n"
+        "For policy=KEEP ENGLISH, preserve that English concept name exactly. Do not transliterate "
+        "it, do not force a Korean translation, and do not add a parenthesized Korean gloss unless "
+        "the source text already contains one.\n"
+        "For Korean technical prose more generally: if a specialized concept is not in the glossary "
+        "and there is no clearly established Korean term recognizable beyond the narrow subfield, "
+        "prefer the original English concept name rather than inventing an awkward Korean rendering. "
+        "Broad textbook-level terms may be translated naturally.\n"
         "For Korean: avoid mechanical parenthesized particles such as 은(는), 이(가), 을(를), "
         "와(과). Recast the sentence naturally. Do not create awkward hybrids such as "
         "'측도 M' when the quantum-mechanical meaning is '측정 M'.\n"
@@ -337,7 +349,7 @@ def translate_blocks(
     items: list[dict],
     target_language: str,
     strategy: dict,
-    progress_callback: Callable[[int, int], None] | None = None,
+    progress_callback: Callable[[float, str], None] | None = None,
 ) -> dict[str, str]:
     if not items:
         return {}
@@ -359,36 +371,71 @@ def translate_blocks(
     )
 
     translated_batches: list[list[str] | None] = [None] * len(batches)
-    completed_batches = 0
+    completed_blocks = 0
+    started_batches = 0
+    lock = threading.Lock()
+    total_blocks = max(1, len(items))
 
-    def report_done() -> None:
+    def emit(fraction: float, message: str) -> None:
         if progress_callback:
-            progress_callback(completed_batches, len(batches))
+            progress_callback(max(0.0, min(1.0, fraction)), message)
+
+    def run_one(index: int, batch: list[dict]) -> list[str]:
+        nonlocal started_batches
+        with lock:
+            started_batches += 1
+            start_number = started_batches
+            # Starting a request moves a small amount within the current
+            # translation range even before the remote call finishes.
+            visible_fraction = min(
+                0.96,
+                (completed_blocks + min(len(batch) * 0.18, 2.0)) / total_blocks,
+            )
+            emit(
+                visible_fraction,
+                f"번역 요청 {start_number}/{len(batches)} 처리 중 · "
+                f"{len(batch)}개 텍스트 블록",
+            )
+
+        try:
+            return _recover(
+                api_key,
+                batch,
+                target_language,
+                strategy,
+            )
+        except Exception:
+            with lock:
+                emit(
+                    completed_blocks / total_blocks,
+                    f"번역 요청 {index + 1}/{len(batches)}를 더 작은 묶음으로 복구 중",
+                )
+            raise
+
+    def mark_complete(batch: list[dict], index: int) -> None:
+        nonlocal completed_blocks
+        with lock:
+            completed_blocks += len(batch)
+            emit(
+                completed_blocks / total_blocks,
+                f"본문 번역 · {completed_blocks}/{len(items)}개 블록 완료 "
+                f"({index + 1}/{len(batches)} 묶음)",
+            )
 
     if workers == 1 or len(batches) <= 1:
         for index, batch in enumerate(batches):
-            translated_batches[index] = _recover(
-                api_key, batch, target_language, strategy
-            )
-            completed_batches += 1
-            report_done()
+            translated_batches[index] = run_one(index, batch)
+            mark_complete(batch, index)
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_index = {
-                executor.submit(
-                    _recover,
-                    api_key,
-                    batch,
-                    target_language,
-                    strategy,
-                ): index
+                executor.submit(run_one, index, batch): index
                 for index, batch in enumerate(batches)
             }
             for future in concurrent.futures.as_completed(future_to_index):
                 index = future_to_index[future]
                 translated_batches[index] = future.result()
-                completed_batches += 1
-                report_done()
+                mark_complete(batches[index], index)
 
     result: dict[str, str] = {}
     for batch, translated in zip(batches, translated_batches):

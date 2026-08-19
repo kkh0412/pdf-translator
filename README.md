@@ -1,14 +1,27 @@
-# PDF Translator v6.3
+# PDF Translator v6.4
 
-- Fixes XeLaTeX failure caused by AI/source math commands such as `\\coloneq`.
-- Normalizes common relation aliases and provides lightweight compatibility macros.
-- Adds live Supabase progress (`progress`, `progress_message`) and a web progress bar.
-- Uses Gemini 3.5 Flash-Lite first; Gemini 3.6 Flash remains a fallback.
-- Reduces wasted translation retries: output-format/placeholder failures split the batch
-  instead of repeatedly trying every model.
-- Uses smaller translation batches for better structured-output reliability.
-- Compile errors now include generated LaTeX source lines around the failure.
+## Terminology
+- For Korean targets, only broadly standardized textbook/cross-field concepts are
+  automatically translated.
+- Niche or subfield-specific concept names default to English when a Korean
+  rendering would be awkward or nonstandard.
+- The pre-scan glossary records `policy=translate` or `policy=keep_english`.
+- Translation batches must obey that policy consistently.
 
-For an existing Supabase project, run `supabase/UPDATE_EXISTING_SUPABASE.sql`
-once to enable live progress. The worker remains backward-compatible if the SQL
-has not been run yet.
+## Detailed progress
+- Supabase progress is updated through document scan, page reconstruction,
+  translation request starts, translation batch completions, LaTeX rendering,
+  optimization, and final upload.
+- Translation batches are smaller (10 blocks / ~4200 chars) so progress updates
+  are more frequent and structured output is easier to validate.
+- The browser polls every 1.5 seconds and also shows elapsed processing time.
+- If the Supabase progress migration has not been applied, the UI explicitly says
+  so instead of displaying a fake 5% forever.
+
+Existing Supabase projects must run:
+`supabase/UPDATE_EXISTING_SUPABASE.sql`
+
+## Worker schedule
+The automatic GitHub Actions schedule remains every 5 minutes. GitHub's scheduled
+workflow mechanism does not support a shorter interval. `workflow_dispatch`
+remains available for manual immediate tests.

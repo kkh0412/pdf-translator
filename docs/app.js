@@ -28,6 +28,7 @@ const setupWarning = document.getElementById('setupWarning');
 
 let currentJob = null;
 let supabaseClient = null;
+let processingStartedAt = null;
 
 function updateProgress(value, message = null) {
   const numeric = Number(value);
@@ -40,6 +41,21 @@ function updateProgress(value, message = null) {
   progressTrack.setAttribute('aria-valuenow', String(progress));
 
   if (message) statusText.textContent = message;
+}
+
+function formatElapsed(ms) {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes > 0
+    ? `${minutes}분 ${String(seconds).padStart(2, '0')}초`
+    : `${seconds}초`;
+}
+
+function detailedMessage(job, fallback) {
+  const base = job.progress_message || fallback;
+  if (!processingStartedAt) return base;
+  return `${base} · 경과 ${formatElapsed(Date.now() - processingStartedAt)}`;
 }
 
 function showError(message) {
@@ -104,20 +120,41 @@ async function poll(jobId) {
 
     currentJob = job;
 
+    const hasDetailedProgress =
+      Object.prototype.hasOwnProperty.call(job, 'progress') &&
+      Object.prototype.hasOwnProperty.call(job, 'progress_message');
+
     if (job.status === 'queued') {
       statusTitle.textContent = '작업 대기 중';
+      processingStartedAt = null;
       updateProgress(
-        job.progress ?? 2,
-        job.progress_message ||
-          '번역 worker가 대기열을 확인하고 있습니다. 작업이 시작되면 단계별 진행률이 표시됩니다.'
+        hasDetailedProgress ? (job.progress ?? 2) : 2,
+        hasDetailedProgress
+          ? (job.progress_message ||
+              '번역 worker가 대기열을 확인하고 있습니다.')
+          : '작업 대기 중 · 상세 진행률 DB 설정은 worker가 시작된 뒤 확인됩니다.'
       );
     } else if (job.status === 'processing') {
       statusTitle.textContent = '번역 및 PDF 생성 중';
-      updateProgress(
-        job.progress ?? 5,
-        job.progress_message ||
-          '문서 구조와 수식을 분석하고 번역한 뒤 LaTeX로 다시 조판하고 있습니다.'
-      );
+      if (!processingStartedAt) processingStartedAt = Date.now();
+
+      if (hasDetailedProgress) {
+        updateProgress(
+          job.progress ?? 4,
+          detailedMessage(
+            job,
+            '문서 구조와 수식을 분석하고 번역한 뒤 LaTeX로 다시 조판하고 있습니다.'
+          )
+        );
+      } else {
+        // Do not show a fake 5% forever. Make the missing DB migration explicit.
+        progressValue.textContent = '진행 중';
+        progressFill.style.width = '12%';
+        progressTrack.removeAttribute('aria-valuenow');
+        statusText.textContent =
+          '상세 진행률 컬럼이 아직 Supabase에 없습니다. ' +
+          'supabase/UPDATE_EXISTING_SUPABASE.sql을 한 번 실행하면 페이지·번역 묶음별 진행률이 표시됩니다.';
+      }
     } else if (job.status === 'done') {
       updateProgress(100, '번역 PDF가 준비되었습니다.');
       spinner.classList.add('hidden');
@@ -130,7 +167,7 @@ async function poll(jobId) {
       throw new Error(job.error || '번역에 실패했습니다.');
     }
 
-    await new Promise((resolve) => setTimeout(resolve, 3000));
+    await new Promise((resolve) => setTimeout(resolve, 1500));
   }
 }
 
@@ -199,6 +236,7 @@ form.addEventListener('submit', async (event) => {
   resultBox.classList.add('hidden');
   spinner.classList.remove('hidden');
   statusBox.classList.remove('hidden');
+  processingStartedAt = null;
   statusTitle.textContent = 'PDF 업로드 중';
   updateProgress(1, '원본 PDF를 Supabase Storage에 저장하고 있습니다.');
   submitBtn.disabled = true;

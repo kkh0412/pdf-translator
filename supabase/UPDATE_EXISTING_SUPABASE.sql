@@ -19,6 +19,9 @@ alter table public.translation_jobs
 add column if not exists progress_message text;
 
 alter table public.translation_jobs
+add column if not exists progress_updated_at timestamptz;
+
+alter table public.translation_jobs
 drop constraint if exists translation_jobs_progress_check;
 
 alter table public.translation_jobs
@@ -61,6 +64,7 @@ with check (
   and translated_segments is null
   and progress = 0
   and progress_message is null
+  and progress_updated_at is null
   and error is null
   and started_at is null
   and finished_at is null

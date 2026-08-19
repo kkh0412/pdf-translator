@@ -3,6 +3,8 @@ name: PDF translation worker
 on:
   workflow_dispatch:
   schedule:
+    # GitHub Actions scheduled workflows cannot run more often than every
+    # 5 minutes. Offset from minute 0 to reduce top-of-hour congestion.
     - cron: '3-58/5 * * * *'
     - cron: '17 4 1 * *'
 

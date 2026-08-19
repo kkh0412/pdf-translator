@@ -429,9 +429,13 @@ TERM_SCHEMA = {
     "properties": {
         "source": {"type": "string"},
         "target": {"type": "string"},
+        "policy": {
+            "type": "string",
+            "enum": ["translate", "keep_english"],
+        },
         "note": {"type": "string"},
     },
-    "required": ["source", "target", "note"],
+    "required": ["source", "target", "policy", "note"],
     "additionalProperties": False,
 }
 
@@ -527,7 +531,7 @@ def analyze_document(pdf_path: Path, target_language: str) -> tuple[dict, dict]:
             "register": "formal academic",
             "terminology": [],
             "translation_principles": [
-                "Use established terminology in the target academic field."
+                "Translate only broadly standardized concepts; keep niche technical concept names in English when a Korean rendering would be awkward or nonstandard."
             ],
             "do_not_translate": ["author names", "DOIs", "URLs", "equation labels"],
             "math_notation_notes": [
@@ -559,10 +563,22 @@ def analyze_document(pdf_path: Path, target_language: str) -> tuple[dict, dict]:
             "B) identify the academic field/subfield and prepare a translation strategy BEFORE "
             "the body translation starts.\n\n"
             "For the terminology strategy:\n"
-            "- Choose established professional terminology used by specialists in the TARGET language.\n"
-            "- Prefer field-standard terms over literal word-for-word translations.\n"
-            "- Include ambiguous/high-value terms that recur in the paper, not ordinary vocabulary.\n"
-            "- Keep notation, variable names, acronyms, author names, bibliographic titles, DOIs and URLs unchanged unless convention strongly requires otherwise.\n"
+            "- Classify each technical concept with policy=translate or policy=keep_english.\n"
+            "- For KOREAN targets, translate only concepts whose Korean name is broadly standardized "
+            "and recognizable across adjacent fields or standard textbooks. Examples include entropy, "
+            "density matrix, Hamiltonian, quantum state, relative entropy, and measurement.\n"
+            "- For niche, recently coined, subfield-specific, protocol/model/resource-theory terms, "
+            "or any concept whose Korean rendering sounds artificial or is not broadly standardized, "
+            "prefer policy=keep_english and keep the source English term unchanged.\n"
+            "- Do NOT invent Korean transliterations merely because a term can be transliterated. "
+            "For example, a narrow term such as 'ergotropy' should normally remain 'ergotropy' "
+            "unless the document itself establishes another convention.\n"
+            "- When policy=keep_english, set target equal to the source English term. Do not append "
+            "a parenthesized Korean gloss unless the source already contains one.\n"
+            "- Prefer field-standard translations over literal word-for-word translations for the "
+            "terms that genuinely should be translated.\n"
+            "- Include ambiguous/high-value recurring terms, not ordinary vocabulary.\n"
+            "- Keep notation, variable names, acronyms, author names, bibliographic titles, DOIs and URLs unchanged.\n"
             "- For Korean scientific prose, avoid mechanical particles such as '은(는)', '이(가)', "
             "'을(를)'; rewrite the sentence naturally instead.\n"
             "- A term such as 'measurement' in quantum mechanics normally means the physical "
@@ -640,8 +656,12 @@ def analyze_document(pdf_path: Path, target_language: str) -> tuple[dict, dict]:
 
     if strategy["terminology"]:
         preview_terms = ", ".join(
-            f"{term['source']} -> {term['target']}"
-            for term in strategy["terminology"][:8]
+            (
+                f"{term['source']} -> {term['target']}"
+                if term.get("policy") == "translate"
+                else f"{term['source']} [keep English]"
+            )
+            for term in strategy["terminology"][:10]
         )
         print(f"Terminology strategy: {preview_terms}", flush=True)
 

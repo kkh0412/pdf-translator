@@ -1082,20 +1082,18 @@ def process_pdf(
     )
     if progress_callback:
         progress_callback(
-            58,
+            56,
             f"전문용어 전략을 적용해 본문 번역을 시작합니다 · "
             f"{len(translation_items)}개 텍스트 블록",
         )
 
-    def translation_progress(done: int, total: int) -> None:
+    def translation_progress(fraction: float, detail: str) -> None:
         if not progress_callback:
             return
-        fraction = done / max(1, total)
-        percent = 58 + int(round(27 * fraction))
-        progress_callback(
-            min(85, percent),
-            f"본문 번역 중 · {done}/{total}개 묶음 완료",
-        )
+        # Translation receives the widest progress interval because it is
+        # typically the longest stage. 56% -> 90%.
+        percent = 56 + int(round(34 * max(0.0, min(1.0, fraction))))
+        progress_callback(min(90, percent), detail)
 
     translations = translate_blocks(
         translation_items,
@@ -1106,7 +1104,7 @@ def process_pdf(
     translation_seconds = time.perf_counter() - phase
 
     if progress_callback:
-        progress_callback(88, "번역 완료 · LaTeX 문서를 조립하고 있습니다.")
+        progress_callback(91, "번역 완료 · LaTeX 문서를 조립하고 있습니다.")
 
     phase = time.perf_counter()
     tex_source = build_latex(
@@ -1117,7 +1115,7 @@ def process_pdf(
     )
 
     if progress_callback:
-        progress_callback(91, "XeLaTeX로 최종 PDF를 조판하고 있습니다.")
+        progress_callback(93, "XeLaTeX로 최종 PDF를 조판하고 있습니다.")
 
     compile_latex(
         tex_source,
@@ -1127,7 +1125,7 @@ def process_pdf(
     latex_seconds = time.perf_counter() - phase
 
     if progress_callback:
-        progress_callback(94, "PDF 조판 완료 · 결과 파일을 정리하고 있습니다.")
+        progress_callback(95, "PDF 조판 완료 · 결과 파일을 정리하고 있습니다.")
 
     out_doc = pymupdf.open(output_path)
     try:

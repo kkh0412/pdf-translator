@@ -46,7 +46,27 @@ select { height: 52px; padding: 0 14px; border: 1px solid #c9c7c0; border-radius
 .status-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; }
 #progressValue { color: #68665f; font-size: 12px; font-variant-numeric: tabular-nums; }
 .progress-track { width: 100%; height: 8px; margin-top: 13px; border-radius: 999px; background: #deddd7; overflow: hidden; }
-.progress-fill { width: 0%; height: 100%; border-radius: inherit; background: #171717; transition: width .35s ease; }
+.progress-fill {
+  width: 0%;
+  height: 100%;
+  border-radius: inherit;
+  background:
+    linear-gradient(
+      90deg,
+      #171717 0%,
+      #171717 42%,
+      #4a4a47 50%,
+      #171717 58%,
+      #171717 100%
+    );
+  background-size: 180% 100%;
+  animation: progressActivity 1.6s linear infinite;
+  transition: width .35s ease;
+}
+@keyframes progressActivity {
+  from { background-position: 100% 0; }
+  to { background-position: -80% 0; }
+}
 .result { justify-content: space-between; }
 .result h2 { margin: 8px 0 0; font-size: 19px; }
 .badge { display: inline-flex; padding: 4px 8px; border-radius: 99px; font-size: 11px; font-weight: 800; background: #dff4dd; }

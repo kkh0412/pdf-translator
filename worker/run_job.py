@@ -92,6 +92,7 @@ def main(job_id: str) -> int:
                     {
                         "progress": percent,
                         "progress_message": message,
+                        "progress_updated_at": now(),
                     }
                 )
                 .eq("id", job_id)
@@ -159,7 +160,7 @@ def main(job_id: str) -> int:
             progress_callback=update_progress,
         )
 
-        update_progress(95, "생성된 PDF를 최적화하고 있습니다.")
+        update_progress(96, "생성된 PDF를 최적화하고 있습니다.")
         _optimize_pdf(output_path)
         output_size = output_path.stat().st_size
 
@@ -170,7 +171,7 @@ def main(job_id: str) -> int:
             )
 
         result_path = f"{job['user_id']}/{job_id}/translated.pdf"
-        update_progress(97, "최종 PDF를 Supabase Storage에 업로드하고 있습니다.")
+        update_progress(98, "최종 PDF를 Supabase Storage에 업로드하고 있습니다.")
 
         try:
             db.storage.from_("documents").upload(
@@ -205,6 +206,7 @@ def main(job_id: str) -> int:
                 {
                     "progress": 100,
                     "progress_message": "번역 PDF가 준비되었습니다.",
+                    "progress_updated_at": now(),
                 }
             )
 
