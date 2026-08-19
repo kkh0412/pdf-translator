@@ -93,6 +93,8 @@ jobs:
           VISION_PAGES_PER_CALL: '2'
           VISION_WORKERS: '2'
           TRANSLATION_WORKERS: '2'
+          GEMINI_SAFE_RPM: '18'
+          GEMINI_MAX_429_RETRIES: '8'
           BOOK_FONT_DIR: /home/runner/.cache/pdf-translator-fonts
           MAX_PAGES: '20'
         shell: bash

@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pymupdf
 
+from .gemini_rate import impose_cooldown, retry_delay_from_text, wait_for_slot
+
 
 LANGUAGE_NAMES = {
     "ko": "Korean",
@@ -29,11 +31,11 @@ class GeminiVisionError(RuntimeError):
 
 
 def _model_candidates() -> list[str]:
-    primary = os.getenv("GEMINI_VISION_MODEL", "gemini-3.6-flash").strip()
+    primary = os.getenv("GEMINI_VISION_MODEL", "gemini-3.5-flash-lite").strip()
     models = [
         primary,
-        "gemini-3.6-flash",
         "gemini-3.5-flash-lite",
+        "gemini-3.6-flash",
     ]
     out: list[str] = []
     for model in models:
@@ -141,6 +143,7 @@ def _call_json(
                         f"format={format_mode}, attempt={attempt + 1}",
                         flush=True,
                     )
+                    wait_for_slot(model)
                     with urllib.request.urlopen(request, timeout=180) as response:
                         payload = json.loads(response.read().decode("utf-8"))
                     return json.loads(_response_text(payload))
@@ -163,7 +166,24 @@ def _call_json(
                         model_unavailable = True
                         break
 
-                    if exc.code in {429, 500, 502, 503, 504}:
+                    if exc.code == 429:
+                        wait_seconds = retry_delay_from_text(
+                            detail,
+                            default=60.0,
+                        ) + 1.0
+                        impose_cooldown(model, wait_seconds)
+                        print(
+                            f"Vision Gemini 429 for {model}: shared cooldown "
+                            f"{wait_seconds:.1f}s; retrying the same model.",
+                            flush=True,
+                        )
+                        if attempt == 0:
+                            continue
+                        raise GeminiVisionError(
+                            f"Vision rate limited after Retry-After wait: {detail}"
+                        )
+
+                    if exc.code in {500, 502, 503, 504}:
                         if attempt == 0:
                             time.sleep(2)
                             continue
@@ -208,6 +228,27 @@ def _block_text(block: dict) -> str:
     return "\n".join(lines)
 
 
+def _font_name_is_bold(font: str) -> bool:
+    font = str(font or "").lower()
+    return any(
+        token in font
+        for token in ("bold", "semibold", "demibold", "heavy", "black")
+    )
+
+
+def _span_is_bold(span: dict) -> bool:
+    flags = int(span.get("flags", 0) or 0)
+    return bool(flags & 16) or _font_name_is_bold(span.get("font", ""))
+
+
+def _span_is_italic(span: dict) -> bool:
+    flags = int(span.get("flags", 0) or 0)
+    font = str(span.get("font", "") or "").lower()
+    return bool(flags & 2) or any(
+        token in font for token in ("italic", "oblique", "slanted")
+    )
+
+
 def _page_hints(page: pymupdf.Page) -> list[dict]:
     data = page.get_text("dict", flags=pymupdf.TEXTFLAGS_DICT)
     width = max(1.0, float(page.rect.width))
@@ -236,6 +277,21 @@ def _page_hints(page: pymupdf.Page) -> list[dict]:
             fonts[font] = fonts.get(font, 0) + max(1, len(span.get("text", "")))
             sizes.append(float(span.get("size", 10.0)))
 
+        weighted_chars = sum(
+            max(1, len(span.get("text", "")))
+            for span in spans
+        )
+        bold_chars = sum(
+            max(1, len(span.get("text", "")))
+            for span in spans
+            if _span_is_bold(span)
+        )
+        italic_chars = sum(
+            max(1, len(span.get("text", "")))
+            for span in spans
+            if _span_is_italic(span)
+        )
+
         hints.append(
             {
                 "id": f"b{n}",
@@ -248,6 +304,8 @@ def _page_hints(page: pymupdf.Page) -> list[dict]:
                 "text": text[:5000],
                 "font": max(fonts, key=fonts.get) if fonts else "",
                 "font_size": round(statistics.median(sizes), 2) if sizes else 10.0,
+                "bold_ratio": round(bold_chars / max(1, weighted_chars), 3),
+                "italic_ratio": round(italic_chars / max(1, weighted_chars), 3),
             }
         )
 
@@ -933,6 +991,60 @@ def _alphabetic_count(text: str) -> int:
     return sum(ch.isalpha() for ch in text)
 
 
+
+def _bbox_intersection_area(a: list[float], b: list[float]) -> float:
+    if len(a) != 4 or len(b) != 4:
+        return 0.0
+    x0 = max(float(a[0]), float(b[0]))
+    y0 = max(float(a[1]), float(b[1]))
+    x1 = min(float(a[2]), float(b[2]))
+    y1 = min(float(a[3]), float(b[3]))
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    return (x1 - x0) * (y1 - y0)
+
+
+def _apply_source_font_weight(
+    blocks: list[dict],
+    hints: list[dict],
+) -> None:
+    """Make the actual source PDF font weight authoritative."""
+    for block in blocks:
+        if block.get("kind") in {"equation", "figure", "table", "footer"}:
+            continue
+
+        bbox = block.get("bbox") or []
+        if len(bbox) != 4:
+            continue
+
+        weighted_bold = 0.0
+        weighted_italic = 0.0
+        total = 0.0
+
+        for hint in hints:
+            area = _bbox_intersection_area(bbox, hint.get("bbox", []))
+            if area <= 0:
+                continue
+
+            weight = max(1.0, min(area, 50000.0))
+            weighted_bold += weight * float(hint.get("bold_ratio", 0.0))
+            weighted_italic += weight * float(hint.get("italic_ratio", 0.0))
+            total += weight
+
+        if total <= 0:
+            continue
+
+        bold_ratio = weighted_bold / total
+        italic_ratio = weighted_italic / total
+
+        if bold_ratio >= 0.62:
+            block["style"] = "bold"
+        elif italic_ratio >= 0.62:
+            block["style"] = "italic"
+        elif bold_ratio <= 0.18 and italic_ratio <= 0.18:
+            block["style"] = "normal"
+
+
 def _validate_blocks(
     blocks: list[dict],
     hints: list[dict],
@@ -1001,6 +1113,8 @@ def _validate_blocks(
         bbox = block.get("bbox", [])
         if len(bbox) != 4:
             raise GeminiVisionError(f"Page {page_number}: invalid bbox")
+
+    _apply_source_font_weight(blocks, hints)
 
     if src_letters >= 500 and out_letters < src_letters * 0.46:
         raise GeminiVisionError(
@@ -1125,6 +1239,9 @@ def parse_pages(
         "12. For column labels use column1/column2/column3/full/auto. Exact paragraph coordinates "
         "do not need to be reproduced, but the number of columns and full-width regions do.\n\n"
         "CONTENT RULES:\n"
+        "12A. Preserve source font emphasis. A block whose extracted bold_ratio is near 1 "
+        "must remain bold even when there is no explicit 'Abstract' label. Conversely, do not "
+        "make a regular-weight sans-serif heading bold solely because it is a heading.\n\n"
         "13. Preserve hierarchy: title, author, affiliation, metadata, abstract, section, "
         "subsection, paragraph, list_item, equation, figure, table, caption, reference, footer.\n"
         "14. Authors, affiliations, journal/arXiv metadata, emails, references and footer material "

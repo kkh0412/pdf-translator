@@ -297,27 +297,136 @@ def _clean_math(latex: str) -> str:
     return latex
 
 
+
+def _clean_prose_text(text: str) -> str:
+    text = unicodedata.normalize("NFC", str(text or ""))
+    out: list[str] = []
+
+    for ch in text:
+        category = unicodedata.category(ch)
+        if category.startswith("C"):
+            if ch in {"\n", "\t", "\r"}:
+                out.append(" ")
+            continue
+        out.append(ch)
+
+    text = "".join(out)
+    text = text.replace("\u00a0", " ").replace("\u00ad", "")
+    text = re.sub(r"[ \t\r\n]+", " ", text)
+    return text
+
+
+def _read_leaked_math_wrapper(
+    text: str,
+    start: int,
+) -> tuple[str, int] | None:
+    r"""Read §math{...}, \math{...}, or $math{...} leaked into prose."""
+    prefixes = ("§math{", "\\math{", "$math{")
+    prefix = next((item for item in prefixes if text.startswith(item, start)), None)
+    if prefix is None:
+        return None
+
+    open_index = start + len(prefix) - 1
+    depth = 0
+    i = open_index
+
+    while i < len(text):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_index + 1:i], i + 1
+        i += 1
+
+    return None
+
+
+def _split_text_with_leaked_math(text: str) -> list[tuple[str, str]]:
+    """Recover Vision pseudo-markup into real semantic text/math segments."""
+    text = _clean_prose_text(text)
+    result: list[tuple[str, str]] = []
+    cursor = 0
+    i = 0
+
+    while i < len(text):
+        parsed = _read_leaked_math_wrapper(text, i)
+        if parsed is None:
+            i += 1
+            continue
+
+        inner, end = parsed
+        if i > cursor:
+            result.append(("text", text[cursor:i]))
+
+        while True:
+            nested = _read_leaked_math_wrapper(inner, 0)
+            if nested is None or nested[1] != len(inner):
+                break
+            inner = nested[0]
+
+        result.append(("math", inner))
+        cursor = end
+        i = end
+
+    if cursor < len(text):
+        result.append(("text", text[cursor:]))
+
+    if not result:
+        result.append(("text", text))
+
+    return result
+
+
 def _assemble_source(block: dict) -> tuple[str, dict[str, str]]:
     pieces: list[str] = []
     math_map: dict[str, str] = {}
     math_index = 0
+
+    def append_math(content: str) -> None:
+        nonlocal math_index
+        token = f"[[MATH_{math_index}]]"
+        math_map[token] = _clean_math(content)
+        pieces.append(token)
+        math_index += 1
 
     for part in block.get("parts", []):
         ptype = part.get("type")
         content = str(part.get("content", ""))
 
         if ptype == "math":
-            token = f"[[MATH_{math_index}]]"
-            math_map[token] = _clean_math(content)
-            pieces.append(token)
-            math_index += 1
-        else:
-            pieces.append(content)
+            append_math(content)
+            continue
 
-    return "".join(pieces).strip(), math_map
+        for recovered_type, recovered_content in _split_text_with_leaked_math(content):
+            if recovered_type == "math":
+                append_math(recovered_content)
+            else:
+                clean_text = _clean_prose_text(recovered_content)
+                if "§" in clean_text:
+                    raise RuntimeError(
+                        "Vision leaked a bare JSON-safe math transport token "
+                        f"into prose: {clean_text[:180]}"
+                    )
+                pieces.append(clean_text)
+
+    source = "".join(pieces).strip()
+    source = re.sub(r"[ \t\r\n]+", " ", source)
+    return source, math_map
 
 
 def _render_translated_text(text: str, math_map: dict[str, str]) -> str:
+    text = _clean_prose_text(text)
+
+    if any(
+        marker in text
+        for marker in ("§math{", "§mathcal", "§gamma", "§rho", "\\math{")
+    ):
+        raise RuntimeError(
+            "Internal math transport marker reached final text rendering"
+        )
+
     out: list[str] = []
     pos = 0
 
@@ -1217,6 +1326,11 @@ def build_latex(
     section_size = float(style.get("section_size_pt", 11.5)) * 0.97
     accent = _hex_color(style.get("title_color", "#333333"))
     gap = float(style.get("column_gap_pt", 18.0))
+    section_weight_cmd = (
+        r"\bfseries"
+        if style.get("section_weight", "normal") == "bold"
+        else ""
+    )
 
     preamble = rf"""\documentclass[10pt]{{article}}
 \usepackage{{fontspec}}
@@ -1272,11 +1386,11 @@ def build_latex(
 \pagestyle{{sourcepage}}
 \newcommand{{\SourceSection}}[1]{{%
   \par\vspace{{0.52em}}\noindent
-  {{\sffamily\fontsize{{{section_size:.2f}pt}}{{{section_size*1.18:.2f}pt}}\selectfont #1}}
+  {{\sffamily {section_weight_cmd}\fontsize{{{section_size:.2f}pt}}{{{section_size*1.18:.2f}pt}}\selectfont #1}}
   \par\vspace{{0.25em}}}}
 \newcommand{{\SourceSubsection}}[1]{{%
   \par\vspace{{0.40em}}\noindent
-  {{\sffamily\bfseries #1}}\par\vspace{{0.16em}}}}
+  {{\sffamily {section_weight_cmd} #1}}\par\vspace{{0.16em}}}}
 \begin{{document}}
 """
 
@@ -1638,6 +1752,27 @@ def process_pdf(
         strategy,
         progress_callback=translation_progress,
     )
+
+    integrity_errors: list[str] = []
+    for item in translation_items:
+        translated = translations.get(item["id"], "")
+        if not translated:
+            integrity_errors.append(f"{item['id']}: empty translation")
+            continue
+        if any(
+            marker in translated
+            for marker in ("§math{", "§mathcal", "§gamma", "§rho", "\\math{")
+        ):
+            integrity_errors.append(
+                f"{item['id']}: internal math transport marker"
+            )
+
+    if integrity_errors:
+        raise RuntimeError(
+            "Translation integrity check failed before PDF rendering: "
+            + "; ".join(integrity_errors[:8])
+        )
+
     translation_seconds = time.perf_counter() - phase
 
     if progress_callback:

@@ -1,34 +1,28 @@
-# PDF Translator v6.11
+# PDF Translator v6.12
 
-## Generic repeated-script repair
+## Bold / font-weight fidelity
+- Source PDF text hints now carry real bold/italic ratios.
+- Actual source font weight overrides Vision guesses at block level.
+- Fully bold unlabeled abstracts are restored as bold.
+- Regular sans-serif headings are not forced bold.
+- `SourceSubsection` no longer contains unconditional `\bfseries`.
 
-XeLaTeX rejects formulas such as:
+## Text integrity
+- Leaked Vision pseudo-markup such as `§math{§mathcal{M}}` is recovered into
+  protected inline math before translation.
+- Bare internal `§` transport markers are rejected instead of printed.
+- Unicode controls/noncharacters/soft hyphens are stripped from prose.
+- Korean output with syllable-by-syllable spacing is rejected and retried.
+- Long English prose that remains untranslated in a Korean-target job is rejected.
+- Final text-integrity validation runs before LaTeX generation.
 
-    C_{\widetilde{\mathcal M}}_\gamma^{\dagger^T}
-    X_a_b
-    X^a^b
-    X_a^b_c
-
-with `Double subscript` / `Double superscript`.
-
-v6.11 adds a recursive TeX-token normalizer before preflight. It preserves all
-tokens and minimally groups the already-scripted atom:
-
-    C_{\widetilde{\mathcal M}}_\gamma^{\dagger^T}
-      -> {C_{\widetilde{\mathcal M}}}_\gamma^{\dagger^T}
-
-    X_a_b
-      -> {X_a}_b
-
-    X_a^b_c
-      -> {X_a^b}_c
-
-It does not merge or delete indices, and it also works inside nested brace groups.
-
-The source-aware Gemini repair prompt now explicitly prohibits repeated
-subscripts/superscripts and tells the model to use the source crop to choose
-between nested-script notation (A_{x_y}) and grouped-object notation
-({A_x}_y).
-
-All previous v6.10 source-aware, per-formula parallel preflight repairs and the
-automatic Supabase worker architecture are retained.
+## Gemini free-tier 429 handling
+- Shared Vision/translation rate governor defaults to `GEMINI_SAFE_RPM=18`.
+- Google Retry-After / "retry in ...s" delays are honored.
+- All local Gemini threads share the same per-model cooldown.
+- 429 no longer recursively splits translation batches.
+- 429 no longer falls back to `preserving the original block`.
+- If quota still cannot recover, the job stops explicitly instead of producing
+  a mixed Korean/English PDF.
+- Gemini 3.5 Flash-Lite remains the normal model; Gemini 3.6 Flash is not used
+  as a quota-escape path.

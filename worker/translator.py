@@ -11,6 +11,8 @@ import urllib.error
 import urllib.request
 from typing import Callable, Iterable
 
+from .gemini_rate import impose_cooldown, retry_delay_from_text, wait_for_slot
+
 
 LANGUAGE_NAMES = {
     "ko": "Korean",
@@ -26,9 +28,10 @@ PLACEHOLDER_RE = re.compile(r"\[\[MATH_\d+\]\]")
 
 
 class GeminiHTTPError(RuntimeError):
-    def __init__(self, status: int, detail: str):
+    def __init__(self, status: int, detail: str, retry_after: float | None = None):
         self.status = status
         self.detail = detail
+        self.retry_after = retry_after
         super().__init__(f"Gemini API HTTP {status}: {detail}")
 
 
@@ -39,12 +42,76 @@ class GeminiOutputError(RuntimeError):
 def _sanitize(value: str) -> str:
     value = unicodedata.normalize("NFC", value or "")
     out = []
+
     for ch in value:
-        if ch in {"\n", "\t"}:
-            out.append(ch)
-        elif not unicodedata.category(ch).startswith("C"):
-            out.append(ch)
-    return "".join(out).strip()
+        if unicodedata.category(ch).startswith("C"):
+            if ch in {"\n", "\t", "\r"}:
+                out.append(" ")
+            continue
+        out.append(ch)
+
+    value = "".join(out)
+    value = value.replace("\u00a0", " ").replace("\u00ad", "")
+    value = re.sub(r"[ \t\r\n]+", " ", value)
+    return value.strip()
+
+
+def _latin_count(text: str) -> int:
+    return sum(
+        1
+        for ch in text
+        if ("A" <= ch <= "Z") or ("a" <= ch <= "z")
+    )
+
+
+def _hangul_count(text: str) -> int:
+    return sum(1 for ch in text if "\uac00" <= ch <= "\ud7a3")
+
+
+def _validate_translation_quality(
+    source: str,
+    translated: str,
+    target_language: str,
+) -> None:
+    forbidden = (
+        "§math{",
+        "§mathcal",
+        "§gamma",
+        "§rho",
+        "§Pi",
+        "§Sigma",
+        "\\math{",
+        "\ufffd",
+        "\ufffe",
+        "\uffff",
+    )
+    if any(token in translated for token in forbidden):
+        raise GeminiOutputError(
+            "Translation leaked an internal math/control marker"
+        )
+
+    if target_language == "ko" and re.search(
+        r"(?:[가-힣]\s+){5,}[가-힣]",
+        translated,
+    ):
+        raise GeminiOutputError(
+            "Translation contains suspicious syllable-by-syllable Korean spacing"
+        )
+
+    if target_language == "ko":
+        source_latin = _latin_count(source)
+        out_latin = _latin_count(translated)
+        out_hangul = _hangul_count(translated)
+
+        if (
+            source_latin >= 60
+            and len(translated) >= 80
+            and out_latin >= 45
+            and out_hangul < max(8, int(out_latin * 0.18))
+        ):
+            raise GeminiOutputError(
+                "Translation appears to be an untranslated English prose block"
+            )
 
 
 def _candidate_models() -> list[str]:
@@ -132,12 +199,30 @@ def _call(api_key: str, model: str, prompt: str, count: int) -> dict:
             "x-goog-api-key": api_key,
         },
     )
+    wait_for_slot(model)
+
     try:
         with urllib.request.urlopen(req, timeout=150) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise GeminiHTTPError(exc.code, detail) from exc
+        retry_after = None
+
+        if exc.code == 429:
+            header_value = exc.headers.get("Retry-After") if exc.headers else None
+            if header_value:
+                try:
+                    retry_after = float(header_value)
+                except ValueError:
+                    retry_after = None
+            if retry_after is None:
+                retry_after = retry_delay_from_text(detail, default=60.0)
+
+        raise GeminiHTTPError(
+            exc.code,
+            detail,
+            retry_after=retry_after,
+        ) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"TRANSIENT_GEMINI_ERROR: {exc}") from exc
 
@@ -249,6 +334,12 @@ def _translate_once(
                 f"Math placeholders changed: expected={expected}, actual={actual}"
             )
 
+        _validate_translation_quality(
+            item["text"],
+            value,
+            target_language,
+        )
+
         out.append(value)
 
     return out
@@ -260,16 +351,21 @@ def _request_batch(
     target_language: str,
     strategy: dict,
 ) -> list[str]:
-    """Translate one batch without burning fallback models on content errors."""
+    """Treat 429 as a timing condition, never as a translation fallback."""
     models = _candidate_models()
     primary = models[0]
+    max_429 = max(1, int(os.getenv("GEMINI_MAX_429_RETRIES", "8")))
     last_error: Exception | None = None
 
-    for attempt in range(2):
+    output_attempts = 0
+    transient_attempts = 0
+    quota_attempts = 0
+
+    while True:
         try:
             print(
-                f"Translation agent: model={primary}, attempt={attempt + 1}, "
-                f"blocks={len(batch)}",
+                f"Translation agent: model={primary}, "
+                f"quota_retry={quota_attempts}, blocks={len(batch)}",
                 flush=True,
             )
             return _translate_once(
@@ -279,44 +375,90 @@ def _request_batch(
                 target_language,
                 strategy,
             )
+
         except GeminiOutputError as exc:
             last_error = exc
-            if attempt == 0:
-                time.sleep(0.5)
+            output_attempts += 1
+            if output_attempts < 2:
+                time.sleep(0.8)
                 continue
-            # Wrong count / changed math placeholders are not service outages.
-            # Let recursive splitting recover the content instead.
             raise
+
         except GeminiHTTPError as exc:
             last_error = exc
-            if exc.status not in {404, 429, 500, 502, 503, 504}:
-                raise
-            break
 
-    if isinstance(last_error, GeminiHTTPError):
-        for model in models[1:]:
-            try:
+            if exc.status == 429:
+                quota_attempts += 1
+                if quota_attempts > max_429:
+                    raise RuntimeError(
+                        "Gemini rate limit did not recover after waiting. "
+                        "The job is stopped instead of inserting untranslated source text."
+                    ) from exc
+
+                wait_seconds = max(
+                    2.0,
+                    float(exc.retry_after or retry_delay_from_text(exc.detail)),
+                ) + 1.0
+
+                impose_cooldown(primary, wait_seconds)
                 print(
-                    f"Translation fallback model={model}, blocks={len(batch)}",
+                    f"Gemini 429 for {primary}: waiting {wait_seconds:.1f}s "
+                    f"before retry {quota_attempts}/{max_429}. "
+                    "Original prose will NOT be used as fallback.",
                     flush=True,
                 )
-                return _translate_once(
-                    api_key,
-                    model,
-                    batch,
-                    target_language,
-                    strategy,
-                )
-            except GeminiOutputError:
-                raise
-            except GeminiHTTPError as exc:
-                last_error = exc
-                if exc.status not in {404, 429, 500, 502, 503, 504}:
-                    raise
                 continue
 
-    if isinstance(last_error, GeminiOutputError):
-        raise last_error
+            if exc.status == 404:
+                break
+
+            if exc.status in {500, 502, 503, 504}:
+                transient_attempts += 1
+                if transient_attempts <= 3:
+                    time.sleep(min(20.0, 2.0 ** transient_attempts))
+                    continue
+                break
+
+            raise
+
+        except RuntimeError as exc:
+            last_error = exc
+            transient_attempts += 1
+            if transient_attempts <= 3:
+                time.sleep(min(20.0, 2.0 ** transient_attempts))
+                continue
+            break
+
+    # Different-model fallback is reserved for service availability, not quota.
+    for model in models[1:]:
+        try:
+            print(
+                f"Translation service fallback model={model}, blocks={len(batch)}",
+                flush=True,
+            )
+            return _translate_once(
+                api_key,
+                model,
+                batch,
+                target_language,
+                strategy,
+            )
+        except GeminiHTTPError as exc:
+            last_error = exc
+            if exc.status == 429:
+                wait_seconds = max(
+                    2.0,
+                    float(exc.retry_after or retry_delay_from_text(exc.detail)),
+                ) + 1.0
+                impose_cooldown(model, wait_seconds)
+                raise RuntimeError(
+                    f"Gemini fallback model {model} is rate limited. "
+                    "The job is stopped instead of preserving untranslated source text."
+                ) from exc
+            if exc.status not in {404, 500, 502, 503, 504}:
+                raise
+        except GeminiOutputError:
+            raise
 
     raise RuntimeError(f"TRANSIENT_GEMINI_ERROR: {last_error}")
 
@@ -329,20 +471,56 @@ def _recover(
 ) -> list[str]:
     try:
         return _request_batch(api_key, batch, target_language, strategy)
-    except Exception as exc:
-        if len(batch) == 1:
-            print(
-                "Translation fallback: preserving the original block after "
-                f"repeated failure: {exc}",
-                flush=True,
-            )
-            return [batch[0]["text"]]
 
-        mid = len(batch) // 2
-        return (
-            _recover(api_key, batch[:mid], target_language, strategy)
-            + _recover(api_key, batch[mid:], target_language, strategy)
-        )
+    except GeminiOutputError as exc:
+        # Split only structured-output/content-quality failures.
+        if len(batch) > 1:
+            mid = len(batch) // 2
+            return (
+                _recover(api_key, batch[:mid], target_language, strategy)
+                + _recover(api_key, batch[mid:], target_language, strategy)
+            )
+
+        # Final single-block quality fallback. Never silently use source prose.
+        for model in _candidate_models()[1:]:
+            try:
+                print(
+                    f"Single-block quality fallback model={model}",
+                    flush=True,
+                )
+                return _translate_once(
+                    api_key,
+                    model,
+                    batch,
+                    target_language,
+                    strategy,
+                )
+            except GeminiHTTPError as fallback_http:
+                if fallback_http.status == 429:
+                    wait_seconds = max(
+                        2.0,
+                        float(
+                            fallback_http.retry_after
+                            or retry_delay_from_text(fallback_http.detail)
+                        ),
+                    ) + 1.0
+                    impose_cooldown(model, wait_seconds)
+                    raise RuntimeError(
+                        "Gemini quota blocked the single-block fallback. "
+                        "The document is stopped rather than emitted partly untranslated."
+                    ) from fallback_http
+            except GeminiOutputError:
+                continue
+
+        raise RuntimeError(
+            "Translation failed quality validation for one block after retries. "
+            "The document is stopped rather than emitted partly untranslated."
+        ) from exc
+
+    except Exception:
+        # HTTP/network quota failures have already been retried. Recursive
+        # splitting would multiply requests and worsen free-tier 429s.
+        raise
 
 
 def translate_blocks(
