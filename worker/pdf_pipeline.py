@@ -57,6 +57,167 @@ def _escape_text(text: str) -> str:
     return "".join(LATEX_ESCAPES.get(ch, ch) for ch in text)
 
 
+
+def _read_balanced_group(text: str, start: int) -> tuple[str, int]:
+    """Read one {...} group and recursively normalize its mathematical body."""
+    if start >= len(text) or text[start] != "{":
+        return "", start
+
+    depth = 0
+    i = start
+    while i < len(text):
+        ch = text[i]
+
+        if ch == "\\" and i + 1 < len(text) and text[i + 1] in "{}":
+            i += 2
+            continue
+
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                inner = text[start + 1:i]
+                return "{" + _normalize_repeated_scripts(inner) + "}", i + 1
+        i += 1
+
+    # Leave malformed unmatched text untouched; preflight/source repair will
+    # handle the genuine grouping error later.
+    return text[start:], len(text)
+
+
+def _read_tex_command(text: str, start: int) -> tuple[str, int]:
+    """Read a TeX control sequence and its immediately attached brace arguments."""
+    if start >= len(text) or text[start] != "\\":
+        return "", start
+
+    i = start + 1
+    if i < len(text) and text[i].isalpha():
+        while i < len(text) and text[i].isalpha():
+            i += 1
+    elif i < len(text):
+        i += 1
+
+    atom = text[start:i]
+
+    # Commands such as \mathcal{M}, \widetilde{X}, \frac{a}{b} form one
+    # syntactic atom for the purpose of subsequent scripts.
+    while i < len(text) and text[i] == "{":
+        group, i2 = _read_balanced_group(text, i)
+        if i2 <= i:
+            break
+        atom += group
+        i = i2
+
+    return atom, i
+
+
+def _read_script_argument(text: str, start: int) -> tuple[str, int]:
+    """Read the single TeX token/group governed by _ or ^."""
+    i = start
+    while i < len(text) and text[i].isspace():
+        i += 1
+
+    if i >= len(text):
+        return "", i
+
+    if text[i] == "{":
+        return _read_balanced_group(text, i)
+
+    if text[i] == "\\":
+        return _read_tex_command(text, i)
+
+    return text[i], i + 1
+
+
+def _read_math_atom(text: str, start: int) -> tuple[str, int]:
+    """Read one base math atom before scripts are attached."""
+    if start >= len(text):
+        return "", start
+
+    if text[start] == "{":
+        return _read_balanced_group(text, start)
+
+    if text[start] == "\\":
+        return _read_tex_command(text, start)
+
+    return text[start], start + 1
+
+
+def _normalize_repeated_scripts(text: str) -> str:
+    """Make repeated TeX sub/superscripts syntactically valid without deleting content.
+
+    TeX forbids two subscripts or two superscripts on the same atom:
+        C_A_B      -> Double subscript
+        X^a^b      -> Double superscript
+
+    Since the invalid input has no legal TeX interpretation, the least-invasive
+    repair is to preserve token order and explicitly group the already-scripted
+    atom before attaching the repeated script:
+        C_A_B      -> {C_A}_B
+        X_a^b_c    -> {X_a^b}_c
+
+    Nested groups are processed recursively.
+    """
+    if not text:
+        return text
+
+    out: list[str] = []
+    i = 0
+
+    while i < len(text):
+        ch = text[i]
+
+        if ch.isspace():
+            out.append(ch)
+            i += 1
+            continue
+
+        # _ or ^ without a preceding atom is left for XeLaTeX/source repair.
+        if ch in "_^":
+            out.append(ch)
+            i += 1
+            continue
+
+        atom, next_i = _read_math_atom(text, i)
+        if next_i <= i:
+            out.append(ch)
+            i += 1
+            continue
+
+        current = atom
+        i = next_i
+        seen_scripts: set[str] = set()
+
+        while True:
+            j = i
+            while j < len(text) and text[j].isspace():
+                j += 1
+
+            if j >= len(text) or text[j] not in "_^":
+                break
+
+            marker = text[j]
+            arg, after = _read_script_argument(text, j + 1)
+            if not arg:
+                break
+
+            if marker in seen_scripts:
+                # Nest the previous scripted atom rather than dropping,
+                # combining or reinterpreting either script.
+                current = "{" + current + "}" + marker + arg
+                seen_scripts = {marker}
+            else:
+                current += marker + arg
+                seen_scripts.add(marker)
+
+            i = after
+
+        out.append(current)
+
+    return "".join(out)
+
+
 def _clean_math(latex: str) -> str:
     # Decode § transport / repair JSON controls before generic sanitation.
     # This is the critical ordering: sanitation must not delete the evidence first.
@@ -113,6 +274,10 @@ def _clean_math(latex: str) -> str:
         latex,
         flags=re.S,
     ).strip()
+
+    # Generic TeX grammar repair: repeated _/_ or ^/^ scripts are illegal.
+    # Preserve every token by nesting the already-scripted atom.
+    latex = _normalize_repeated_scripts(latex)
 
     if DANGEROUS_MATH.search(latex):
         raise RuntimeError("Unsafe LaTeX command returned by the vision agent")

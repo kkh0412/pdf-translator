@@ -1,29 +1,34 @@
-# PDF Translator v6.10
+# PDF Translator v6.11
 
-## Math pipeline overhaul
+## Generic repeated-script repair
 
-v6.10 no longer preflights all formulas in one XeLaTeX document.
+XeLaTeX rejects formulas such as:
 
-Each inline/display formula is compiled independently (parallel workers), so one
-bad formula cannot hide later errors and the whole 150+ formula document is not
-recompiled from the beginning after every repair.
+    C_{\widetilde{\mathcal M}}_\gamma^{\dagger^T}
+    X_a_b
+    X^a^b
+    X_a^b_c
 
-For every failing formula:
-1. parse the XeLaTeX error;
-2. apply a narrow deterministic repair when the failure is an undefined short
-   text macro used only as a superscript/subscript, e.g. `^{\fn}` ->
-   `^{\mathrm{fn}}`;
-3. otherwise crop the exact source equation/paragraph from the original PDF and
-   send that crop + compiler error + current transcription to Gemini;
-4. reconstruct with standard LaTeX/amsmath/amssymb only;
-5. recompile only that failed formula.
+with `Double subscript` / `Double superscript`.
 
-Every formula gets its own repair budget; the previous document-wide two-repair
-limit has been removed.
+v6.11 adds a recursive TeX-token normalizer before preflight. It preserves all
+tokens and minimally groups the already-scripted atom:
 
-The initial Vision transcription prompt now explicitly forbids invented custom
-macros such as `\fn` and requires visible roman superscript/subscript labels to
-be represented with `\mathrm{...}` / `\text{...}`.
+    C_{\widetilde{\mathcal M}}_\gamma^{\dagger^T}
+      -> {C_{\widetilde{\mathcal M}}}_\gamma^{\dagger^T}
 
-The v6.9 aligned-equation renderer and automatic Supabase worker architecture
-are retained.
+    X_a_b
+      -> {X_a}_b
+
+    X_a^b_c
+      -> {X_a^b}_c
+
+It does not merge or delete indices, and it also works inside nested brace groups.
+
+The source-aware Gemini repair prompt now explicitly prohibits repeated
+subscripts/superscripts and tells the model to use the source crop to choose
+between nested-script notation (A_{x_y}) and grouped-object notation
+({A_x}_y).
+
+All previous v6.10 source-aware, per-formula parallel preflight repairs and the
+automatic Supabase worker architecture are retained.
