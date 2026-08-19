@@ -16,55 +16,39 @@ if ! command -v xelatex >/dev/null 2>&1; then
   export PATH="$HOME/.TinyTeX/bin/x86_64-linux:$PATH"
 fi
 
-tlmgr install \
-  kpfonts-otf \
-  xetexko \
-  cjk-ko \
-  enumitem \
-  geometry \
-  graphics \
-  amsmath \
-  amsfonts
+tlmgr install lm xetexko cjk-ko enumitem geometry graphics xcolor amsmath amsfonts
 
-mkdir -p "$HOME/.cache/pdf-translator-fonts"
+FONT_DIR="$HOME/.cache/pdf-translator-fonts"
+mkdir -p "$FONT_DIR"
 
-if [ ! -f "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Regular.ttf" ]; then
-  curl -fL --retry 3 \
-    -o "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Regular.ttf" \
-    https://raw.githubusercontent.com/google/fonts/main/ofl/nanummyeongjo/NanumMyeongjo-Regular.ttf
-fi
+download_font () {
+  local name="$1"
+  local url="$2"
+  if [ ! -f "$FONT_DIR/$name" ]; then
+    curl -fL --retry 3 -o "$FONT_DIR/$name" "$url"
+  fi
+}
 
-if [ ! -f "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Bold.ttf" ]; then
-  curl -fL --retry 3 \
-    -o "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Bold.ttf" \
-    https://raw.githubusercontent.com/google/fonts/main/ofl/nanummyeongjo/NanumMyeongjo-Bold.ttf
-fi
+download_font NanumMyeongjo-Regular.ttf \
+  https://raw.githubusercontent.com/google/fonts/main/ofl/nanummyeongjo/NanumMyeongjo-Regular.ttf
+download_font NanumMyeongjo-Bold.ttf \
+  https://raw.githubusercontent.com/google/fonts/main/ofl/nanummyeongjo/NanumMyeongjo-Bold.ttf
+download_font NanumGothic-Regular.ttf \
+  https://raw.githubusercontent.com/google/fonts/main/ofl/nanumgothic/NanumGothic-Regular.ttf
+download_font NanumGothic-Bold.ttf \
+  https://raw.githubusercontent.com/google/fonts/main/ofl/nanumgothic/NanumGothic-Bold.ttf
 
 for font in \
-  KpRoman-Regular.otf \
-  KpRoman-Italic.otf \
-  KpRoman-Bold.otf \
-  KpRoman-BoldItalic.otf \
-  KpSans-Regular.otf \
-  KpSans-Italic.otf \
-  KpSans-Bold.otf \
-  KpSans-BoldItalic.otf
+  lmroman10-regular.otf lmroman10-bold.otf lmroman10-italic.otf lmroman10-bolditalic.otf \
+  lmsans10-regular.otf lmsans10-bold.otf lmsans10-oblique.otf lmsans10-boldoblique.otf
 do
   src="$(kpsewhich "$font")"
   test -n "$src"
-  cp -f "$src" "$HOME/.cache/pdf-translator-fonts/$font"
+  cp -f "$src" "$FONT_DIR/$font"
 done
 
 kpsewhich xetexko.sty >/dev/null
 kpsewhich kolabels-utf.sty >/dev/null
-kpsewhich geometry.sty >/dev/null
-kpsewhich enumitem.sty >/dev/null
 kpsewhich amsmath.sty >/dev/null
-kpsewhich amssymb.sty >/dev/null
-
 test -x ".venv/bin/python"
 test -x "$HOME/.TinyTeX/bin/x86_64-linux/xelatex"
-test -f "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Regular.ttf"
-test -f "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Bold.ttf"
-test -f "$HOME/.cache/pdf-translator-fonts/KpRoman-Regular.otf"
-test -f "$HOME/.cache/pdf-translator-fonts/KpSans-Regular.otf"

@@ -1,35 +1,39 @@
-# PDF Translator - Semantic LaTeX v5.3
+# PDF Translator v6 - Vision-first semantic LaTeX
 
-이번 버전은 원본 PDF의 정확한 문단 좌표를 복제하지 않고, 제목 / 절 / 소제목 / 본문 / 불릿 / 인용문 / 그림 / 수식의 **조판 스타일**을 우선해 XeLaTeX로 새 문서를 만듭니다.
+목표는 픽셀 단위 위치 복사가 아니라 **"원 저자가 대상 언어로 같은 논문/책을 만들었다면"**에 가까운 PDF입니다.
 
-## v5.3 핵심 수정
+처리 순서:
 
-- 원본 syllabus에서 실제로 사용된 Kp 계열 분위기를 유지합니다.
-- `kpfonts-otf.sty`는 더 이상 로드하지 않습니다.
-- 대신 `KpRoman-*.otf` / `KpSans-*.otf` 파일을 `fontspec`으로 직접 로드합니다.
-- 따라서 `kpfonts-otf.sty`가 요구하던 `realscripts`와 `unicode-math` 때문에 컴파일이 연쇄적으로 깨지는 문제가 없어집니다.
-- 한국어 본문은 Nanum Myeongjo를 사용합니다.
-- GitHub Actions가 실제 생성 문서와 동일한 핵심 preamble을 사용한 smoke-test PDF를 먼저 컴파일합니다. 이 테스트가 성공한 뒤에만 사용자 PDF 처리를 시작합니다.
-- TinyTeX와 폰트는 Actions cache를 재사용합니다.
+1. 원본 PDF의 대표 페이지를 이미지로 렌더링
+2. Gemini vision style agent가 컬럼 수, serif/sans 역할, 제목 색/크기, 여백, 문단 스타일을 분석
+3. 각 페이지 이미지를 Gemini vision content agent가 읽음
+   - 자연어와 inline math를 분리
+   - 독립 수식을 실제 LaTeX로 복원
+   - 그림/표만 이미지 asset으로 분리
+4. 번역 agent는 자연어만 번역하고 `[[MATH_n]]` placeholder를 절대 수정하지 않음
+5. XeLaTeX가 원본 style profile을 사용해 전체 문서를 새로 조판
+6. 원본이 2-column이면 결과도 2-column인지 자동 검사
+7. 결과 페이지 수가 비정상적으로 폭증하면 실패 처리
 
-## 브라우저 / Supabase 설정
+## API
 
-`docs/config.js`에는 현재 프로젝트의 Supabase URL과 publishable key가 이미 설정되어 있습니다.
-
-GitHub Actions Secrets에는 다음 두 값만 필요합니다.
+새 secret은 필요 없습니다.
 
 - `GEMINI_API_KEY`
 - `SUPABASE_SECRET_KEY`
 
-GitHub Actions Variable에는 다음 값이 필요합니다.
+GitHub Actions variable:
+- `SUPABASE_URL`
 
-- `SUPABASE_URL = https://ejiwkhalnssozcrjxojc.supabase.co`
+Vision agent는 기본 `gemini-3.6-flash`, 번역 agent도 기본 `gemini-3.6-flash`를 사용하고
+일시 장애 시 3.5 Flash / Flash-Lite로 fallback합니다.
 
+## 중요한 차이
 
-## v5.5
+v5까지는 번역 Gemini가 페이지 이미지를 보지 않았습니다.
+v6부터는 style agent와 page reconstruction agent가 실제 렌더된 페이지 이미지를 봅니다.
 
-- U+0000 and other PDF/OCR control characters are removed before XeLaTeX.
-- Unicode math symbols in prose are converted to LaTeX math commands.
-- TinyTeX + book fonts + Python dependencies are stored in one prepared runtime cache.
-- The cache is explicitly saved before PDF processing, so a later PDF failure does not discard it.
-- A separate `Prepare PDF runtime cache` workflow prewarms the cache after deployment and touches it twice weekly.
+수식은 더 이상 PDF crop PNG로 넣지 않습니다.
+- inline math -> LaTeX math part
+- display equation -> LaTeX equation environment
+- 실제 figure/table만 원본 PDF에서 crop하여 이미지로 유지합니다.

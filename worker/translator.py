@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import json
 import os
+import re
 import time
+import unicodedata
 import urllib.error
 import urllib.request
-import unicodedata
 from typing import Iterable
 
 
@@ -17,6 +20,8 @@ LANGUAGE_NAMES = {
     "es": "Spanish",
 }
 
+PLACEHOLDER_RE = re.compile(r"\[\[MATH_\d+\]\]")
+
 
 class GeminiHTTPError(RuntimeError):
     def __init__(self, status: int, detail: str):
@@ -26,71 +31,54 @@ class GeminiHTTPError(RuntimeError):
 
 
 class GeminiOutputError(RuntimeError):
-    """Gemini returned JSON, but it could not be safely mapped to the input batch."""
+    pass
 
 
-def _sanitize_translation_text(value: str) -> str:
-    """Normalize model output and remove invisible control bytes unsafe for XeTeX."""
+def _sanitize(value: str) -> str:
     value = unicodedata.normalize("NFC", value or "")
-    out: list[str] = []
+    out = []
     for ch in value:
         if ch in {"\n", "\t"}:
             out.append(ch)
-            continue
-        if unicodedata.category(ch).startswith("C"):
-            continue
-        if ch == "\u0338":
-            continue
-        out.append(ch)
+        elif not unicodedata.category(ch).startswith("C"):
+            out.append(ch)
     return "".join(out).strip()
 
 
-def _chunks(
-    items: list[dict],
-    max_items: int = 40,
-    max_chars: int = 9000,
-) -> Iterable[list[dict]]:
-    """Keep batches modest so long documents do not encourage omitted entries."""
-    batch: list[dict] = []
-    chars = 0
+def _candidate_models() -> list[str]:
+    primary = os.getenv("GEMINI_TRANSLATION_MODEL", "gemini-3.6-flash").strip()
+    models = [
+        primary,
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+    ]
+    out = []
+    for m in models:
+        if m and m not in out:
+            out.append(m)
+    return out
+
+
+def _chunks(items: list[dict], max_items: int = 28, max_chars: int = 9000) -> Iterable[list[dict]]:
+    batch, chars = [], 0
     for item in items:
         n = len(item.get("text", ""))
         if batch and (len(batch) >= max_items or chars + n > max_chars):
             yield batch
-            batch = []
-            chars = 0
+            batch, chars = [], 0
         batch.append(item)
         chars += n
     if batch:
         yield batch
 
 
-def _candidate_models() -> list[str]:
-    primary = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
-    fallbacks = [
-        "gemini-3.5-flash-lite",
-        "gemini-3.6-flash",
-        "gemini-3.7-flash",
-    ]
-    out: list[str] = []
-    for model in [primary, *fallbacks]:
-        if model and model not in out:
-            out.append(model)
-    return out
-
-
-def _translation_schema(count: int) -> dict:
-    # Exact-length arrays are supported by Gemini structured output.
-    # The application owns the input IDs, so the model never has to reproduce them.
+def _schema(count: int) -> dict:
     return {
         "type": "object",
         "properties": {
             "translations": {
                 "type": "array",
-                "description": (
-                    "Translations in exactly the same order as the input segments. "
-                    f"The array must contain exactly {count} strings."
-                ),
                 "items": {"type": "string"},
                 "minItems": count,
                 "maxItems": count,
@@ -101,8 +89,8 @@ def _translation_schema(count: int) -> dict:
     }
 
 
-def _extract_model_text(response: dict) -> str:
-    chunks: list[str] = []
+def _extract_text(response: dict) -> str:
+    chunks = []
     for step in response.get("steps", []):
         if step.get("type") != "model_output":
             continue
@@ -111,15 +99,12 @@ def _extract_model_text(response: dict) -> str:
                 chunks.append(block["text"])
     if chunks:
         return "".join(chunks)
-
-    output_text = response.get("output_text")
-    if isinstance(output_text, str) and output_text:
-        return output_text
-
-    raise GeminiOutputError("Gemini returned no model output text")
+    if isinstance(response.get("output_text"), str):
+        return response["output_text"]
+    raise GeminiOutputError("Gemini returned no text output")
 
 
-def _call_gemini(api_key: str, model: str, prompt: str, count: int) -> dict:
+def _call(api_key: str, model: str, prompt: str, count: int) -> dict:
     endpoint = "https://generativelanguage.googleapis.com/v1beta/interactions"
     body = {
         "model": model,
@@ -128,290 +113,152 @@ def _call_gemini(api_key: str, model: str, prompt: str, count: int) -> dict:
         "response_format": {
             "type": "text",
             "mime_type": "application/json",
-            "schema": _translation_schema(count),
+            "schema": _schema(count),
         },
         "generation_config": {
             "thinking_level": "low",
             "temperature": 0.1,
         },
     }
-
-    request = urllib.request.Request(
+    req = urllib.request.Request(
         endpoint,
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
         method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "x-goog-api-key": api_key,
-        },
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
     )
-
     try:
-        with urllib.request.urlopen(request, timeout=120) as response:
+        with urllib.request.urlopen(req, timeout=150) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise GeminiHTTPError(exc.code, detail) from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"TRANSIENT_GEMINI_ERROR: connection error: {exc}") from exc
+        raise RuntimeError(f"TRANSIENT_GEMINI_ERROR: {exc}") from exc
 
 
-def _translate_batch_once(
+def _translate_once(
     api_key: str,
     model: str,
     batch: list[dict],
     target_language: str,
 ) -> list[str]:
-    # index is only for human/model orientation. IDs stay entirely local.
     compact = [
         {
             "index": i,
-            "kind": item.get("kind", "paragraph"),
+            "kind": item["kind"],
             "text": item["text"],
         }
         for i, item in enumerate(batch)
     ]
 
     prompt = (
-        "You are translating ordered text segments extracted from a PDF document.\n"
-        f"Translate every segment into {LANGUAGE_NAMES[target_language]}.\n"
-        f"There are exactly {len(batch)} input segments.\n"
-        "Return exactly the same number of translations in the same order.\n"
-        "Do not merge, skip, split, reorder, or duplicate segments.\n"
-        "Requirements:\n"
-        "- Translate natural-language content faithfully and professionally.\n"
-        "- Preserve citation markers, bracketed reference numbers, URLs, DOIs, "
-        "acronyms, proper names, equations, symbols, and numeric values.\n"
-        "- Do not add explanations, notes, Markdown, or commentary.\n"
-        "- Preserve the document role indicated by kind (title, section, topic, bullet, verse, paragraph).\n"
-        "- For kind=verse, preserve original line breaks and line count as closely as grammar allows.\n"
-        "- For headings and bullets, translate only the wording; do not invent numbering or bullet symbols.\n"
-        "- Use natural professional book/document prose rather than terse UI language.\n"
-        "- Do not omit meaning.\n\n"
-        "INPUT JSON ARRAY (ordered):\n"
+        "Translate ordered semantic blocks from a scientific/academic document.\n"
+        f"Target language: {LANGUAGE_NAMES[target_language]}.\n"
+        "Write as if the ORIGINAL AUTHOR had written the publication directly in the target language: "
+        "formal, natural, publication-quality academic prose.\n"
+        "Use standard terminology of physics/mathematics/quantum information where applicable.\n"
+        "Examples for Korean: coarse-graining -> 조대화, quantum state -> 양자 상태, "
+        "relative entropy -> 상대 엔트로피, retrodiction -> 역추론 unless context strongly requires another standard term.\n"
+        "Do not translate author names, citation numbers, equation numbers, URLs, DOIs, variable names, or acronyms.\n"
+        "CRITICAL: tokens of the form [[MATH_0]], [[MATH_1]], ... are protected mathematical expressions. "
+        "Preserve every such token EXACTLY, character-for-character. You may move a token to a grammatically "
+        "natural position, but never edit, merge, duplicate, translate, or delete it.\n"
+        "Do not add Markdown or commentary.\n"
+        f"Return exactly {len(batch)} strings in the same order.\n\n"
         + json.dumps(compact, ensure_ascii=False)
     )
 
-    response = _call_gemini(api_key, model, prompt, len(batch))
-    output_text = _extract_model_text(response)
-
+    payload = _call(api_key, model, prompt, len(batch))
     try:
-        parsed = json.loads(output_text)
+        parsed = json.loads(_extract_text(payload))
     except json.JSONDecodeError as exc:
-        raise GeminiOutputError("Gemini returned invalid structured JSON") from exc
+        raise GeminiOutputError("Gemini returned invalid JSON") from exc
 
-    translations = parsed.get("translations")
-    if not isinstance(translations, list):
-        raise GeminiOutputError("Gemini structured response is missing translations")
+    values = parsed.get("translations")
+    if not isinstance(values, list) or len(values) != len(batch):
+        raise GeminiOutputError("Gemini returned the wrong number of translations")
 
-    if len(translations) != len(batch):
-        raise GeminiOutputError(
-            f"Gemini returned {len(translations)} translations for {len(batch)} segments"
-        )
-
-    cleaned: list[str] = []
-    for i, value in enumerate(translations):
+    out = []
+    for item, value in zip(batch, values):
         if not isinstance(value, str):
-            raise GeminiOutputError(f"Gemini returned a non-string translation at index {i}")
-        sanitized = _sanitize_translation_text(value)
-        if not sanitized:
-            raise GeminiOutputError(f"Gemini returned an empty translation at index {i}")
-        cleaned.append(sanitized)
+            raise GeminiOutputError("Gemini returned a non-string translation")
+        value = _sanitize(value)
+        if not value:
+            raise GeminiOutputError("Gemini returned an empty translation")
 
-    return cleaned
+        expected = sorted(PLACEHOLDER_RE.findall(item["text"]))
+        actual = sorted(PLACEHOLDER_RE.findall(value))
+        if expected != actual:
+            raise GeminiOutputError(
+                f"Math placeholders changed: expected={expected}, actual={actual}"
+            )
+        out.append(value)
+    return out
 
 
-def _is_transient_status(status: int) -> bool:
-    return status in {429, 500, 502, 503, 504}
-
-
-def _request_with_model_fallback(
-    api_key: str,
-    batch: list[dict],
-    target_language: str,
-    models: list[str],
-    preferred_model: str,
-    label: str,
-) -> tuple[list[str], str]:
-    ordered_models = [preferred_model] + [m for m in models if m != preferred_model]
-    last_error: Exception | None = None
-
-    for model in ordered_models:
-        # Retry malformed/semantically invalid output once on the same model.
+def _request_batch(api_key: str, batch: list[dict], target_language: str) -> list[str]:
+    last_error = None
+    for model in _candidate_models():
         for attempt in range(2):
             try:
                 print(
-                    f"Gemini {label}: model={model}, attempt={attempt + 1}, "
-                    f"segments={len(batch)}",
+                    f"Translation agent: model={model}, attempt={attempt + 1}, "
+                    f"blocks={len(batch)}",
                     flush=True,
                 )
-                translations = _translate_batch_once(
-                    api_key, model, batch, target_language
-                )
-                return translations, model
-
+                return _translate_once(api_key, model, batch, target_language)
             except GeminiOutputError as exc:
                 last_error = exc
                 if attempt == 0:
-                    print(
-                        f"Gemini {label}: output validation failed ({exc}); retrying once.",
-                        flush=True,
-                    )
                     time.sleep(1)
                     continue
-                # Bad output twice: splitting the batch is more useful than trying
-                # the same large request across every model.
-                raise
-
+                break
             except GeminiHTTPError as exc:
                 last_error = exc
                 if exc.status == 404:
-                    print(
-                        f"{model} unavailable (404); trying fallback model.",
-                        flush=True,
-                    )
                     break
-                if _is_transient_status(exc.status):
-                    if attempt == 0:
-                        delay = 2
-                        print(
-                            f"{model} temporary HTTP {exc.status}; retrying in {delay}s.",
-                            flush=True,
-                        )
-                        time.sleep(delay)
-                        continue
-                    print(
-                        f"{model} still unavailable (HTTP {exc.status}); trying fallback model.",
-                        flush=True,
-                    )
-                    break
-                raise
-
-            except RuntimeError as exc:
-                last_error = exc
-                if str(exc).startswith("TRANSIENT_GEMINI_ERROR:"):
+                if exc.status in {429, 500, 502, 503, 504}:
                     if attempt == 0:
                         time.sleep(2)
                         continue
                     break
                 raise
-
-    raise RuntimeError(
-        "TRANSIENT_GEMINI_ERROR: all Gemini fallback models are temporarily "
-        f"unavailable. Last error: {last_error}"
-    )
+    raise RuntimeError(f"TRANSIENT_GEMINI_ERROR: {last_error}")
 
 
-def _translate_resilient(
-    api_key: str,
-    batch: list[dict],
-    target_language: str,
-    models: list[str],
-    preferred_model: str,
-    label: str,
-    depth: int = 0,
-) -> tuple[list[str], str]:
-    """Translate a batch; if structured output is incomplete, retry only that batch.
-
-    Large malformed batches are split recursively. A single irrecoverable segment is
-    preserved in the source language rather than making the entire PDF disappear.
-    """
+def _recover(api_key: str, batch: list[dict], target_language: str) -> list[str]:
     try:
-        return _request_with_model_fallback(
-            api_key,
-            batch,
-            target_language,
-            models,
-            preferred_model,
-            label,
-        )
-    except GeminiOutputError as exc:
-        print(
-            f"Gemini {label}: incomplete/invalid structured output after retry: {exc}",
-            flush=True,
-        )
-
+        return _request_batch(api_key, batch, target_language)
+    except Exception as exc:
         if len(batch) == 1:
-            # Preserve document completeness. This is deliberately visible in logs,
-            # but the PDF keeps the source text instead of dropping the segment.
             print(
-                f"WARNING: preserving source text for one unrecoverable segment "
-                f"({batch[0]['id']}).",
+                f"Translation fallback: preserving original block after repeated failure: {exc}",
                 flush=True,
             )
-            return [batch[0]["text"]], preferred_model
-
+            return [batch[0]["text"]]
         mid = len(batch) // 2
-        left = batch[:mid]
-        right = batch[mid:]
-        print(
-            f"Gemini {label}: splitting {len(batch)} segments into "
-            f"{len(left)} + {len(right)} for targeted recovery.",
-            flush=True,
+        return (
+            _recover(api_key, batch[:mid], target_language)
+            + _recover(api_key, batch[mid:], target_language)
         )
 
-        left_values, active_model = _translate_resilient(
-            api_key,
-            left,
-            target_language,
-            models,
-            preferred_model,
-            f"{label}.L",
-            depth + 1,
-        )
-        right_values, active_model = _translate_resilient(
-            api_key,
-            right,
-            target_language,
-            models,
-            active_model,
-            f"{label}.R",
-            depth + 1,
-        )
-        return left_values + right_values, active_model
 
-
-def translate_segments(items: list[dict], target_language: str) -> dict[str, str]:
+def translate_blocks(items: list[dict], target_language: str) -> dict[str, str]:
     if not items:
         return {}
 
     if os.getenv("MOCK_TRANSLATION", "false").lower() == "true":
-        return {
-            item["id"]: f"[{LANGUAGE_NAMES.get(target_language, target_language)}] {item['text']}"
-            for item in items
-        }
-
-    if target_language not in LANGUAGE_NAMES:
-        raise ValueError("Unsupported target language")
+        return {item["id"]: item["text"] for item in items}
 
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured")
+    if target_language not in LANGUAGE_NAMES:
+        raise RuntimeError(f"Unsupported target language: {target_language}")
 
-    models = _candidate_models()
     result: dict[str, str] = {}
-    active_model = models[0]
-
-    for batch_index, batch in enumerate(_chunks(items), start=1):
-        translations, active_model = _translate_resilient(
-            api_key,
-            batch,
-            target_language,
-            models,
-            active_model,
-            f"batch {batch_index}",
-        )
-
-        # Mapping is deterministic: model never generates or edits IDs.
-        for source_item, translation in zip(batch, translations, strict=True):
-            result[source_item["id"]] = translation
-
-    # This should now be an internal invariant, not a model-output dependency.
-    missing = [x["id"] for x in items if x["id"] not in result]
-    if missing:
-        raise RuntimeError(
-            "Internal translation mapping error; missing "
-            f"{len(missing)} segments: {missing[:10]}"
-        )
-
+    for batch in _chunks(items):
+        translated = _recover(api_key, batch, target_language)
+        for item, value in zip(batch, translated):
+            result[item["id"]] = value
     return result
