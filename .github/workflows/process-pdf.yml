@@ -1,24 +1,49 @@
-name: Process PDF translation
+name: PDF translation worker
 
 on:
   workflow_dispatch:
-    inputs:
-      job_id:
-        description: Supabase translation_jobs UUID
-        required: true
-        type: string
+  schedule:
+    # 대기열 확인: 5분 간격. 정각 부하를 피하려고 3분부터 시작합니다.
+    - cron: '3-58/5 * * * *'
+    # 공개 저장소의 scheduled workflow 비활성화를 피하기 위한 월 1회 heartbeat.
+    - cron: '17 4 1 * *'
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: pdf-${{ inputs.job_id }}
+  group: pdf-translation-worker
   cancel-in-progress: false
 
 jobs:
-  process:
+  check-queue:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    outputs:
+      has_jobs: ${{ steps.queue.outputs.has_jobs }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check Supabase queue
+        id: queue
+        env:
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+        shell: bash
+        run: |
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SECRET_KEY" ]; then
+            echo "Repository variable SUPABASE_URL and secret SUPABASE_SECRET_KEY are required." >&2
+            exit 1
+          fi
+          HAS_JOBS="$(python worker/check_queue.py)"
+          echo "has_jobs=$HAS_JOBS" >> "$GITHUB_OUTPUT"
+          echo "Queued jobs: $HAS_JOBS"
+
+  process:
+    needs: check-queue
+    if: needs.check-queue.outputs.has_jobs == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -40,11 +65,31 @@ jobs:
       - name: Install Python dependencies
         run: python -m pip install --upgrade pip && pip install -r worker/requirements.txt
 
-      - name: Process PDF
+      - name: Process queued PDFs
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: gpt-5.6-luna
           MAX_PAGES: '20'
-        run: python -m worker.run_job '${{ inputs.job_id }}'
+        run: python -m worker.run_pending --max-jobs 3
+
+  heartbeat:
+    if: github.event_name == 'schedule' && github.event.schedule == '17 4 1 * *'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Record monthly activity
+        shell: bash
+        run: |
+          date -u '+%Y-%m-%dT%H:%M:%SZ' > .github/worker-heartbeat.txt
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/worker-heartbeat.txt
+          git diff --cached --quiet && exit 0
+          git commit -m 'chore: keep scheduled worker active'
+          git push

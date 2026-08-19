@@ -57,23 +57,6 @@ async function ensureAnonymousSession() {
   return signed.session;
 }
 
-async function invokeFunction(name, body) {
-  const { data, error } = await supabase.functions.invoke(name, { body });
-  if (error) {
-    let detail = error.message;
-    try {
-      const response = error.context;
-      if (response && typeof response.json === 'function') {
-        const payload = await response.json();
-        detail = payload.error || payload.message || detail;
-      }
-    } catch (_) {}
-    throw new Error(detail);
-  }
-  if (data?.error) throw new Error(data.error);
-  return data;
-}
-
 async function poll(jobId) {
   while (true) {
     const { data: job, error } = await supabase
@@ -84,12 +67,9 @@ async function poll(jobId) {
     if (error) throw new Error(`작업 상태 확인 실패: ${error.message}`);
 
     currentJob = job;
-    if (job.status === 'uploading') {
-      statusTitle.textContent = '업로드 확인 중';
-      statusText.textContent = 'Supabase Storage에 저장된 PDF를 확인하고 있습니다.';
-    } else if (job.status === 'queued') {
+    if (job.status === 'queued') {
       statusTitle.textContent = '작업 대기 중';
-      statusText.textContent = 'GitHub Actions 번역 worker 실행을 기다리고 있습니다.';
+      statusText.textContent = '번역 worker가 대기열을 확인하고 있습니다. 보통 몇 분 안에 시작됩니다.';
     } else if (job.status === 'processing') {
       statusTitle.textContent = '번역 및 PDF 생성 중';
       statusText.textContent = '수식과 레이아웃을 보존하면서 XeLaTeX로 결과 PDF를 만들고 있습니다.';
@@ -103,15 +83,16 @@ async function poll(jobId) {
     } else if (job.status === 'failed') {
       throw new Error(job.error || '번역에 실패했습니다.');
     }
-    await new Promise((resolve) => setTimeout(resolve, 2500));
+    await new Promise((resolve) => setTimeout(resolve, 3000));
   }
 }
 
 async function downloadResult() {
   if (!currentJob?.result_path) return;
+  const filename = `${currentJob.original_name.replace(/\.pdf$/i, '')}_translated.pdf`;
   const { data, error } = await supabase.storage
     .from('documents')
-    .createSignedUrl(currentJob.result_path, 300, { download: `${currentJob.original_name.replace(/\.pdf$/i, '')}_translated.pdf` });
+    .createSignedUrl(currentJob.result_path, 300, { download: filename });
   if (error) return showError(`다운로드 주소 생성 실패: ${error.message}`);
   window.location.href = data.signedUrl;
 }
@@ -142,29 +123,40 @@ form.addEventListener('submit', async (event) => {
   resultBox.classList.add('hidden');
   spinner.classList.remove('hidden');
   statusBox.classList.remove('hidden');
-  statusTitle.textContent = '업로드 준비 중';
-  statusText.textContent = 'Supabase에서 안전한 업로드 주소를 만들고 있습니다.';
+  statusTitle.textContent = 'PDF 업로드 중';
+  statusText.textContent = '원본 PDF를 Supabase Storage에 저장하고 있습니다.';
   submitBtn.disabled = true;
 
   try {
-    await ensureAnonymousSession();
+    const session = await ensureAnonymousSession();
+    const userId = session.user.id;
+    const jobId = crypto.randomUUID();
     const targetLanguage = document.getElementById('language').value;
-    const created = await invokeFunction('create-job', {
-      filename: file.name,
-      size: file.size,
-      target_language: targetLanguage,
-    });
+    const originalPath = `${userId}/${jobId}/original.pdf`;
 
-    statusTitle.textContent = 'PDF 업로드 중';
-    statusText.textContent = '원본 PDF를 Supabase Storage에 저장하고 있습니다.';
     const { error: uploadError } = await supabase.storage
       .from('documents')
-      .uploadToSignedUrl(created.path, created.token, file, { contentType: 'application/pdf' });
+      .upload(originalPath, file, {
+        contentType: 'application/pdf',
+        upsert: false,
+      });
     if (uploadError) throw new Error(`PDF 업로드 실패: ${uploadError.message}`);
 
-    const started = await invokeFunction('start-job', { job_id: created.job_id });
-    if (!started?.ok) throw new Error('작업 시작 요청에 실패했습니다.');
-    await poll(created.job_id);
+    const { error: insertError } = await supabase
+      .from('translation_jobs')
+      .insert({
+        id: jobId,
+        user_id: userId,
+        status: 'queued',
+        original_name: file.name,
+        target_language: targetLanguage,
+        original_path: originalPath,
+      });
+    if (insertError) throw new Error(`작업 생성 실패: ${insertError.message}`);
+
+    statusTitle.textContent = '작업 대기 중';
+    statusText.textContent = '업로드가 끝났습니다. 번역 worker가 대기열을 확인하고 있습니다.';
+    await poll(jobId);
   } catch (error) {
     showError(error.message || String(error));
   }
