@@ -25,9 +25,20 @@ LANGUAGE_NAMES = {
 }
 
 
-def _chunks(items: list[dict], size: int = 30) -> Iterable[list[dict]]:
-    for i in range(0, len(items), size):
-        yield items[i : i + size]
+def _chunks(items: list[dict], max_items: int = 80, max_chars: int = 16000) -> Iterable[list[dict]]:
+    """Use larger batches to reduce sequential API round trips while staying moderate in size."""
+    batch: list[dict] = []
+    chars = 0
+    for item in items:
+        n = len(item.get("text", ""))
+        if batch and (len(batch) >= max_items or chars + n > max_chars):
+            yield batch
+            batch = []
+            chars = 0
+        batch.append(item)
+        chars += n
+    if batch:
+        yield batch
 
 
 def translate_segments(items: list[dict], target_language: str) -> dict[str, str]:

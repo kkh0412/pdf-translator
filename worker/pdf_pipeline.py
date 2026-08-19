@@ -1,11 +1,7 @@
 from __future__ import annotations
 
 import html
-import math
-import os
 import re
-import shutil
-import subprocess
 from pathlib import Path
 
 import fitz
@@ -26,10 +22,7 @@ def _looks_like_math(text: str, font: str) -> bool:
     if any(marker in f for marker in MATH_FONT_MARKERS):
         return True
     if re.fullmatch(r"[\d\s.,;:()\[\]{}+\-*/=<>|_^%°′″]+", t):
-        # A citation/page number such as "[12]" is not math by itself. Operators make it math-like.
         return any(ch in "+-*/=<>|_^" for ch in t)
-    # Be deliberately conservative around equation-like spans. Preserving an occasional
-    # short phrase is safer than painting over a formula and translating its symbols.
     if len(t) <= 120 and ("=" in t or "^" in t or "_" in t):
         if re.search(r"[A-Za-zΑ-Ωα-ω]\s*(?:[=_^]|[+\-*/]\s*[A-Za-z0-9(])", t):
             return True
@@ -53,251 +46,237 @@ def _is_translatable(text: str, font: str) -> bool:
     return any(ch.isalpha() for ch in t)
 
 
-def _latex_escape(text: str) -> str:
-    # Render all translated content as text. Math remains in the untouched page background.
-    replacements = {
-        "\\": r"\textbackslash{}",
-        "{": r"\{",
-        "}": r"\}",
-        "%": r"\%",
-        "$": r"\$",
-        "&": r"\&",
-        "#": r"\#",
-        "_": r"\_",
-        "^": r"\textasciicircum{}",
-        "~": r"\textasciitilde{}",
-    }
-    return "".join(replacements.get(ch, ch) for ch in text)
+def _style_from_font(font_name: str) -> tuple[str, str, str]:
+    """Return CSS family, weight, style inferred from the source span font name."""
+    f = (font_name or "").lower()
+    serif_markers = ("times", "serif", "roman", "cmr", "minion", "palatino", "garamond")
+    family = "serif" if any(x in f for x in serif_markers) else "sans-serif"
+    weight = "700" if any(x in f for x in ("bold", "black", "demi", "semibold")) else "400"
+    style = "italic" if any(x in f for x in ("italic", "oblique", "slanted")) else "normal"
+    return family, weight, style
 
 
-def extract_layout(pdf_path: Path, work_dir: Path, max_pages: int) -> tuple[list[dict], list[dict]]:
+def extract_layout(pdf_path: Path, max_pages: int) -> tuple[list[dict], list[dict]]:
+    """Extract only geometry/text metadata. No page rasterization is performed."""
     doc = fitz.open(pdf_path)
-    if doc.page_count > max_pages:
-        doc.close()
-        raise RuntimeError(f"This demo accepts at most {max_pages} pages per PDF")
+    try:
+        if doc.page_count > max_pages:
+            raise RuntimeError(f"This demo accepts at most {max_pages} pages per PDF")
 
-    pages: list[dict] = []
-    segments: list[dict] = []
+        pages: list[dict] = []
+        segments: list[dict] = []
 
-    def add_segment(pno: int, sid: int, text: str, bbox, font_size: float, font: str) -> int:
-        text = " ".join(text.split())
-        if not text:
-            return sid
-        x0, y0, x1, y1 = map(float, bbox)
-        if x1 - x0 < 3 or y1 - y0 < 3:
-            return sid
-        segments.append(
-            {
-                "id": f"p{pno}_s{sid}",
-                "page": pno,
-                "text": text,
-                "bbox": [x0, y0, x1, y1],
-                "font_size": float(font_size or 9.0),
-                "font": font,
-            }
-        )
-        return sid + 1
+        def add_segment(pno: int, sid: int, text: str, bbox, font_size: float, font: str) -> int:
+            text = " ".join(text.split())
+            if not text:
+                return sid
+            x0, y0, x1, y1 = map(float, bbox)
+            if x1 - x0 < 3 or y1 - y0 < 3:
+                return sid
+            segments.append(
+                {
+                    "id": f"p{pno}_s{sid}",
+                    "page": pno,
+                    "text": text,
+                    "bbox": [x0, y0, x1, y1],
+                    "font_size": float(font_size or 9.0),
+                    "font": font,
+                }
+            )
+            return sid + 1
 
-    for pno, page in enumerate(doc):
-        rect = page.rect
-        # 2x rasterization: figures/equations remain visually intact beneath translated text.
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-        img_name = f"page_{pno + 1:04d}.png"
-        pix.save(work_dir / img_name)
+        for pno, page in enumerate(doc):
+            rect = page.rect
+            pages.append({"index": pno, "width": float(rect.width), "height": float(rect.height)})
 
-        pages.append(
-            {
-                "index": pno,
-                "width": float(rect.width),
-                "height": float(rect.height),
-                "image": img_name,
-            }
-        )
+            data = page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT)
+            sid = 0
+            for block in data.get("blocks", []):
+                if block.get("type") != 0:
+                    continue
 
-        data = page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT)
-        sid = 0
-        for block in data.get("blocks", []):
-            if block.get("type") != 0:
-                continue
+                block_spans = [
+                    span
+                    for line in block.get("lines", [])
+                    for span in line.get("spans", [])
+                    if span.get("text", "").strip()
+                ]
+                if not block_spans:
+                    continue
 
-            block_spans = [
-                span
-                for line in block.get("lines", [])
-                for span in line.get("spans", [])
-                if span.get("text", "").strip()
-            ]
-            if not block_spans:
-                continue
+                has_math = any(
+                    _looks_like_math(span.get("text", ""), span.get("font", ""))
+                    for span in block_spans
+                )
+                translatable = [
+                    span
+                    for span in block_spans
+                    if _is_translatable(span.get("text", ""), span.get("font", ""))
+                ]
 
-            has_math = any(_looks_like_math(span.get("text", ""), span.get("font", "")) for span in block_spans)
-            translatable = [span for span in block_spans if _is_translatable(span.get("text", ""), span.get("font", ""))]
+                # Whole paragraph/heading blocks are best for translation context and reflow.
+                if translatable and not has_math:
+                    line_texts = []
+                    for line in block.get("lines", []):
+                        parts = [
+                            span.get("text", "").strip()
+                            for span in line.get("spans", [])
+                            if span.get("text", "").strip()
+                        ]
+                        if parts:
+                            line_texts.append(" ".join(parts))
+                    text = " ".join(line_texts)
+                    sizes = sorted(float(span.get("size", 9.0)) for span in translatable)
+                    font_size = sizes[len(sizes) // 2]
+                    sid = add_segment(
+                        pno,
+                        sid,
+                        text,
+                        block["bbox"],
+                        font_size,
+                        translatable[0].get("font", ""),
+                    )
+                    continue
 
-            # Preferred path: translate a whole paragraph/heading block at once. This keeps context and
-            # lets TeX reflow the translation inside the original block rectangle.
-            if translatable and not has_math:
-                line_texts = []
+                # Mixed math/text block: only replace contiguous language spans.
                 for line in block.get("lines", []):
-                    parts = [span.get("text", "").strip() for span in line.get("spans", []) if span.get("text", "").strip()]
-                    if parts:
-                        line_texts.append(" ".join(parts))
-                text = " ".join(line_texts)
-                sizes = sorted(float(span.get("size", 9.0)) for span in translatable)
-                font_size = sizes[len(sizes) // 2]
-                sid = add_segment(pno, sid, text, block["bbox"], font_size, translatable[0].get("font", ""))
-                continue
-
-            # Conservative fallback for blocks containing math: only replace contiguous natural-language
-            # spans and leave mathematical spans untouched in the page background.
-            for line in block.get("lines", []):
-                group = []
-                for span in line.get("spans", []):
-                    if _is_translatable(span.get("text", ""), span.get("font", "")):
-                        if group:
-                            prev = group[-1]
-                            gap = float(span["bbox"][0]) - float(prev["bbox"][2])
-                            threshold = max(8.0, float(span.get("size", 9.0)) * 2.2)
-                            if gap > threshold:
-                                x0 = min(float(x["bbox"][0]) for x in group)
-                                y0 = min(float(x["bbox"][1]) for x in group)
-                                x1 = max(float(x["bbox"][2]) for x in group)
-                                y1 = max(float(x["bbox"][3]) for x in group)
-                                text = " ".join(x.get("text", "").strip() for x in group)
-                                sid = add_segment(pno, sid, text, [x0, y0, x1, y1], float(group[0].get("size", 9.0)), group[0].get("font", ""))
+                    group = []
+                    for span in line.get("spans", []):
+                        if _is_translatable(span.get("text", ""), span.get("font", "")):
+                            if group:
+                                prev = group[-1]
+                                gap = float(span["bbox"][0]) - float(prev["bbox"][2])
+                                threshold = max(8.0, float(span.get("size", 9.0)) * 2.2)
+                                if gap > threshold:
+                                    sid = _flush_group(pno, sid, group, add_segment)
+                                    group = []
+                            group.append(span)
+                        else:
+                            if group:
+                                sid = _flush_group(pno, sid, group, add_segment)
                                 group = []
-                        group.append(span)
-                    else:
-                        if group:
-                            x0 = min(float(x["bbox"][0]) for x in group)
-                            y0 = min(float(x["bbox"][1]) for x in group)
-                            x1 = max(float(x["bbox"][2]) for x in group)
-                            y1 = max(float(x["bbox"][3]) for x in group)
-                            text = " ".join(x.get("text", "").strip() for x in group)
-                            sid = add_segment(pno, sid, text, [x0, y0, x1, y1], float(group[0].get("size", 9.0)), group[0].get("font", ""))
-                            group = []
-                if group:
-                    x0 = min(float(x["bbox"][0]) for x in group)
-                    y0 = min(float(x["bbox"][1]) for x in group)
-                    x1 = max(float(x["bbox"][2]) for x in group)
-                    y1 = max(float(x["bbox"][3]) for x in group)
-                    text = " ".join(x.get("text", "").strip() for x in group)
-                    sid = add_segment(pno, sid, text, [x0, y0, x1, y1], float(group[0].get("size", 9.0)), group[0].get("font", ""))
+                    if group:
+                        sid = _flush_group(pno, sid, group, add_segment)
 
-    doc.close()
-    return pages, segments
-
-def build_tex(pages: list[dict], segments: list[dict], translations: dict[str, str], work_dir: Path) -> Path:
-    by_page: dict[int, list[dict]] = {}
-    for seg in segments:
-        by_page.setdefault(seg["page"], []).append(seg)
-
-    first_w = pages[0]["width"]
-    first_h = pages[0]["height"]
-    parts = [
-        r"\documentclass{article}",
-        rf"\usepackage[paperwidth={first_w:.3f}bp,paperheight={first_h:.3f}bp,margin=0pt]{{geometry}}",
-        r"\usepackage{graphicx}",
-        r"\usepackage{tikz}",
-        r"\usepackage{adjustbox}",
-        r"\usepackage{fontspec}",
-        r"\usepackage{xeCJK}",
-        r"\usepackage[absolute,overlay]{textpos}",
-        r"\setmainfont{Noto Sans}",
-        r"\setCJKmainfont{Noto Sans CJK KR}",
-        r"\pagestyle{empty}",
-        r"\setlength{\parindent}{0pt}",
-        r"\begin{document}",
-    ]
-
-    for page in pages:
-        w = page["width"]
-        h = page["height"]
-        parts.extend(
-            [
-                r"\thispagestyle{empty}",
-                rf"\begin{{tikzpicture}}[remember picture,overlay]",
-                rf"\node[anchor=north west,inner sep=0pt] at (current page.north west) "
-                rf"{{\includegraphics[width={w:.3f}bp,height={h:.3f}bp]{{{page['image']}}}}};",
-            ]
-        )
-
-        for seg in by_page.get(page["index"], []):
-            translated = translations.get(seg["id"], seg["text"])
-            if not translated:
-                continue
-            x0, y0, x1, y1 = seg["bbox"]
-            bw = max(4.0, x1 - x0)
-            bh = max(4.0, y1 - y0)
-            # Small padding masks antialiasing from the original glyphs without invading nearby formula spans too much.
-            pad_x = min(0.8, bw * 0.015)
-            pad_y = min(0.6, bh * 0.04)
-            rx0 = max(0.0, x0 - pad_x)
-            ry0 = max(0.0, y0 - pad_y)
-            rw = min(w - rx0, bw + 2 * pad_x)
-            rh = min(h - ry0, bh + 2 * pad_y)
-            fs = max(5.2, min(seg["font_size"], bh * 0.82))
-            leading = fs * 1.08
-            safe = _latex_escape(translated)
-
-            parts.append(
-                rf"\fill[white] ([xshift={rx0:.3f}bp,yshift=-{ry0:.3f}bp]current page.north west) "
-                rf"rectangle ++({rw:.3f}bp,-{rh:.3f}bp);"
-            )
-            parts.append(
-                rf"\node[anchor=north west,inner sep=0pt] at "
-                rf"([xshift={x0:.3f}bp,yshift=-{y0:.3f}bp]current page.north west) "
-                rf"{{\begin{{adjustbox}}{{max width={bw:.3f}bp,max totalheight={bh:.3f}bp}}"
-                rf"\begin{{minipage}}[t]{{{bw:.3f}bp}}\raggedright\sloppy"
-                rf"\fontsize{{{fs:.3f}bp}}{{{leading:.3f}bp}}\selectfont {safe}"
-                rf"\end{{minipage}}\end{{adjustbox}}}};"
-            )
-
-        parts.extend([r"\end{tikzpicture}", r"\null", r"\newpage"])
-
-    parts.append(r"\end{document}")
-    tex_path = work_dir / "translated.tex"
-    tex_path.write_text("\n".join(parts), encoding="utf-8")
-    return tex_path
+        return pages, segments
+    finally:
+        doc.close()
 
 
-def compile_tex(tex_path: Path, work_dir: Path, output_path: Path) -> None:
-    cmd = [
-        "xelatex",
-        "-interaction=nonstopmode",
-        "-halt-on-error",
-        "-output-directory",
-        str(work_dir.resolve()),
-        str(tex_path.resolve()),
-    ]
-    logs = []
-    proc = None
-    # TikZ current-page anchors need a second pass to settle page coordinates.
-    for _ in range(2):
-        proc = subprocess.run(cmd, cwd=work_dir, capture_output=True, text=True, timeout=180)
-        logs.append(proc.stdout + "\n" + proc.stderr)
-        if proc.returncode != 0:
-            break
-    generated = work_dir / "translated.pdf"
-    if proc is None or proc.returncode != 0 or not generated.exists():
-        log_tail = "\n".join(logs)[-5000:]
-        raise RuntimeError("XeLaTeX compilation failed:\n" + log_tail)
-    shutil.copy2(generated, output_path)
+def _flush_group(pno: int, sid: int, group: list[dict], add_segment) -> int:
+    x0 = min(float(x["bbox"][0]) for x in group)
+    y0 = min(float(x["bbox"][1]) for x in group)
+    x1 = max(float(x["bbox"][2]) for x in group)
+    y1 = max(float(x["bbox"][3]) for x in group)
+    text = " ".join(x.get("text", "").strip() for x in group)
+    sizes = sorted(float(x.get("size", 9.0)) for x in group)
+    font_size = sizes[len(sizes) // 2]
+    return add_segment(pno, sid, text, [x0, y0, x1, y1], font_size, group[0].get("font", ""))
 
 
-def process_pdf(pdf_path: Path, target_language: str, work_dir: Path, output_path: Path, max_pages: int) -> dict:
+def render_pdf(
+    pdf_path: Path,
+    output_path: Path,
+    segments: list[dict],
+    translations: dict[str, str],
+) -> dict:
+    """Overlay translations directly onto the original vector PDF using MuPDF.
+
+    This avoids TeX Live / CJK font package installation entirely. The original page,
+    figures, equations, and vector graphics stay untouched underneath the translated
+    text boxes.
+    """
+    doc = fitz.open(pdf_path)
+    scales: list[float] = []
+    try:
+        by_page: dict[int, list[dict]] = {}
+        for seg in segments:
+            by_page.setdefault(seg["page"], []).append(seg)
+
+        for pno, page in enumerate(doc):
+            for seg in by_page.get(pno, []):
+                translated = translations.get(seg["id"], seg["text"]).strip()
+                if not translated:
+                    continue
+
+                x0, y0, x1, y1 = seg["bbox"]
+                bw = max(4.0, x1 - x0)
+                bh = max(4.0, y1 - y0)
+
+                # Small padding masks antialiasing from the original glyphs.
+                pad_x = min(0.7, bw * 0.012)
+                pad_y = min(0.5, bh * 0.035)
+                mask = fitz.Rect(
+                    max(0.0, x0 - pad_x),
+                    max(0.0, y0 - pad_y),
+                    min(page.rect.width, x1 + pad_x),
+                    min(page.rect.height, y1 + pad_y),
+                )
+
+                # Preserve the previous demo's conservative behavior: visually cover
+                # language glyphs without deleting nearby formula/vector objects.
+                page.draw_rect(mask, color=None, fill=(1, 1, 1), overlay=True)
+
+                font_size = max(5.0, min(float(seg["font_size"]), bh * 0.86))
+                family, weight, style = _style_from_font(seg.get("font", ""))
+                css = (
+                    "* { margin: 0; padding: 0; } "
+                    f"body {{ font-family: {family}; font-size: {font_size:.2f}pt; "
+                    f"font-weight: {weight}; font-style: {style}; line-height: 1.05; "
+                    "color: #000; }"
+                )
+
+                # insert_htmlbox uses HarfBuzz, supports CJK without an external font
+                # package, and scales content down until it fits inside the rectangle.
+                spare_height, scale = page.insert_htmlbox(
+                    fitz.Rect(x0, y0, x1, y1),
+                    html.escape(translated),
+                    css=css,
+                    scale_low=0.42,
+                    overlay=True,
+                )
+                if spare_height < 0:
+                    raise RuntimeError(
+                        f"Translated text could not fit inside source box {seg['id']}. "
+                        "Try a shorter translation or larger layout box."
+                    )
+                scales.append(float(scale))
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        doc.save(output_path, garbage=3, deflate=True)
+    finally:
+        doc.close()
+
+    return {
+        "min_text_scale": min(scales) if scales else 1.0,
+        "avg_text_scale": (sum(scales) / len(scales)) if scales else 1.0,
+    }
+
+
+def process_pdf(
+    pdf_path: Path,
+    target_language: str,
+    work_dir: Path,
+    output_path: Path,
+    max_pages: int,
+) -> dict:
+    # work_dir is kept in the function signature for compatibility with run_job.py.
     work_dir.mkdir(parents=True, exist_ok=True)
-    pages, segments = extract_layout(pdf_path, work_dir, max_pages=max_pages)
+    pages, segments = extract_layout(pdf_path, max_pages=max_pages)
     if not segments:
         raise RuntimeError(
-            "No selectable natural-language text was detected. This first demo supports born-digital PDFs; scanned/image-only PDFs need OCR support."
+            "No selectable natural-language text was detected. This demo supports "
+            "born-digital PDFs; scanned/image-only PDFs need OCR support."
         )
+
     translations = translate_segments(
         [{"id": s["id"], "text": s["text"]} for s in segments],
         target_language,
     )
-    tex_path = build_tex(pages, segments, translations, work_dir)
-    compile_tex(tex_path, work_dir, output_path)
+    render_info = render_pdf(pdf_path, output_path, segments, translations)
+
     return {
         "pages": len(pages),
         "translated_segments": len(segments),
-        "tex_path": str(tex_path),
+        **render_info,
     }

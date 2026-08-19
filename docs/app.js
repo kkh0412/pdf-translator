@@ -1,7 +1,9 @@
 const config = window.PDF_TRANSLATOR_CONFIG || {};
 const SUPABASE_URL = String(config.SUPABASE_URL || '').replace(/\/$/, '');
 const SUPABASE_PUBLISHABLE_KEY = String(config.SUPABASE_PUBLISHABLE_KEY || '');
-const configured = SUPABASE_URL.startsWith('https://') &&
+
+const configured =
+  SUPABASE_URL.startsWith('https://') &&
   !SUPABASE_URL.includes('YOUR-PROJECT-REF') &&
   SUPABASE_PUBLISHABLE_KEY.startsWith('sb_publishable_') &&
   !SUPABASE_PUBLISHABLE_KEY.includes('REPLACE_ME');
@@ -21,8 +23,8 @@ const downloadBtn = document.getElementById('downloadBtn');
 const errorBox = document.getElementById('errorBox');
 const setupWarning = document.getElementById('setupWarning');
 
-let supabase = null;
 let currentJob = null;
+let supabaseClient = null;
 
 function showError(message) {
   errorBox.textContent = message;
@@ -34,14 +36,17 @@ function showError(message) {
 
 function setSelectedFile(file) {
   if (!file) return;
+
   if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) {
     showError('PDF 파일만 업로드할 수 있습니다.');
     return;
   }
+
   if (file.size > 20 * 1024 * 1024) {
     showError('현재 데모에서는 20 MB 이하 PDF만 업로드할 수 있습니다.');
     return;
   }
+
   const dt = new DataTransfer();
   dt.items.add(file);
   input.files = dt.files;
@@ -50,23 +55,39 @@ function setSelectedFile(file) {
 }
 
 async function ensureAnonymousSession() {
-  const { data } = await supabase.auth.getSession();
+  if (!supabaseClient) {
+    throw new Error('Supabase client가 초기화되지 않았습니다. 페이지를 새로고침해 주세요.');
+  }
+
+  const { data, error: sessionError } = await supabaseClient.auth.getSession();
+  if (sessionError) {
+    throw new Error(`세션 확인 실패: ${sessionError.message}`);
+  }
+
   if (data.session) return data.session;
-  const { data: signed, error } = await supabase.auth.signInAnonymously();
+
+  const { data: signed, error } = await supabaseClient.auth.signInAnonymously();
   if (error) throw new Error(`익명 로그인 실패: ${error.message}`);
+
+  if (!signed.session) {
+    throw new Error('익명 로그인 세션을 생성하지 못했습니다.');
+  }
+
   return signed.session;
 }
 
 async function poll(jobId) {
   while (true) {
-    const { data: job, error } = await supabase
+    const { data: job, error } = await supabaseClient
       .from('translation_jobs')
       .select('id,status,original_name,target_language,pages,translated_segments,error,result_path')
       .eq('id', jobId)
       .single();
+
     if (error) throw new Error(`작업 상태 확인 실패: ${error.message}`);
 
     currentJob = job;
+
     if (job.status === 'queued') {
       statusTitle.textContent = '작업 대기 중';
       statusText.textContent = '번역 worker가 대기열을 확인하고 있습니다. 보통 몇 분 안에 시작됩니다.';
@@ -83,17 +104,25 @@ async function poll(jobId) {
     } else if (job.status === 'failed') {
       throw new Error(job.error || '번역에 실패했습니다.');
     }
+
     await new Promise((resolve) => setTimeout(resolve, 3000));
   }
 }
 
 async function downloadResult() {
   if (!currentJob?.result_path) return;
+
   const filename = `${currentJob.original_name.replace(/\.pdf$/i, '')}_translated.pdf`;
-  const { data, error } = await supabase.storage
+
+  const { data, error } = await supabaseClient.storage
     .from('documents')
     .createSignedUrl(currentJob.result_path, 300, { download: filename });
-  if (error) return showError(`다운로드 주소 생성 실패: ${error.message}`);
+
+  if (error) {
+    showError(`다운로드 주소 생성 실패: ${error.message}`);
+    return;
+  }
+
   window.location.href = data.signedUrl;
 }
 
@@ -102,22 +131,44 @@ input.addEventListener('change', () => {
   if (file) setSelectedFile(file);
 });
 
-['dragenter', 'dragover'].forEach((name) => dropzone.addEventListener(name, (event) => {
-  event.preventDefault();
-  dropzone.classList.add('dragging');
-}));
-['dragleave', 'drop'].forEach((name) => dropzone.addEventListener(name, (event) => {
-  event.preventDefault();
-  dropzone.classList.remove('dragging');
-}));
-dropzone.addEventListener('drop', (event) => setSelectedFile(event.dataTransfer.files[0]));
+['dragenter', 'dragover'].forEach((name) =>
+  dropzone.addEventListener(name, (event) => {
+    event.preventDefault();
+    dropzone.classList.add('dragging');
+  })
+);
+
+['dragleave', 'drop'].forEach((name) =>
+  dropzone.addEventListener(name, (event) => {
+    event.preventDefault();
+    dropzone.classList.remove('dragging');
+  })
+);
+
+dropzone.addEventListener('drop', (event) => {
+  setSelectedFile(event.dataTransfer.files[0]);
+});
+
 downloadBtn.addEventListener('click', downloadResult);
 
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
-  if (!configured) return showError('먼저 docs/config.js에 Supabase URL과 publishable key를 입력하세요.');
+
+  if (!configured) {
+    showError('먼저 docs/config.js에 Supabase URL과 publishable key를 입력하세요.');
+    return;
+  }
+
+  if (!supabaseClient) {
+    showError('Supabase 연결 초기화에 실패했습니다. 페이지를 새로고침해 주세요.');
+    return;
+  }
+
   const file = input.files[0];
-  if (!file) return showError('PDF 파일을 선택하세요.');
+  if (!file) {
+    showError('PDF 파일을 선택하세요.');
+    return;
+  }
 
   errorBox.classList.add('hidden');
   resultBox.classList.add('hidden');
@@ -134,15 +185,18 @@ form.addEventListener('submit', async (event) => {
     const targetLanguage = document.getElementById('language').value;
     const originalPath = `${userId}/${jobId}/original.pdf`;
 
-    const { error: uploadError } = await supabase.storage
+    const { error: uploadError } = await supabaseClient.storage
       .from('documents')
       .upload(originalPath, file, {
         contentType: 'application/pdf',
         upsert: false,
       });
-    if (uploadError) throw new Error(`PDF 업로드 실패: ${uploadError.message}`);
 
-    const { error: insertError } = await supabase
+    if (uploadError) {
+      throw new Error(`PDF 업로드 실패: ${uploadError.message}`);
+    }
+
+    const { error: insertError } = await supabaseClient
       .from('translation_jobs')
       .insert({
         id: jobId,
@@ -152,26 +206,48 @@ form.addEventListener('submit', async (event) => {
         target_language: targetLanguage,
         original_path: originalPath,
       });
-    if (insertError) throw new Error(`작업 생성 실패: ${insertError.message}`);
+
+    if (insertError) {
+      throw new Error(`작업 생성 실패: ${insertError.message}`);
+    }
 
     statusTitle.textContent = '작업 대기 중';
     statusText.textContent = '업로드가 끝났습니다. 번역 worker가 대기열을 확인하고 있습니다.';
+
     await poll(jobId);
   } catch (error) {
     showError(error.message || String(error));
   }
 });
 
-(async function init() {
+function initializeSupabase() {
   if (!configured) {
     setupWarning.classList.remove('hidden');
     submitBtn.disabled = true;
     return;
   }
-  supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
-  try {
-    await ensureAnonymousSession();
-  } catch (error) {
-    showError(error.message || String(error));
+
+  if (!window.supabase || typeof window.supabase.createClient !== 'function') {
+    showError('Supabase JavaScript 라이브러리를 불러오지 못했습니다. 페이지를 새로고침해 주세요.');
+    submitBtn.disabled = true;
+    return;
   }
-})();
+
+  supabaseClient = window.supabase.createClient(
+    SUPABASE_URL,
+    SUPABASE_PUBLISHABLE_KEY,
+    {
+      auth: {
+        persistSession: true,
+        autoRefreshToken: true,
+        detectSessionInUrl: false,
+      },
+    }
+  );
+
+  ensureAnonymousSession().catch((error) => {
+    showError(error.message || String(error));
+  });
+}
+
+initializeSupabase();

@@ -3,9 +3,9 @@ name: PDF translation worker
 on:
   workflow_dispatch:
   schedule:
-    # 대기열 확인: 5분 간격. 정각 부하를 피하려고 3분부터 시작합니다.
+    # GitHub scheduled workflows support 5-minute granularity.
     - cron: '3-58/5 * * * *'
-    # 공개 저장소의 scheduled workflow 비활성화를 피하기 위한 월 1회 heartbeat.
+    # Keep scheduled workflows active in a public repository.
     - cron: '17 4 1 * *'
 
 permissions:
@@ -16,14 +16,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  check-queue:
+  worker:
+    if: github.event_name != 'schedule' || github.event.schedule != '17 4 1 * *'
     runs-on: ubuntu-latest
-    outputs:
-      has_jobs: ${{ steps.queue.outputs.has_jobs }}
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
+      # Check the queue first using Ubuntu's built-in Python. If there is no work,
+      # the job ends here without setting up Python packages.
       - name: Check Supabase queue
         id: queue
         env:
@@ -35,37 +37,24 @@ jobs:
             echo "Repository variable SUPABASE_URL and secret SUPABASE_SECRET_KEY are required." >&2
             exit 1
           fi
-          HAS_JOBS="$(python worker/check_queue.py)"
+          HAS_JOBS="$(python3 worker/check_queue.py)"
           echo "has_jobs=$HAS_JOBS" >> "$GITHUB_OUTPUT"
           echo "Queued jobs: $HAS_JOBS"
 
-  process:
-    needs: check-queue
-    if: needs.check-queue.outputs.has_jobs == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Set up Python
-        uses: actions/setup-python@v5
+        if: steps.queue.outputs.has_jobs == 'true'
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
           cache: pip
           cache-dependency-path: worker/requirements.txt
 
-      - name: Install XeLaTeX and CJK fonts
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            texlive-xetex texlive-latex-extra texlive-fonts-recommended texlive-lang-cjk \
-            fonts-noto-core fonts-noto-cjk
-
       - name: Install Python dependencies
-        run: python -m pip install --upgrade pip && pip install -r worker/requirements.txt
+        if: steps.queue.outputs.has_jobs == 'true'
+        run: pip install --disable-pip-version-check -r worker/requirements.txt
 
       - name: Process queued PDFs
+        if: steps.queue.outputs.has_jobs == 'true'
         env:
           SUPABASE_URL: ${{ vars.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
@@ -79,10 +68,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
-
       - name: Record monthly activity
         shell: bash
         run: |
