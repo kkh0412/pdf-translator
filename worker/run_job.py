@@ -176,7 +176,7 @@ def main(job_id: str) -> int:
             job["target_language"],
             temp / "work",
             output_path,
-            max_pages=int(os.getenv("MAX_PAGES", "20")),
+            max_pages=int(os.getenv("MAX_PAGES", "100")),
             progress_callback=update_progress,
         )
 

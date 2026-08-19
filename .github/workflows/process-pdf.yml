@@ -96,7 +96,7 @@ jobs:
           GEMINI_SAFE_RPM: '18'
           GEMINI_MAX_429_RETRIES: '8'
           BOOK_FONT_DIR: /home/runner/.cache/pdf-translator-fonts
-          MAX_PAGES: '20'
+          MAX_PAGES: '100'
         shell: bash
         run: |
           export PATH="$HOME/.TinyTeX/bin/x86_64-linux:$PATH"

@@ -523,7 +523,7 @@ def reconstruct_document(
             raise RuntimeError("PDF has no pages")
         if doc.page_count > max_pages:
             raise RuntimeError(
-                f"This demo accepts at most {max_pages} pages per PDF"
+                f"PDF는 최대 {max_pages}페이지까지 번역할 수 있습니다."
             )
         source_pages = doc.page_count
     finally:

@@ -1,4 +1,10 @@
-# PDF Translator v6.14
+# PDF Translator v6.15
+
+## 100-page limit
+- 사용자 화면의 PDF 제한을 최대 100페이지로 변경했습니다.
+- GitHub Actions의 `MAX_PAGES`도 100으로 변경했습니다.
+- worker의 환경변수 기본값도 100페이지로 변경했습니다.
+- 100페이지 초과 문서에는 자연스러운 한국어 오류를 표시합니다.
 
 ## Fixed: `Šafránek` / `§afránek` false math-transport detection
 
