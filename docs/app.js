@@ -29,6 +29,7 @@ const setupWarning = document.getElementById('setupWarning');
 let currentJob = null;
 let supabaseClient = null;
 let processingStartedAt = null;
+let queuedStartedAt = null;
 
 function updateProgress(value, message = null) {
   const numeric = Number(value);
@@ -108,53 +109,6 @@ async function ensureAnonymousSession() {
   return signed.session;
 }
 
-async function triggerWorkerNow(jobId) {
-  let lastError = null;
-
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    try {
-      updateProgress(
-        3,
-        attempt === 1
-          ? '업로드 완료 · 번역 worker를 즉시 시작하고 있습니다.'
-          : 'Worker 시작 요청을 한 번 더 시도하고 있습니다.'
-      );
-
-      const { data, error } = await supabaseClient.functions.invoke(
-        'trigger-worker',
-        {
-          body: { job_id: jobId },
-        }
-      );
-
-      if (error) throw error;
-      if (!data?.ok) {
-        throw new Error(data?.error || 'Worker 시작 요청에 실패했습니다.');
-      }
-
-      updateProgress(
-        3,
-        data.already_processing
-          ? 'Worker가 이미 이 문서를 처리하고 있습니다.'
-          : 'Worker 실행 요청 완료 · GitHub runner가 시작되기를 기다리고 있습니다.'
-      );
-      return true;
-    } catch (error) {
-      lastError = error;
-      if (attempt < 2) {
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      }
-    }
-  }
-
-  console.warn('Immediate worker dispatch failed:', lastError);
-  updateProgress(
-    2,
-    '즉시 실행 요청에 실패했습니다. 15분 간격의 복구 worker가 대기열을 확인합니다.'
-  );
-  return false;
-}
-
 async function poll(jobId) {
   while (true) {
     const { data: job, error } = await supabaseClient
@@ -172,17 +126,36 @@ async function poll(jobId) {
       Object.prototype.hasOwnProperty.call(job, 'progress_message');
 
     if (job.status === 'queued') {
-      statusTitle.textContent = '작업 대기 중';
+      statusTitle.textContent = 'Worker 시작 대기 중';
       processingStartedAt = null;
-      updateProgress(
-        hasDetailedProgress ? (job.progress ?? 2) : 2,
-        hasDetailedProgress
-          ? (job.progress_message ||
-              '번역 worker가 대기열을 확인하고 있습니다.')
-          : '작업 대기 중 · 상세 진행률 DB 설정은 worker가 시작된 뒤 확인됩니다.'
-      );
+      if (!queuedStartedAt) queuedStartedAt = Date.now();
+
+      const queuedForMs = Date.now() - queuedStartedAt;
+      const dbProgress = Number(job.progress ?? 0);
+
+      if (hasDetailedProgress && (dbProgress > 0 || job.progress_message)) {
+        updateProgress(
+          dbProgress,
+          detailedMessage(
+            job,
+            'Supabase가 GitHub worker 실행 요청을 처리하고 있습니다.'
+          )
+        );
+      } else if (queuedForMs >= 8000) {
+        updateProgress(
+          0,
+          '자동 worker trigger가 실행되지 않았습니다. ' +
+          'Supabase Vault의 github_actions_token과 최신 UPDATE_EXISTING_SUPABASE.sql 설정을 확인하세요.'
+        );
+      } else {
+        updateProgress(
+          1,
+          '작업을 생성했습니다 · Supabase DB trigger가 GitHub worker를 즉시 호출하고 있습니다.'
+        );
+      }
     } else if (job.status === 'processing') {
       statusTitle.textContent = '번역 및 PDF 생성 중';
+      queuedStartedAt = null;
       if (!processingStartedAt) processingStartedAt = Date.now();
 
       if (hasDetailedProgress) {
@@ -284,6 +257,7 @@ form.addEventListener('submit', async (event) => {
   spinner.classList.remove('hidden');
   statusBox.classList.remove('hidden');
   processingStartedAt = null;
+  queuedStartedAt = null;
   statusTitle.textContent = 'PDF 업로드 중';
   updateProgress(1, '원본 PDF를 Supabase Storage에 저장하고 있습니다.');
   submitBtn.disabled = true;
@@ -321,13 +295,13 @@ form.addEventListener('submit', async (event) => {
       throw new Error(`작업 생성 실패: ${insertError.message}`);
     }
 
+    queuedStartedAt = Date.now();
     statusTitle.textContent = 'Worker 시작 중';
     updateProgress(
-      2,
-      '업로드가 끝났습니다. 번역 worker를 즉시 호출합니다.'
+      1,
+      '업로드 완료 · Supabase DB trigger가 GitHub worker를 즉시 호출합니다.'
     );
 
-    await triggerWorkerNow(jobId);
     await poll(jobId);
   } catch (error) {
     showError(error.message || String(error));

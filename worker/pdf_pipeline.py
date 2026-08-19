@@ -16,6 +16,7 @@ from .translator import translate_blocks
 from .vision_agent import (
     GeminiVisionError,
     _decode_math_transport,
+    repair_math_formula,
     analyze_document,
     parse_pages,
 )
@@ -61,6 +62,34 @@ def _clean_math(latex: str) -> str:
     # This is the critical ordering: sanitation must not delete the evidence first.
     latex = _decode_math_transport(latex)
     latex = _sanitize_unicode(latex).strip()
+
+    unicode_math = {
+        "−": "-",
+        "∈": r"\in ",
+        "∉": r"\notin ",
+        "≤": r"\leq ",
+        "≥": r"\geq ",
+        "≠": r"\neq ",
+        "×": r"\times ",
+        "·": r"\cdot ",
+        "∞": r"\infty ",
+        "→": r"\to ",
+        "↦": r"\mapsto ",
+        "∅": r"\varnothing ",
+        "∩": r"\cap ",
+        "∪": r"\cup ",
+    }
+    for source, target in unicode_math.items():
+        latex = latex.replace(source, target)
+
+    # Standalone \t is not a valid spacing command. Vision occasionally emits
+    # long runs like "\t\t\t := ...". Genuine \theta / \textsf / \times
+    # do not match this word-boundary pattern.
+    latex = re.sub(r"(?:\\t\b\s*)+", " ", latex)
+
+    # Defensive cleanup for isolated legacy one-letter transport prefixes.
+    latex = re.sub(r"(?:\\r\b\s*)+", " ", latex)
+    latex = re.sub(r"(?:\\f\b\s*)+", " ", latex)
     latex = re.sub(r"^\s*\$\$(.*?)\$\$\s*$", r"\1", latex, flags=re.S)
     latex = re.sub(r"^\s*\\\[(.*?)\\\]\s*$", r"\1", latex, flags=re.S)
     latex = re.sub(r"^\s*\$(.*?)\$\s*$", r"\1", latex, flags=re.S)
@@ -697,8 +726,8 @@ def _math_preflight_preamble() -> str:
 
 
 def preflight_math_blocks(blocks: list[dict], work_dir: Path) -> None:
-    """Compile reconstructed formulas before the expensive translation stage."""
-    formulas: list[tuple[str, str]] = []
+    """Compile formulas before translation and repair only a failing formula."""
+    records: list[dict] = []
 
     for block in blocks:
         block_id = str(block.get("id", "?"))
@@ -706,67 +735,135 @@ def preflight_math_blocks(blocks: list[dict], work_dir: Path) -> None:
         if block.get("kind") == "equation":
             formula = _clean_math(block.get("equation_latex", ""))
             if formula:
-                formulas.append((f"{block_id}:display", formula))
+                records.append(
+                    {
+                        "label": f"{block_id}:display",
+                        "formula": formula,
+                        "block": block,
+                        "kind": "display",
+                        "key": None,
+                    }
+                )
 
         for token, formula in (block.get("math_map") or {}).items():
             cleaned = _clean_math(formula)
             if cleaned:
-                formulas.append((f"{block_id}:{token}", cleaned))
+                records.append(
+                    {
+                        "label": f"{block_id}:{token}",
+                        "formula": cleaned,
+                        "block": block,
+                        "kind": "inline",
+                        "key": token,
+                    }
+                )
 
-    if not formulas:
+    if not records:
         print("Math preflight: no formulas to check.", flush=True)
         return
 
     preflight_dir = work_dir / "math-preflight"
     preflight_dir.mkdir(parents=True, exist_ok=True)
     tex_path = preflight_dir / "math_preflight.tex"
-
-    chunks = [_math_preflight_preamble()]
-    for index, (label, formula) in enumerate(formulas, start=1):
-        chunks.append(
-            f"\\typeout{{PDFTRANSLATOR-MATH-{index}: {label}}}\n"
-            "\\[\n"
-            + formula
-            + "\n\\]\n"
-        )
-    chunks.append("\\end{document}\n")
-    tex_path.write_text("".join(chunks), encoding="utf-8")
-
     engine = shutil.which("xelatex")
     if not engine:
         raise RuntimeError("xelatex was not found for math preflight")
 
-    proc = subprocess.run(
-        [
-            engine,
-            "-interaction=nonstopmode",
-            "-halt-on-error",
-            "-file-line-error",
-            tex_path.name,
-        ],
-        cwd=preflight_dir,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=180,
-    )
+    def compile_records() -> subprocess.CompletedProcess:
+        chunks = [_math_preflight_preamble()]
+        for index, record in enumerate(records, start=1):
+            chunks.append(
+                f"\\typeout{{PDFTRANSLATOR-MATH-{index}: {record['label']}}}\n"
+                "\\[\n"
+                + record["formula"]
+                + "\n\\]\n"
+            )
+        chunks.append("\\end{document}\n")
+        tex_path.write_text("".join(chunks), encoding="utf-8")
 
-    if proc.returncode != 0:
+        return subprocess.run(
+            [
+                engine,
+                "-interaction=nonstopmode",
+                "-halt-on-error",
+                "-file-line-error",
+                tex_path.name,
+            ],
+            cwd=preflight_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=180,
+        )
+
+    repaired_labels: list[str] = []
+
+    # Initial attempt + at most two formula-specific AI syntax repairs.
+    for repair_round in range(3):
+        proc = compile_records()
+
+        if proc.returncode == 0:
+            print(
+                f"Math preflight: {len(records)} formulas compiled successfully"
+                + (
+                    f" after repairing {', '.join(repaired_labels)}."
+                    if repaired_labels
+                    else "."
+                ),
+                flush=True,
+            )
+            return
+
         markers = re.findall(
             r"PDFTRANSLATOR-MATH-(\d+): ([^\n\r]+)",
             proc.stdout,
         )
-        failing = markers[-1][1] if markers else "unknown formula"
-        raise RuntimeError(
-            "Math preflight failed before body translation. "
-            f"Likely formula: {failing}\n"
-            + proc.stdout[-9000:]
+        if not markers:
+            raise RuntimeError(
+                "Math preflight failed before body translation.\n"
+                + proc.stdout[-9000:]
+            )
+
+        failing_index = int(markers[-1][0]) - 1
+        if failing_index < 0 or failing_index >= len(records):
+            raise RuntimeError(
+                "Math preflight could not identify the failing formula.\n"
+                + proc.stdout[-9000:]
+            )
+
+        record = records[failing_index]
+        label = record["label"]
+
+        if repair_round >= 2 or label in repaired_labels:
+            raise RuntimeError(
+                "Math preflight failed before body translation. "
+                f"Likely formula: {label}\n"
+                f"Normalized formula:\n{record['formula']}\n\n"
+                + proc.stdout[-9000:]
+            )
+
+        print(
+            f"Math preflight: automatically repairing malformed formula {label}",
+            flush=True,
         )
 
-    print(
-        f"Math preflight: {len(formulas)} formulas compiled successfully.",
-        flush=True,
-    )
+        repaired = _clean_math(
+            repair_math_formula(
+                record["formula"],
+                label=label,
+            )
+        )
+
+        if record["kind"] == "display":
+            record["block"]["equation_latex"] = repaired
+            record["block"]["equation_lines"] = []
+        else:
+            record["block"]["math_map"][record["key"]] = repaired
+
+        record["formula"] = repaired
+        repaired_labels.append(label)
+
+    raise RuntimeError("Unexpected math preflight state.")
 
 
 def build_latex(

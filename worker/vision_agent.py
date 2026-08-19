@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import statistics
 import time
 import urllib.error
@@ -672,31 +673,91 @@ MATH_BACKSLASH_TOKEN = "§"
 
 
 def _decode_math_transport(value: str) -> str:
-    """Decode JSON-safe math transport and repair legacy JSON escape damage."""
+    """Decode JSON-safe math transport and contextually repair JSON escapes."""
     value = str(value or "")
     value = value.replace(MATH_BACKSLASH_TOKEN, "\\")
 
-    # Legacy malformed JSON math could decode TeX command prefixes as controls.
-    # Recover them while we still know this string is mathematical content.
-    value = value.replace("\x08", r"\b")  # \boldsymbol, \beta, ...
-    value = value.replace("\x0c", r"\f")  # \frac, \forall, ...
-    value = value.replace("\r", r"\r")    # \rho, \right, \rangle, ...
-    value = value.replace("\t", r"\t")    # \text, \theta, \times, ...
+    # BACKSPACE / FORM FEED are not normal math formatting.
+    value = value.replace("\x08", r"\b")
+    value = value.replace("\x0c", r"\f")
 
-    # JSON \n can damage commands such as \nabla / \neq / \nu / \notin.
-    # Repair recognizable command tails; ordinary formatting line breaks become spaces.
-    pieces = value.split("\n")
-    if len(pieces) > 1:
-        common_n_tails = ("abla", "eq", "u", "otin", "eg", "i")
-        rebuilt = [pieces[0]]
-        for piece in pieces[1:]:
-            if piece.startswith(common_n_tails):
-                rebuilt.append(r"\n" + piece)
-            else:
-                rebuilt.append(" " + piece)
-        value = "".join(rebuilt)
+    def repair_control(
+        text: str,
+        control: str,
+        command_prefix: str,
+        tail_pattern: str,
+    ) -> str:
+        pattern = re.compile(re.escape(control) + rf"(?={tail_pattern})")
+        text = pattern.sub(lambda _m: "\\" + command_prefix, text)
+        # Unrecognized controls are indentation/formatting whitespace.
+        return text.replace(control, " ")
+
+    # \text..., \theta, \times, \top, \tilde, \tau, \triangle, \tfrac, \to
+    value = repair_control(
+        value,
+        "\t",
+        "t",
+        r"(?:ext(?:sf|bf|it|tt|rm|normal)?\b|heta\b|imes\b|op\b|"
+        r"ilde\b|au\b|riangle\w*\b|frac\b|o\b)",
+    )
+
+    # \rho, \right, \rangle, \rvert, \rm
+    value = repair_control(
+        value,
+        "\r",
+        "r",
+        r"(?:ho\b|ight\b|angle\b|vert\b|m\b)",
+    )
+
+    # \nabla, \neq, \nu, \notin, \neg
+    value = repair_control(
+        value,
+        "\n",
+        "n",
+        r"(?:abla\b|eq\b|u\b|otin\b|eg\b)",
+    )
 
     return value
+
+
+MATH_REPAIR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "math": {"type": "string"},
+    },
+    "required": ["math"],
+    "additionalProperties": False,
+}
+
+
+def repair_math_formula(latex: str, label: str = "") -> str:
+    """Last-resort LaTeX syntax repair; mathematical content must be preserved."""
+    transport = str(latex or "").replace("\\", MATH_BACKSLASH_TOKEN)
+
+    prompt = (
+        "Repair ONLY the LaTeX syntax of this one mathematical expression.\n"
+        "Do not translate, simplify, or change mathematical meaning. Preserve every "
+        "variable, index, superscript, subscript, coefficient, operator, equality, "
+        "inequality, and delimiter.\n"
+        "Remove accidental spacing garbage such as standalone §t commands and repair "
+        "TeX grouping so the expression compiles with amsmath/amssymb.\n"
+        "Use § instead of every LaTeX backslash in the output.\n"
+        f"Context label: {label}\n"
+        f"Expression:\n{transport}"
+    )
+
+    result = _call_json(
+        prompt,
+        [],
+        MATH_REPAIR_SCHEMA,
+        "math-repair",
+    )
+
+    repaired = _decode_math_transport(str(result.get("math", ""))).strip()
+    if not repaired:
+        raise GeminiVisionError(f"Math repair returned empty output: {label}")
+
+    return repaired
 
 
 def _brace_balance_error(math: str) -> str | None:
