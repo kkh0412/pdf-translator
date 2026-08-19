@@ -73,6 +73,9 @@ def _validate_translation_quality(
     translated: str,
     target_language: str,
 ) -> None:
+    # Reject internal transport COMMANDS, not every literal § character.
+    # A section sign can be legitimate prose, and Vision may occasionally confuse
+    # a Unicode letter such as Š with §; source-hint repair runs before this stage.
     forbidden = (
         "§math{",
         "§mathcal",

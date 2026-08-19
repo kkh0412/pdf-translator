@@ -1004,6 +1004,107 @@ def _bbox_intersection_area(a: list[float], b: list[float]) -> float:
     return (x1 - x0) * (y1 - y0)
 
 
+
+def _unicode_letter_words(text: str) -> list[str]:
+    """Extract Unicode letter-only words without requiring third-party regex."""
+    return re.findall(r"[^\W\d_]+", str(text or ""), flags=re.UNICODE)
+
+
+def _overlapping_hint_text(block: dict, hints: list[dict]) -> str:
+    bbox = block.get("bbox") or []
+    if len(bbox) != 4:
+        return ""
+
+    matches: list[tuple[float, str]] = []
+    for hint in hints:
+        area = _bbox_intersection_area(bbox, hint.get("bbox", []))
+        if area > 0:
+            matches.append((area, str(hint.get("text", ""))))
+
+    matches.sort(key=lambda item: item[0], reverse=True)
+    return " ".join(text for _area, text in matches[:4])
+
+
+def _repair_section_sign_glyphs_from_source(
+    text: str,
+    source_hint: str,
+) -> str:
+    """Repair OCR/Vision confusions such as `§afránek` -> `Šafránek`.
+
+    The JSON-safe math protocol legitimately uses §, so we cannot globally
+    replace it. A prose occurrence is repaired only when the source PDF text
+    layer contains a Unicode word whose suffix exactly matches the Vision word.
+
+    Example:
+        Vision: Dominik §afránek
+        PDF text hint: Dominik Šafránek
+        result: Dominik Šafránek
+    """
+    text = str(text or "")
+    if "§" not in text or not source_hint:
+        return text
+
+    source_words = _unicode_letter_words(source_hint)
+    if not source_words:
+        return text
+
+    # § followed by a Unicode letter word. This intentionally does not match
+    # section-sign references such as "§ 3" or mathematical wrappers §math{...}.
+    pattern = re.compile(r"§([^\W\d_]+)", flags=re.UNICODE)
+
+    def replacement(match: re.Match) -> str:
+        tail = match.group(1)
+
+        # Internal transport commands are not prose glyph errors.
+        if tail.casefold() in {
+            "math", "mathcal", "mathbf", "boldsymbol", "mathrm", "text",
+            "textsf", "textbf", "textit", "operatorname", "frac", "sqrt",
+            "rho", "gamma", "theta", "sigma", "pi", "phi", "psi", "omega",
+            "alpha", "beta", "delta", "lambda", "mu", "nu", "tau",
+        }:
+            return match.group(0)
+
+        candidates = [
+            word
+            for word in source_words
+            if len(word) == len(tail) + 1
+            and word[1:].casefold() == tail.casefold()
+        ]
+
+        if len(candidates) == 1:
+            return candidates[0]
+
+        return match.group(0)
+
+    return pattern.sub(replacement, text)
+
+
+def _repair_prose_glyphs_from_source(
+    blocks: list[dict],
+    hints: list[dict],
+) -> None:
+    """Repair high-confidence prose glyph OCR errors before later processing."""
+    for block in blocks:
+        if block.get("kind") in {"equation", "figure", "table"}:
+            continue
+
+        source_hint = _overlapping_hint_text(block, hints)
+        if not source_hint:
+            continue
+
+        parts = block.get("parts") or []
+        for part in parts:
+            if part.get("type") != "text":
+                continue
+
+            content = str(part.get("content", ""))
+            repaired = _repair_section_sign_glyphs_from_source(
+                content,
+                source_hint,
+            )
+            part["content"] = repaired
+
+
 def _apply_source_font_weight(
     blocks: list[dict],
     hints: list[dict],
@@ -1114,6 +1215,7 @@ def _validate_blocks(
         if len(bbox) != 4:
             raise GeminiVisionError(f"Page {page_number}: invalid bbox")
 
+    _repair_prose_glyphs_from_source(blocks, hints)
     _apply_source_font_weight(blocks, hints)
 
     if src_letters >= 500 and out_letters < src_letters * 0.46:
@@ -1204,7 +1306,10 @@ def parse_pages(
         "The renderer converts § back to a real LaTeX backslash after JSON parsing.\n"
         "2. Every inline mathematical expression is a part with type=math and VALID LaTeX "
         "under this § transport convention, "
-        "without $ delimiters. Natural prose must remain type=text.\n"
+        "without $ delimiters. Natural prose must remain type=text. "
+        "IMPORTANT: § is reserved ONLY as a LaTeX-backslash transport character inside math fields. "
+        "Never use § as a substitute for a real Unicode prose letter. Preserve names exactly from "
+        "the page/text hints: for example `Šafránek` must stay `Šafránek`, never `§afránek`.\n"
         "3. Read superscripts and subscripts from their VISUAL vertical position. "
         "Never flatten them into baseline text. Use ^ and _ explicitly; use braces for multi-token "
         "scripts. Using the § transport convention, examples are "
@@ -1245,8 +1350,9 @@ def parse_pages(
         "13. Preserve hierarchy: title, author, affiliation, metadata, abstract, section, "
         "subsection, paragraph, list_item, equation, figure, table, caption, reference, footer.\n"
         "14. Authors, affiliations, journal/arXiv metadata, emails, references and footer material "
-        "normally use translate=false. Title, abstract, headings, prose and captions normally "
-        "use translate=true.\n"
+        "normally use translate=false. Preserve their spelling and Unicode diacritics exactly, using "
+        "the extracted PDF text hint when it is clearer than the image. Title, abstract, headings, "
+        "prose and captions normally use translate=true.\n"
         "15. Real figures/tables may be figure/table blocks. bbox is normalized [x0,y0,x1,y1] "
         "in 0..1000 and must cover the visual object, not its caption.\n"
         "16. Omit page-number-only items. Do not omit dense prose or equations.\n\n"

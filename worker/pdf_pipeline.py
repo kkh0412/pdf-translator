@@ -379,6 +379,33 @@ def _split_text_with_leaked_math(text: str) -> list[tuple[str, str]]:
     return result
 
 
+
+_BARE_MATH_TRANSPORT_RE = re.compile(
+    r"§(?:"
+    r"math(?:cal|bf|rm|sf|tt)?|"
+    r"boldsymbol|mathbf|mathrm|operatorname|text(?:sf|bf|it|tt|rm)?|"
+    r"frac|sqrt|sum|prod|int|lim|log|ln|exp|"
+    r"alpha|beta|gamma|delta|epsilon|varepsilon|zeta|eta|theta|vartheta|"
+    r"iota|kappa|lambda|mu|nu|xi|pi|varpi|rho|varrho|sigma|varsigma|"
+    r"tau|upsilon|phi|varphi|chi|psi|omega|"
+    r"Gamma|Delta|Theta|Lambda|Xi|Pi|Sigma|Upsilon|Phi|Psi|Omega|"
+    r"otimes|oplus|Vert|vert|lvert|rvert|langle|rangle|"
+    r"dagger|infty|in|notin|leq|geq|neq|to|mapsto|cap|cup|"
+    r"widehat|widetilde|hat|tilde|bar|overline|underbrace|overbrace|"
+    r"ket|bra|braket|mel"
+    r")(?:\b|\s|\{|\[|\()"
+)
+
+
+def _contains_bare_math_transport(text: str) -> bool:
+    """Return true only for § sequences that look like LaTeX commands.
+
+    A literal section sign or an OCR-confused Unicode name must not be rejected
+    merely because it contains the § character.
+    """
+    return bool(_BARE_MATH_TRANSPORT_RE.search(str(text or "")))
+
+
 def _assemble_source(block: dict) -> tuple[str, dict[str, str]]:
     pieces: list[str] = []
     math_map: dict[str, str] = {}
@@ -404,7 +431,7 @@ def _assemble_source(block: dict) -> tuple[str, dict[str, str]]:
                 append_math(recovered_content)
             else:
                 clean_text = _clean_prose_text(recovered_content)
-                if "§" in clean_text:
+                if _contains_bare_math_transport(clean_text):
                     raise RuntimeError(
                         "Vision leaked a bare JSON-safe math transport token "
                         f"into prose: {clean_text[:180]}"
@@ -419,10 +446,7 @@ def _assemble_source(block: dict) -> tuple[str, dict[str, str]]:
 def _render_translated_text(text: str, math_map: dict[str, str]) -> str:
     text = _clean_prose_text(text)
 
-    if any(
-        marker in text
-        for marker in ("§math{", "§mathcal", "§gamma", "§rho", "\\math{")
-    ):
+    if _contains_bare_math_transport(text) or "\\math{" in text:
         raise RuntimeError(
             "Internal math transport marker reached final text rendering"
         )
@@ -1759,10 +1783,7 @@ def process_pdf(
         if not translated:
             integrity_errors.append(f"{item['id']}: empty translation")
             continue
-        if any(
-            marker in translated
-            for marker in ("§math{", "§mathcal", "§gamma", "§rho", "\\math{")
-        ):
+        if _contains_bare_math_transport(translated) or "\\math{" in translated:
             integrity_errors.append(
                 f"{item['id']}: internal math transport marker"
             )
