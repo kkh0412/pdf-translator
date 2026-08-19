@@ -58,32 +58,56 @@ jobs:
           path: |
             ~/.TinyTeX
             ~/.cache/pdf-translator-fonts
-          key: ${{ runner.os }}-pdf-translator-latex-v5-2026-07
+          # New key fixes the old cache that was missing cjk-ko.
+          # restore-keys lets us reuse the old TinyTeX download and only add
+          # the missing package on the first v5.1 run.
+          key: ${{ runner.os }}-pdf-translator-latex-v5-1-cjkko-2026-08
+          restore-keys: |
+            ${{ runner.os }}-pdf-translator-latex-v5-
 
-      - name: Install LaTeX environment once
-        if: steps.queue.outputs.has_jobs == 'true' && steps.latex-cache.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          set -euxo pipefail
-          export TINYTEX_VERSION=2026.07
-          export TINYTEX_INSTALLER=TinyTeX-1
-          curl -fsSL https://yihui.org/tinytex/install-unx.sh | sh
-          export PATH="$HOME/.TinyTeX/bin/x86_64-linux:$PATH"
-          tlmgr install kpfonts-otf xetexko enumitem
-
-          mkdir -p "$HOME/.cache/pdf-translator-fonts"
-          curl -fL --retry 3 \
-            -o "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Regular.ttf" \
-            https://raw.githubusercontent.com/google/fonts/main/ofl/nanummyeongjo/NanumMyeongjo-Regular.ttf
-          curl -fL --retry 3 \
-            -o "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Bold.ttf" \
-            https://raw.githubusercontent.com/google/fonts/main/ofl/nanummyeongjo/NanumMyeongjo-Bold.ttf
-
-      - name: Add cached TinyTeX to PATH
+      - name: Add TinyTeX to PATH
         if: steps.queue.outputs.has_jobs == 'true'
         shell: bash
         run: |
           echo "$HOME/.TinyTeX/bin/x86_64-linux" >> "$GITHUB_PATH"
+
+      - name: Install TinyTeX only if cache is empty
+        if: steps.queue.outputs.has_jobs == 'true'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export PATH="$HOME/.TinyTeX/bin/x86_64-linux:$PATH"
+          if ! command -v xelatex >/dev/null 2>&1; then
+            export TINYTEX_VERSION=2026.07
+            export TINYTEX_INSTALLER=TinyTeX-1
+            curl -fsSL https://yihui.org/tinytex/install-unx.sh | sh
+          fi
+
+      - name: Ensure required LaTeX packages and book fonts
+        if: steps.queue.outputs.has_jobs == 'true'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export PATH="$HOME/.TinyTeX/bin/x86_64-linux:$PATH"
+
+          # xetexko needs cjk-ko for kolabels-utf.sty / konames-utf.sty.
+          # tlmgr skips packages that are already installed, so after the new
+          # cache is saved this step is effectively only a quick check.
+          tlmgr install kpfonts-otf xetexko cjk-ko enumitem
+          kpsewhich kolabels-utf.sty
+
+          mkdir -p "$HOME/.cache/pdf-translator-fonts"
+          if [ ! -f "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Regular.ttf" ]; then
+            curl -fL --retry 3 \
+              -o "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Regular.ttf" \
+              https://raw.githubusercontent.com/google/fonts/main/ofl/nanummyeongjo/NanumMyeongjo-Regular.ttf
+          fi
+          if [ ! -f "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Bold.ttf" ]; then
+            curl -fL --retry 3 \
+              -o "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Bold.ttf" \
+              https://raw.githubusercontent.com/google/fonts/main/ofl/nanummyeongjo/NanumMyeongjo-Bold.ttf
+          fi
+
           test -f "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Regular.ttf"
           test -f "$HOME/.cache/pdf-translator-fonts/NanumMyeongjo-Bold.ttf"
 
