@@ -126,7 +126,7 @@ async function poll(jobId) {
       Object.prototype.hasOwnProperty.call(job, 'progress_message');
 
     if (job.status === 'queued') {
-      statusTitle.textContent = 'Worker 시작 대기 중';
+      statusTitle.textContent = '번역 준비 중';
       processingStartedAt = null;
       if (!queuedStartedAt) queuedStartedAt = Date.now();
 
@@ -138,24 +138,22 @@ async function poll(jobId) {
           dbProgress,
           detailedMessage(
             job,
-            'Supabase가 GitHub worker 실행 요청을 처리하고 있습니다.'
+            '번역 작업을 준비하고 있습니다.'
           )
         );
       } else if (queuedForMs >= 8000) {
         updateProgress(
           0,
-          'DB worker trigger가 설치되지 않았거나 실행되지 않았습니다. ' +
-          'v6.8의 UPDATE_EXISTING_SUPABASE.sql을 전체 실행한 뒤 ' +
-          'CHECK_WORKER_TRIGGER.sql로 상태를 확인하세요.'
+          '번역 작업을 시작하지 못했습니다. 잠시 후 다시 시도해 주세요.'
         );
       } else {
         updateProgress(
           1,
-          '작업을 생성했습니다 · Supabase DB trigger가 GitHub worker를 즉시 호출하고 있습니다.'
+          '파일 업로드가 끝났습니다 · 번역 작업을 준비하고 있습니다.'
         );
       }
     } else if (job.status === 'processing') {
-      statusTitle.textContent = '번역 및 PDF 생성 중';
+      statusTitle.textContent = '번역 중';
       queuedStartedAt = null;
       if (!processingStartedAt) processingStartedAt = Date.now();
 
@@ -164,7 +162,7 @@ async function poll(jobId) {
           job.progress ?? 4,
           detailedMessage(
             job,
-            '문서 구조와 수식을 분석하고 번역한 뒤 LaTeX로 다시 조판하고 있습니다.'
+            '문서 구조와 수식을 살펴 번역하고, 결과를 다시 조판하고 있습니다.'
           )
         );
       } else {
@@ -173,11 +171,10 @@ async function poll(jobId) {
         progressFill.style.width = '12%';
         progressTrack.removeAttribute('aria-valuenow');
         statusText.textContent =
-          '상세 진행률 컬럼이 아직 Supabase에 없습니다. ' +
-          'supabase/UPDATE_EXISTING_SUPABASE.sql을 한 번 실행하면 페이지·번역 묶음별 진행률이 표시됩니다.';
+          '번역을 진행하고 있습니다. 잠시만 기다려 주세요.';
       }
     } else if (job.status === 'done') {
-      updateProgress(100, '번역 PDF가 준비되었습니다.');
+      updateProgress(100, '번역이 완료되었습니다.');
       spinner.classList.add('hidden');
       statusBox.classList.add('hidden');
       resultBox.classList.remove('hidden');
@@ -259,8 +256,8 @@ form.addEventListener('submit', async (event) => {
   statusBox.classList.remove('hidden');
   processingStartedAt = null;
   queuedStartedAt = null;
-  statusTitle.textContent = 'PDF 업로드 중';
-  updateProgress(1, '원본 PDF를 Supabase Storage에 저장하고 있습니다.');
+  statusTitle.textContent = '파일 업로드 중';
+  updateProgress(1, '번역할 PDF를 업로드하고 있습니다.');
   submitBtn.disabled = true;
 
   try {
@@ -297,10 +294,10 @@ form.addEventListener('submit', async (event) => {
     }
 
     queuedStartedAt = Date.now();
-    statusTitle.textContent = 'Worker 시작 중';
+    statusTitle.textContent = '번역 준비 중';
     updateProgress(
       1,
-      '업로드 완료 · Supabase DB trigger가 GitHub worker를 즉시 호출합니다.'
+      '업로드가 완료되었습니다 · 번역을 시작할 준비를 하고 있습니다.'
     );
 
     await poll(jobId);

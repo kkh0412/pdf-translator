@@ -3,20 +3,20 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="description" content="원본의 활자와 문서 스타일을 최대한 유지하는 LaTeX PDF 번역 데모" />
-  <title>PDF Translator</title>
+  <meta name="description" content="문서의 구조와 수식을 살려 자연스럽게 다시 조판하는 PDF 번역기" />
+  <title>대관령산양의 번역기</title>
   <link rel="stylesheet" href="./style.css" />
 </head>
 <body>
   <main class="shell">
     <nav class="topbar">
-      <a class="brand" href="./">PDF TRANSLATOR</a>
+      <a class="brand" href="./">대관령산양의 번역기</a>
     </nav>
 
     <section class="hero">
-      <div class="eyebrow">STYLE-PRESERVING LATEX TRANSLATION</div>
-      <h1>PDF의 스타일을 살려<br />번역본을 다시 조판합니다.</h1>
-      <p>원본의 제목 계층·글꼴 분위기·목록·그림·수식을 분석하고, 번역문 전체를 LaTeX로 자연스럽게 다시 조판합니다.</p>
+      <div class="eyebrow">PDF TRANSLATION</div>
+      <h1>원문의 흐름을 살려,<br />읽기 좋은 번역본으로.</h1>
+      <p>문서의 구조와 수식, 강조와 단 구성을 살펴 번역하고 결과를 LaTeX로 다시 조판합니다. 논문과 전문 문서를 원문에 가까운 인상으로 읽을 수 있도록 만드는 번역기입니다.</p>
     </section>
 
     <section class="card">
@@ -29,24 +29,26 @@
         <label class="dropzone" id="dropzone">
           <input id="pdfInput" type="file" accept="application/pdf,.pdf" required />
           <div class="pdf-icon">PDF</div>
-          <strong id="fileLabel">PDF 파일을 선택하거나 여기에 놓으세요</strong>
-          <span id="serverLimits">최대 50 MB · 최대 20페이지</span>
+          <strong id="fileLabel">번역할 PDF를 선택하거나 여기에 놓으세요</strong>
+          <span id="serverLimits">PDF · 최대 50 MB · 최대 20페이지</span>
         </label>
 
         <div class="form-row">
           <div class="field">
-            <label for="language">번역 언어</label>
-            <select id="language">
-              <option value="ko" selected>한국어</option>
-              <option value="en">English</option>
-              <option value="ja">日本語</option>
-              <option value="zh-CN">简体中文</option>
-              <option value="fr">Français</option>
-              <option value="de">Deutsch</option>
-              <option value="es">Español</option>
-            </select>
+            <label for="language">번역할 언어</label>
+            <div class="select-wrap">
+              <select id="language">
+                <option value="ko" selected>한국어</option>
+                <option value="en">English</option>
+                <option value="ja">日本語</option>
+                <option value="zh-CN">简体中文</option>
+                <option value="fr">Français</option>
+                <option value="de">Deutsch</option>
+                <option value="es">Español</option>
+              </select>
+            </div>
           </div>
-          <button class="primary" type="submit" id="submitBtn">번역 시작</button>
+          <button class="primary" type="submit" id="submitBtn">번역하기</button>
         </div>
       </form>
 
@@ -54,10 +56,10 @@
         <div class="spinner" id="spinner"></div>
         <div class="status-main">
           <div class="status-heading">
-            <strong id="statusTitle">처리 중</strong>
+            <strong id="statusTitle">번역 준비 중</strong>
             <span id="progressValue">0%</span>
           </div>
-          <p id="statusText">PDF를 분석하고 있습니다.</p>
+          <p id="statusText">문서를 살펴보고 있습니다.</p>
           <div
             class="progress-track"
             id="progressTrack"
@@ -75,10 +77,10 @@
       <div class="result hidden" id="resultBox">
         <div>
           <span class="badge">완료</span>
-          <h2>번역 PDF가 준비되었습니다.</h2>
+          <h2>번역이 완료되었습니다.</h2>
           <p id="resultMeta"></p>
         </div>
-        <button class="primary" id="downloadBtn" type="button">PDF 다운로드</button>
+        <button class="primary" id="downloadBtn" type="button">번역본 다운로드</button>
       </div>
 
       <div class="error hidden" id="errorBox"></div>
@@ -87,22 +89,22 @@
     <section class="features">
       <article>
         <span>01</span>
-        <h3>수식 보존</h3>
-        <p>수학 영역은 번역하지 않고 원본 페이지의 표현을 유지합니다.</p>
+        <h3>수식은 그대로 읽히게</h3>
+        <p>본문 속 기호부터 여러 줄 수식까지 LaTeX로 다시 구성해, 번역 과정에서 수학 표기가 흐트러지지 않도록 합니다.</p>
       </article>
       <article>
         <span>02</span>
-        <h3>책다운 조판</h3>
-        <p>본문은 명조 계열의 출판용 글꼴을 사용하고, 제목·소제목·인용문·목록의 위계를 LaTeX로 재현합니다.</p>
+        <h3>문서의 인상을 유지하게</h3>
+        <p>제목과 본문, 굵은 글씨, 단 구성과 여백을 살펴 원문이 가진 출판물의 분위기를 번역본에도 이어갑니다.</p>
       </article>
       <article>
         <span>03</span>
-        <h3>자연스러운 재배치</h3>
-        <p>원래 좌표에 억지로 끼워 넣지 않고 내용 길이에 맞춰 문단과 그림을 자연스럽게 재배치합니다.</p>
+        <h3>번역문은 자연스럽게</h3>
+        <p>분야와 문맥을 먼저 파악한 뒤 전문 용어와 문장을 다듬고, 번역된 길이에 맞춰 페이지를 자연스럽게 다시 조판합니다.</p>
       </article>
     </section>
 
-    <footer>1차 데모 · 텍스트 선택이 가능한 PDF를 대상으로 합니다. 업로드가 끝나면 Supabase 데이터베이스 trigger가 GitHub worker를 즉시 호출합니다.</footer>
+    <footer>대관령산양의 번역기</footer>
   </main>
 
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>

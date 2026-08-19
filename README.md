@@ -1,4 +1,15 @@
-# PDF Translator v6.12
+# PDF Translator v6.13
+
+## Homepage refresh
+- Visible service name changed to `대관령산양의 번역기`.
+- Hero copy, upload copy, result copy, and progress copy were rewritten in natural Korean.
+- Backend implementation terms are removed from the normal user-facing interface.
+- Language dropdown uses a custom down arrow positioned slightly inward from the left edge.
+- The three feature explanations were rewritten around math fidelity, document appearance, and natural translation/reflow.
+- The old first-demo/backend footer notice was removed.
+
+## Translation pipeline
+All v6.12 translation, math, quota, and integrity fixes are retained.
 
 ## Bold / font-weight fidelity
 - Source PDF text hints now carry real bold/italic ratios.
