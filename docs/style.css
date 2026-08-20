@@ -17,6 +17,25 @@ button, input, select { font: inherit; }
 .admin-link.disabled { pointer-events: none; opacity: .4; }
 
 .hero { padding: 78px 0 46px; max-width: 850px; }
+.hero-layout {
+  display: grid;
+  grid-template-columns: clamp(88px, 9vw, 128px) minmax(0, 1fr);
+  gap: clamp(26px, 3vw, 44px);
+  align-items: start;
+}
+
+.hero-logo {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin-top: 4px;
+  border-radius: 24%;
+}
+
+.hero-copy {
+  min-width: 0;
+}
+
 .eyebrow { font-size: 11px; font-weight: 750; letter-spacing: .16em; margin-bottom: 18px; color: #77756d; }
 .hero h1 { margin: 0; font-size: clamp(42px, 7vw, 76px); line-height: 1.02; letter-spacing: -.055em; font-weight: 650; }
 .hero p { max-width: 720px; margin: 26px 0 0; font-size: 17px; line-height: 1.78; color: #575650; }
@@ -117,6 +136,15 @@ select:focus {
 footer { padding-top: 30px; color: #8a887f; font-size: 12px; letter-spacing: .01em; }
 
 @media (max-width: 720px) {
+  .hero-layout {
+    grid-template-columns: 64px minmax(0, 1fr);
+    gap: 18px;
+  }
+
+  .hero-logo {
+    margin-top: 2px;
+  }
+
   .shell { width: min(100% - 24px, 1080px); }
   .hero { padding: 54px 0 32px; }
   .form-row { grid-template-columns: 1fr; }
