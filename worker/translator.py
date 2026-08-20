@@ -14,7 +14,6 @@ from typing import Callable, Iterable
 from .gemini_rate import (
     check_cancel,
     daily_quota_exhausted,
-    impose_cooldown,
     is_daily_quota_error,
     mark_daily_quota_exhausted,
     retry_delay_from_text,
@@ -58,6 +57,21 @@ class GeminiDailyQuotaError(RuntimeError):
         self.model = model
         self.detail = detail
         super().__init__(f"Daily quota exhausted for {model}: {detail}")
+
+
+class Gemini429UseGoogle(RuntimeError):
+    """Translation-only signal: do not wait; switch this job to Google Translate."""
+
+    def __init__(self, model: str, detail: str):
+        self.model = model
+        self.detail = detail
+        super().__init__(f"Gemini translation 429 on {model}")
+
+
+# Once any translation batch receives a Gemini 429, all remaining translation
+# batches in this process use Google Translate immediately. This prevents a
+# parallel batch from spending another minute in Retry-After waits.
+_use_google_for_remaining_translation = threading.Event()
 
 
 def _sanitize(value: str) -> str:
@@ -448,75 +462,60 @@ def _translate_with_quota_retries(
     context: str,
     status_callback: Callable[[str], None] | None = None,
 ) -> list[str]:
-    """Use one model while distinguishing daily quota from temporary throttling."""
+    """Translation policy: a Gemini 429 never waits.
+
+    Vision/math repair still has its own retry policy because Google Translate
+    cannot replace those tasks. This function is used only for natural-language
+    translation, where Google Translate is an acceptable immediate fallback.
+    """
     if daily_quota_exhausted(model):
         raise GeminiDailyQuotaError(
             model,
             "This model already reached its per-day quota earlier in this job.",
         )
 
-    max_429 = max(
-        1,
-        int(os.getenv("GEMINI_MAX_429_RETRIES", "8")),
-    )
-    quota_attempt = 0
+    try:
+        return _translate_once(
+            api_key,
+            model,
+            batch,
+            target_language,
+            strategy,
+        )
 
-    while True:
-        try:
-            return _translate_once(
-                api_key,
-                model,
-                batch,
-                target_language,
-                strategy,
-            )
+    except GeminiHTTPError as exc:
+        if exc.status != 429:
+            raise
 
-        except GeminiHTTPError as exc:
-            if exc.status != 429:
-                raise
+        if is_daily_quota_error(exc.detail):
+            mark_daily_quota_exhausted(model)
 
-            if is_daily_quota_error(exc.detail):
-                mark_daily_quota_exhausted(model)
-                if status_callback:
-                    status_callback(
-                        "현재 처리 경로의 사용량이 많아 다른 경로로 전환하고 있습니다."
-                    )
-                print(
-                    f"Daily quota exhausted for {model}; switching models immediately.",
-                    flush=True,
-                )
-                raise GeminiDailyQuotaError(model, exc.detail) from exc
-
-            quota_attempt += 1
-            if quota_attempt > max_429:
-                raise RuntimeError(
-                    f"{context}: temporary Gemini rate limit did not recover after "
-                    f"{max_429} waits on model {model}."
-                ) from exc
-
-            wait_seconds = max(
-                2.0,
-                float(
-                    exc.retry_after
-                    or retry_delay_from_text(exc.detail)
-                ),
-            ) + 1.0
-
-            impose_cooldown(model, wait_seconds)
+        # Do NOT impose a cooldown or honor Retry-After for prose translation.
+        # User latency is more important here because Google Translate can take
+        # over this exact task immediately.
+        if google_translate_configured():
+            _use_google_for_remaining_translation.set()
             if status_callback:
                 status_callback(
-                    "현재 요청이 많아 잠시 기다린 뒤 자동으로 계속합니다."
+                    "번역 요청이 지연되어 Google 번역으로 전환해 계속 처리하고 있습니다."
                 )
             print(
-                f"{context}: transient 429 on {model}; waiting "
-                f"{wait_seconds:.1f}s before retry "
-                f"{quota_attempt}/{max_429}.",
+                f"{context}: Gemini 429 on {model}; switching immediately "
+                "to Google Translate without waiting.",
                 flush=True,
             )
+            raise Gemini429UseGoogle(model, exc.detail) from exc
 
-            # _translate_once -> _call -> wait_for_slot() observes the shared
-            # cooldown. Daily quota never reaches this branch.
-
+        # If Google Translate was not configured, still do not sleep. Let the
+        # caller try the next Gemini model immediately.
+        print(
+            f"{context}: Gemini 429 on {model}; no wait, trying next model "
+            "because Google Translate is not configured.",
+            flush=True,
+        )
+        if is_daily_quota_error(exc.detail):
+            raise GeminiDailyQuotaError(model, exc.detail) from exc
+        raise exc
 
 
 def _google_translate_fallback(
@@ -580,7 +579,15 @@ def _request_batch(
     *,
     status_callback: Callable[[str], None] | None = None,
 ) -> list[str]:
-    """Try the configured model chain, skipping models whose RPD is exhausted."""
+    """Translate a batch with zero-wait Google fallback on any Gemini 429."""
+    if _use_google_for_remaining_translation.is_set() and google_translate_configured():
+        return _google_translate_fallback(
+            batch,
+            target_language,
+            strategy,
+            status_callback=status_callback,
+        )
+
     last_error: Exception | None = None
     attempted_models = 0
 
@@ -605,9 +612,18 @@ def _request_batch(
                 status_callback=status_callback,
             )
 
+        except Gemini429UseGoogle:
+            return _google_translate_fallback(
+                batch,
+                target_language,
+                strategy,
+                status_callback=status_callback,
+            )
+
         except GeminiDailyQuotaError as exc:
             last_error = exc
-            # The next model has an independent model quota dimension.
+            # Daily exhaustion known before the call can still move to another
+            # model. A live 429 with Google configured never reaches here.
             continue
 
         except GeminiHTTPError as exc:
@@ -716,6 +732,13 @@ def _recover(
                     context="Single-block quality fallback",
                     status_callback=status_callback,
                 )
+            except Gemini429UseGoogle:
+                return _google_translate_fallback(
+                    batch,
+                    target_language,
+                    strategy,
+                    status_callback=status_callback,
+                )
             except GeminiDailyQuotaError:
                 continue
             except GeminiHTTPError as fallback_http:
@@ -754,6 +777,10 @@ def translate_blocks(
     initial_translations: dict[str, str] | None = None,
     checkpoint_callback: Callable[[dict[str, str]], None] | None = None,
 ) -> dict[str, str]:
+    # One translation stage == one provider decision lifecycle. Once a live 429
+    # occurs, the event remains set for all remaining parallel batches.
+    _use_google_for_remaining_translation.clear()
+
     if not items:
         return {}
 

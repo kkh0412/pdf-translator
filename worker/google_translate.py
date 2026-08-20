@@ -188,7 +188,7 @@ def translate_batch(
 
     if status_callback:
         status_callback(
-            "AI 번역 모델의 사용량이 모두 소진되어 Google 번역으로 남은 본문을 계속 처리하고 있습니다."
+            "번역 요청이 지연되어 Google 번역으로 전환해 계속 처리하고 있습니다."
         )
 
     print(

@@ -1,4 +1,11 @@
-# 대관령산양의 번역기 v8.5.2
+# 대관령산양의 번역기 v8.5.3
+
+## Zero-wait translation fallback
+- 본문 번역에서 Gemini HTTP 429가 한 번이라도 발생하면 Retry-After를 기다리지 않습니다.
+- Google Translate가 설정되어 있으면 즉시 Google 번역으로 전환합니다.
+- 한 번 전환되면 같은 작업의 남은 번역 batch도 Gemini를 다시 호출하지 않습니다.
+- Google Translate가 설정되지 않은 경우에만 다음 Gemini 모델을 즉시 시도하며, 역시 429 대기는 하지 않습니다.
+- Vision/수식 인식·복구는 Google 번역으로 대체할 수 없으므로 기존 별도 정책을 유지합니다.
 
 ## Heartbeat SQL hotfix correction
 - v8.5.1 standalone hotfix의 잘못된 literal `\n` 줄바꿈을 수정했습니다.
