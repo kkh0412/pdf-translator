@@ -1,0 +1,92 @@
+name: Prepare PDF runtime cache
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'worker/requirements.txt'
+      - 'worker/latex_requirements.txt'
+      - 'worker/setup_runtime.sh'
+      - '.github/workflows/prepare-runtime.yml'
+      - '.github/workflows/process-pdf.yml'
+  schedule:
+    - cron: '23 3 * * 1,4'
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Restore prepared runtime
+        id: runtime-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ~/.TinyTeX
+            ~/.cache/pdf-translator-fonts
+            .venv
+          key: ${{ runner.os }}-${{ runner.arch }}-pdf-translator-runtime-v6-${{ hashFiles('worker/requirements.txt', 'worker/latex_requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-pdf-translator-runtime-v6-
+
+      - name: Build on cache miss
+        if: steps.runtime-cache.outputs.cache-hit != 'true'
+        run: bash worker/setup_runtime.sh
+
+      - name: Smoke test two-column Korean + real LaTeX math
+        if: steps.runtime-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          export PATH="$HOME/.TinyTeX/bin/x86_64-linux:$PATH"
+          TMP="$(mktemp -d)"
+          mkdir -p "$TMP/font"
+          cp "$HOME/.cache/pdf-translator-fonts/"* "$TMP/font/"
+          cat > "$TMP/smoke.tex" <<'EOF'
+          \documentclass[10pt]{article}
+          \usepackage{fontspec}
+          \usepackage{xetexko}
+          \usepackage{amsmath,amssymb}
+          \usepackage{multicol}
+          \setmainfont[Path={font/},UprightFont=lmroman10-regular.otf,BoldFont=lmroman10-bold.otf,ItalicFont=lmroman10-italic.otf]{lmroman10-regular.otf}
+          \setmainhangulfont[Path={font/},UprightFont=NanumMyeongjo-Regular.ttf,BoldFont=NanumMyeongjo-Bold.ttf]{NanumMyeongjo-Regular.ttf}
+          \begin{document}
+          {\Large A translated scientific article\par\vspace{1em}}
+          \begin{multicols}{2}
+          양자 상태 $\rho^T$와 기준 상태 $\gamma_x$에 대해
+          $S_{\mathcal M,\gamma}^{(j)}(\rho)$를 고려한다.
+          \begin{equation}
+          \begin{aligned}
+          S_{\mathcal M,\gamma}^{(j)}(\rho)
+          &= S(\rho)+D(\rho\Vert\gamma) \\
+          &\quad -D(\mathcal M(\rho)\Vert\mathcal M(\gamma)).
+          \end{aligned}
+          \end{equation}
+          실제 LaTeX 수식과 함께 두 단으로 흐른다.
+          \end{multicols}
+          이제 이 부분은 한 단이다. 컬럼 수 전환도 정상적으로 컴파일되어야 한다.
+          \begin{multicols}{2}
+          다시 두 단으로 전환한다.
+          \end{multicols}
+          \end{document}
+          EOF
+          (cd "$TMP" && xelatex -interaction=nonstopmode -halt-on-error smoke.tex >/dev/null)
+          test -s "$TMP/smoke.pdf"
+          rm -rf "$TMP"
+
+      - name: Save prepared runtime immediately
+        if: steps.runtime-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.TinyTeX
+            ~/.cache/pdf-translator-fonts
+            .venv
+          key: ${{ steps.runtime-cache.outputs.cache-primary-key }}
+
+      - run: echo "Vision/LaTeX runtime cache is ready."
