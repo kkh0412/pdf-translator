@@ -8,6 +8,7 @@ import shutil
 import threading
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,11 +16,38 @@ import pymupdf
 from supabase import create_client
 
 from .pdf_pipeline import process_pdf
+from .gemini_rate import set_cancel_check
 
 
 MAX_STORAGE_BYTES = 50 * 1024 * 1024
 CHECKPOINT_BUCKET = "translation-checkpoints"
 CHECKPOINT_VERSION = 1
+CLIENT_HEARTBEAT_TIMEOUT_SECONDS = max(20, int(os.getenv("CLIENT_HEARTBEAT_TIMEOUT_SECONDS", "45")))
+CLIENT_HEARTBEAT_POLL_SECONDS = 5.0
+
+
+class ClientDisconnectedError(RuntimeError):
+    pass
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _heartbeat_is_stale(value: object, *, now_value: datetime | None = None) -> bool:
+    parsed = _parse_timestamp(value)
+    if parsed is None:
+        return True
+    current = now_value or datetime.now(timezone.utc)
+    return (current - parsed).total_seconds() > CLIENT_HEARTBEAT_TIMEOUT_SECONDS
 
 
 def _sha256(path: Path) -> str:
@@ -182,10 +210,24 @@ def main(job_id: str) -> int:
     progress_floor = 0
     last_progress = -1
     last_progress_message = None
+    cancel_event = threading.Event()
+    monitor_stop = threading.Event()
+    monitor_thread: threading.Thread | None = None
+    checkpoint_state: dict = {}
+    persist_checkpoint_fn = None
+
+    def raise_if_cancelled() -> None:
+        if cancel_event.is_set():
+            raise ClientDisconnectedError(
+                "CLIENT_DISCONNECTED: browser heartbeat expired; worker stopped safely."
+            )
+
+    set_cancel_check(raise_if_cancelled)
 
     def update_progress(percent: int, message: str) -> None:
         nonlocal progress_updates_enabled, progress_floor, last_progress, last_progress_message
 
+        raise_if_cancelled()
         if not progress_updates_enabled:
             return
 
@@ -257,6 +299,26 @@ def main(job_id: str) -> int:
         )
         return 0
 
+    heartbeat_watch_enabled = "client_heartbeat_at" in job
+    if heartbeat_watch_enabled and (
+        job.get("client_active") is False
+        or _heartbeat_is_stale(job.get("client_heartbeat_at"))
+    ):
+        db.table("translation_jobs").update(
+            {
+                "status": "paused",
+                "client_active": False,
+                "paused_at": now(),
+                "progress_message": (
+                    "브라우저 연결이 끊어져 작업을 잠시 멈췄습니다. "
+                    "다시 접속하면 저장된 지점부터 이어서 진행합니다."
+                ),
+                "progress_updated_at": now(),
+            }
+        ).eq("id", job_id).execute()
+        print(f"Job {job_id}: client heartbeat already stale; not starting worker.", flush=True)
+        return 0
+
     db.table("translation_jobs").update(
         {
             "status": "processing",
@@ -264,6 +326,52 @@ def main(job_id: str) -> int:
             "error": None,
         }
     ).eq("id", job_id).execute()
+
+    if heartbeat_watch_enabled:
+        def monitor_client_heartbeat() -> None:
+            monitor_db = create_client(url, key)
+            last_db_success = time.monotonic()
+            while not monitor_stop.wait(CLIENT_HEARTBEAT_POLL_SECONDS):
+                try:
+                    rows = (
+                        monitor_db.table("translation_jobs")
+                        .select("status,client_heartbeat_at,client_active")
+                        .eq("id", job_id)
+                        .limit(1)
+                        .execute()
+                        .data
+                    )
+                    last_db_success = time.monotonic()
+                    if not rows:
+                        cancel_event.set()
+                        return
+                    state = rows[0]
+                    if state.get("client_active") is False:
+                        cancel_event.set()
+                        return
+                    if _heartbeat_is_stale(state.get("client_heartbeat_at")):
+                        cancel_event.set()
+                        return
+                    if str(state.get("status", "")) not in {"processing", "queued"}:
+                        return
+                except Exception as exc:
+                    print(f"Heartbeat monitor DB check failed: {exc}", flush=True)
+                    if time.monotonic() - last_db_success > CLIENT_HEARTBEAT_TIMEOUT_SECONDS:
+                        cancel_event.set()
+                        return
+
+        monitor_thread = threading.Thread(
+            target=monitor_client_heartbeat,
+            name=f"client-heartbeat-{job_id[:8]}",
+            daemon=True,
+        )
+        monitor_thread.start()
+    else:
+        print(
+            "Client heartbeat columns are unavailable; run the latest Supabase SQL "
+            "to enable automatic worker stop on browser disconnect.",
+            flush=True,
+        )
 
     temp = Path(tempfile.mkdtemp(prefix=f"pdfjob-{job_id[:8]}-"))
 
@@ -357,6 +465,7 @@ def main(job_id: str) -> int:
                         flush=True,
                     )
 
+        persist_checkpoint_fn = persist_checkpoint
         output_path = temp / "translated.pdf"
         info = process_pdf(
             input_path,
@@ -425,6 +534,39 @@ def main(job_id: str) -> int:
         print(f"Completed {job_id}: {info}", flush=True)
         return 0
 
+    except ClientDisconnectedError as exc:
+        message = str(exc)
+        try:
+            if persist_checkpoint_fn is not None and checkpoint_state:
+                persist_checkpoint_fn(checkpoint_state)
+        except Exception as checkpoint_exc:
+            print(
+                f"Final disconnect checkpoint save failed: {checkpoint_exc}",
+                flush=True,
+            )
+
+        pause_payload = {
+            "status": "paused",
+            "client_active": False,
+            "paused_at": now(),
+            "started_at": None,
+            "finished_at": None,
+            "error": None,
+        }
+        if progress_updates_enabled:
+            pause_payload.update(
+                {
+                    "progress_message": (
+                        "브라우저 연결이 끊어져 작업을 잠시 멈췄습니다. "
+                        "다시 접속하면 저장된 지점부터 이어서 진행합니다."
+                    ),
+                    "progress_updated_at": now(),
+                }
+            )
+        db.table("translation_jobs").update(pause_payload).eq("id", job_id).execute()
+        print(f"Client disconnected; paused {job_id} after checkpoint: {message}", flush=True)
+        return 0
+
     except Exception as exc:
         message = str(exc)[-6000:]
 
@@ -469,6 +611,10 @@ def main(job_id: str) -> int:
         return 1
 
     finally:
+        monitor_stop.set()
+        if monitor_thread is not None:
+            monitor_thread.join(timeout=2.0)
+        set_cancel_check(None)
         shutil.rmtree(temp, ignore_errors=True)
 
 

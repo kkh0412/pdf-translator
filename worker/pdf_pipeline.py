@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import copy
+import math
 import os
 import re
 import shutil
@@ -23,6 +24,7 @@ from .vision_agent import (
     parse_pages,
     stabilize_page_blocks,
 )
+from .gemini_rate import check_cancel
 
 
 PLACEHOLDER_RE = re.compile(r"\[\[MATH_(\d+)\]\]")
@@ -804,11 +806,31 @@ def _render_translated_text(text: str, math_map: dict[str, str]) -> str:
     return "".join(out)
 
 
+def _normalized_bbox_values(bbox_norm: object) -> list[float] | None:
+    """Return sorted, clamped normalized coordinates or None for unusable input."""
+    if not isinstance(bbox_norm, (list, tuple)) or len(bbox_norm) != 4:
+        return None
+    try:
+        values = [float(value) for value in bbox_norm]
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in values):
+        return None
+
+    x0, y0, x1, y1 = values
+    x0, x1 = sorted((max(0.0, min(1000.0, x0)), max(0.0, min(1000.0, x1))))
+    y0, y1 = sorted((max(0.0, min(1000.0, y0)), max(0.0, min(1000.0, y1))))
+    return [x0, y0, x1, y1]
+
+
 def _normalized_bbox_to_rect(
     page: pymupdf.Page,
     bbox_norm: list[float],
 ) -> pymupdf.Rect:
-    x0, y0, x1, y1 = bbox_norm
+    values = _normalized_bbox_values(bbox_norm)
+    if values is None:
+        return pymupdf.Rect()
+    x0, y0, x1, y1 = values
     return (
         pymupdf.Rect(
             page.rect.width * x0 / 1000.0,
@@ -910,6 +932,113 @@ def _vector_drawing_count_in_rect(
         if _rect_intersection_area(pymupdf.Rect(drect), rect) > 0.5:
             count += 1
     return count
+
+
+
+def _rect_union(rects: list[pymupdf.Rect]) -> pymupdf.Rect | None:
+    valid = [rect for rect in rects if rect.width > 0 and rect.height > 0]
+    if not valid:
+        return None
+    result = pymupdf.Rect(valid[0])
+    for rect in valid[1:]:
+        result |= rect
+    return result
+
+
+def _expanded_figure_probe(page: pymupdf.Page, rect: pymupdf.Rect) -> pymupdf.Rect:
+    cx = (rect.x0 + rect.x1) / 2.0 if rect.width > 0 else page.rect.width / 2.0
+    cy = (rect.y0 + rect.y1) / 2.0 if rect.height > 0 else page.rect.height / 2.0
+    width = max(rect.width, min(page.rect.width * 0.28, 180.0))
+    height = max(rect.height, min(page.rect.height * 0.20, 180.0))
+    return pymupdf.Rect(
+        cx - width / 2.0,
+        cy - height / 2.0,
+        cx + width / 2.0,
+        cy + height / 2.0,
+    ) & page.rect
+
+
+def _recover_figure_rect_from_pdf_objects(
+    doc: pymupdf.Document,
+    page: pymupdf.Page,
+    rect: pymupdf.Rect,
+) -> pymupdf.Rect | None:
+    """Recover a malformed Vision bbox from actual PDF image/vector geometry."""
+    probe = _expanded_figure_probe(page, rect)
+    page_area = max(1.0, page.rect.width * page.rect.height)
+
+    # Prefer a real embedded bitmap placement if one intersects the probe.
+    raster_rects: list[pymupdf.Rect] = []
+    for image_info in page.get_images(full=True):
+        try:
+            placements = page.get_image_rects(int(image_info[0]))
+        except Exception:
+            continue
+        for placement in placements:
+            candidate = pymupdf.Rect(placement) & page.rect
+            if candidate.width < 8 or candidate.height < 8:
+                continue
+            if _rect_intersection_area(candidate, probe) > 0:
+                raster_rects.append(candidate)
+
+    if raster_rects:
+        pcx = (probe.x0 + probe.x1) / 2.0
+        pcy = (probe.y0 + probe.y1) / 2.0
+        raster_rects.sort(
+            key=lambda candidate: (
+                -_rect_intersection_area(candidate, probe),
+                ((candidate.x0 + candidate.x1) / 2.0 - pcx) ** 2
+                + ((candidate.y0 + candidate.y1) / 2.0 - pcy) ** 2,
+            )
+        )
+        return raster_rects[0]
+
+    # Vector figures are often composed of many small path rectangles. Union
+    # only the drawing objects that touch the local probe.
+    drawing_rects: list[pymupdf.Rect] = []
+    try:
+        for drawing in page.get_drawings():
+            drect = drawing.get("rect")
+            if drect is None:
+                continue
+            candidate = pymupdf.Rect(drect) & page.rect
+            if candidate.width <= 0 or candidate.height <= 0:
+                continue
+            if _rect_intersection_area(candidate, probe) > 0:
+                drawing_rects.append(candidate)
+    except Exception:
+        drawing_rects = []
+
+    union = _rect_union(drawing_rects)
+    if union is not None:
+        area_fraction = (union.width * union.height) / page_area
+        if union.width >= 8 and union.height >= 8 and area_fraction <= 0.65:
+            # Small padding prevents clipping strokes exactly on the bbox edge.
+            padded = pymupdf.Rect(
+                union.x0 - 3,
+                union.y0 - 3,
+                union.x1 + 3,
+                union.y1 + 3,
+            ) & page.rect
+            return padded
+
+    return None
+
+
+def _safe_raster_figure_fallback(
+    page: pymupdf.Page,
+    rect: pymupdf.Rect,
+    assets_dir: Path,
+    index: int,
+) -> Path:
+    pix = page.get_pixmap(
+        matrix=pymupdf.Matrix(2.0, 2.0),
+        clip=rect,
+        alpha=False,
+    )
+    out = assets_dir / f"figure_{index:04d}_safe_fallback.png"
+    pix.save(out)
+    return out
 
 
 def _classify_figure_source(
@@ -1020,43 +1149,71 @@ def _extract_figure_asset(
     bbox_norm: list[float],
     assets_dir: Path,
     index: int,
-) -> tuple[Path, str]:
+) -> tuple[Path | None, str]:
+    """Extract a figure without ever letting a malformed Vision bbox kill the PDF."""
+    check_cancel()
     page = doc[page_index]
     rect = _normalized_bbox_to_rect(page, bbox_norm)
+    original_rect = pymupdf.Rect(rect)
 
-    if rect.width < 4 or rect.height < 4:
-        raise RuntimeError(
-            f"Vision agent produced an invalid figure bbox: {bbox_norm}"
-        )
+    # Reversed coordinates are normalized automatically. A remaining very thin
+    # rectangle is treated as an unreliable visual hint and repaired from the
+    # actual PDF object geometry.
+    if rect.width < 8 or rect.height < 8:
+        repaired = _recover_figure_rect_from_pdf_objects(doc, page, rect)
+        if repaired is not None:
+            print(
+                f"Figure asset {index}: repaired malformed bbox {bbox_norm} "
+                f"from source PDF object geometry.",
+                flush=True,
+            )
+            rect = repaired
+        else:
+            print(
+                f"Warning: figure {index} has an unusable bbox {bbox_norm} and "
+                "no trustworthy source-PDF visual object could be matched; "
+                "skipping this figure instead of failing the document.",
+                flush=True,
+            )
+            return None, "skipped"
 
-    source_type, candidate = _classify_figure_source(doc, page, rect)
+    try:
+        source_type, candidate = _classify_figure_source(doc, page, rect)
 
-    if source_type == "raster" and candidate is not None:
-        asset = _save_raster_asset(
-            page,
-            rect,
-            candidate,
-            assets_dir,
-            index,
-        )
+        if source_type == "raster" and candidate is not None:
+            asset = _save_raster_asset(page, rect, candidate, assets_dir, index)
+            print(
+                f"Figure asset {index}: bitmap source preserved as {asset.name}",
+                flush=True,
+            )
+            return asset, "raster"
+
+        asset = _save_vector_asset(doc, page_index, rect, assets_dir, index)
         print(
-            f"Figure asset {index}: bitmap source preserved as {asset.name}",
+            f"Figure asset {index}: vector/mixed source preserved as {asset.name}",
             flush=True,
         )
-        return asset, "raster"
+        return asset, "vector_or_mixed"
 
-    asset = _save_vector_asset(
-        doc,
-        page_index,
-        rect,
-        assets_dir,
-        index,
-    )
-    print(
-        f"Figure asset {index}: vector/mixed source preserved as {asset.name}",
-        flush=True,
-    )
-    return asset, "vector_or_mixed"
+    except Exception as exc:
+        # If native preservation itself fails but the repaired rectangle is
+        # trustworthy, retain the visual as a raster crop rather than aborting.
+        try:
+            if rect.width >= 8 and rect.height >= 8:
+                asset = _safe_raster_figure_fallback(page, rect, assets_dir, index)
+                print(
+                    f"Warning: native figure extraction failed ({exc}); "
+                    f"using safe raster fallback {asset.name}.",
+                    flush=True,
+                )
+                return asset, "safe_raster_fallback"
+        except Exception as fallback_exc:
+            print(
+                f"Warning: figure {index} extraction and fallback both failed: "
+                f"{fallback_exc}; figure skipped.",
+                flush=True,
+            )
+        return None, "skipped"
 
 
 def _page_batches(page_count: int, pages_per_call: int) -> list[list[int]]:
@@ -1118,6 +1275,7 @@ def _restore_figure_assets(
             if block.get("kind") != "figure":
                 continue
             page_index = int(block.get("page", 0))
+            check_cancel()
             asset_path, asset_type = _extract_figure_asset(
                 doc,
                 page_index,
@@ -1125,9 +1283,16 @@ def _restore_figure_assets(
                 assets_dir,
                 asset_index,
             )
+            if asset_path is None:
+                block["_drop_unrecoverable_figure"] = True
+                continue
             block["asset"] = asset_path
             block["asset_type"] = asset_type
             asset_index += 1
+        blocks[:] = [
+            block for block in blocks
+            if not block.get("_drop_unrecoverable_figure")
+        ]
     finally:
         doc.close()
 
@@ -1400,7 +1565,9 @@ def reconstruct_document(
     doc = pymupdf.open(pdf_path)
     try:
         for pno in range(source_pages):
+            check_cancel()
             for local_index, original_block in enumerate(page_results[pno]):
+                check_cancel()
                 block = dict(original_block)
                 block_id = f"p{pno}_b{local_index}"
                 block["id"] = block_id
@@ -1410,6 +1577,7 @@ def reconstruct_document(
                 )
 
                 if block["kind"] == "figure":
+                    check_cancel()
                     asset_path, asset_type = _extract_figure_asset(
                         doc,
                         pno,
@@ -1417,6 +1585,8 @@ def reconstruct_document(
                         assets_dir,
                         asset_index,
                     )
+                    if asset_path is None:
+                        continue
                     block["asset"] = asset_path
                     block["asset_type"] = asset_type
                     asset_index += 1
@@ -2780,6 +2950,7 @@ def process_pdf(
     checkpoint_callback: Callable[[dict], None] | None = None,
 ) -> dict:
     started = time.perf_counter()
+    check_cancel()
     work_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_state = checkpoint_state if checkpoint_state is not None else {}
 
@@ -2790,6 +2961,7 @@ def process_pdf(
         src_doc.close()
 
     phase = time.perf_counter()
+    check_cancel()
     style, strategy, blocks, translation_items = reconstruct_document(
         pdf_path,
         target_language,
@@ -2846,6 +3018,7 @@ def process_pdf(
                 math_preflight_complete=False,
             )
 
+        check_cancel()
         preflight_math_blocks(
             blocks,
             work_dir,
@@ -2913,6 +3086,7 @@ def process_pdf(
             progress_callback(90, "이전에 완료한 본문 번역을 불러왔습니다.")
         print("Checkpoint resume: translation phase skipped.", flush=True)
     else:
+        check_cancel()
         translations = translate_blocks(
             translation_items,
             target_language,
@@ -2952,6 +3126,7 @@ def process_pdf(
         progress_callback(91, "번역 완료 · 문서를 조립하고 있습니다.")
 
     phase = time.perf_counter()
+    check_cancel()
     tex_source = build_latex(
         style,
         blocks,

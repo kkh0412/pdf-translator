@@ -34,7 +34,7 @@ drop constraint if exists translation_jobs_status_check;
 
 alter table public.translation_jobs
 add constraint translation_jobs_status_check
-check (status in ('uploading','queued','processing','done','failed'));
+check (status in ('uploading','queued','processing','paused','done','failed'));
 
 revoke all on table public.translation_jobs from anon, authenticated;
 grant select, insert on table public.translation_jobs to authenticated;
@@ -131,6 +131,18 @@ add column if not exists checkpoint_updated_at timestamptz;
 alter table public.translation_jobs
 add column if not exists resume_count integer not null default 0;
 
+-- Browser heartbeat. A worker stops after the browser/client has not checked in
+-- for the configured timeout, preserving its checkpoint instead of spending API
+-- quota after the user has disconnected.
+alter table public.translation_jobs
+add column if not exists client_heartbeat_at timestamptz not null default now();
+
+alter table public.translation_jobs
+add column if not exists client_active boolean not null default true;
+
+alter table public.translation_jobs
+add column if not exists paused_at timestamptz;
+
 insert into storage.buckets
   (id, name, public, file_size_limit, allowed_mime_types)
 values
@@ -156,13 +168,30 @@ declare
   github_token text;
   request_id bigint;
   current_status text;
+  current_client_active boolean;
+  current_heartbeat timestamptz;
 begin
-  select status
-  into current_status
+  select status, client_active, client_heartbeat_at
+  into current_status, current_client_active, current_heartbeat
   from public.translation_jobs
   where id = p_job_id;
 
   if current_status is distinct from 'queued' then
+    return null;
+  end if;
+
+  if current_client_active is false
+     or current_heartbeat is null
+     or current_heartbeat < now() - interval '45 seconds' then
+    update public.translation_jobs
+    set
+      status = 'paused',
+      paused_at = now(),
+      client_active = false,
+      progress_message =
+        '브라우저 연결이 끊어져 작업을 잠시 멈췄습니다. 다시 접속하면 저장된 지점부터 이어서 진행합니다.',
+      progress_updated_at = now()
+    where id = p_job_id;
     return null;
   end if;
 
@@ -241,6 +270,81 @@ $$;
 
 revoke all on function public.dispatch_pdf_translation_worker(uuid, text)
 from public;
+
+-- Authenticated browser heartbeat / resume signal. The browser cannot update
+-- arbitrary job fields directly; this narrowly scoped SECURITY DEFINER RPC
+-- verifies ownership first.
+create or replace function public.pdf_translation_client_signal(
+  p_job_id uuid,
+  p_action text default 'heartbeat'
+)
+returns text
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  current_user uuid;
+  current_owner uuid;
+  current_status text;
+  normalized_action text;
+begin
+  current_user := auth.uid();
+  if current_user is null then
+    raise exception 'authentication required';
+  end if;
+
+  normalized_action := lower(coalesce(p_action, 'heartbeat'));
+
+  select user_id, status
+  into current_owner, current_status
+  from public.translation_jobs
+  where id = p_job_id;
+
+  if current_owner is null or current_owner <> current_user then
+    raise exception 'job not found';
+  end if;
+
+  if normalized_action in ('heartbeat', 'resume') then
+    update public.translation_jobs
+    set
+      client_heartbeat_at = now(),
+      client_active = true
+    where id = p_job_id;
+
+    if current_status = 'paused' then
+      update public.translation_jobs
+      set
+        status = 'queued',
+        paused_at = null,
+        started_at = null,
+        finished_at = null,
+        error = null,
+        progress_message = '연결이 복구되어 저장된 진행 지점부터 이어서 진행합니다.',
+        progress_updated_at = now(),
+        dispatch_last_at = null
+      where id = p_job_id;
+
+      perform public.dispatch_pdf_translation_worker(p_job_id, 'client-resume');
+      return 'queued';
+    end if;
+
+    return current_status;
+  end if;
+
+  if normalized_action = 'disconnect' then
+    update public.translation_jobs
+    set client_active = false
+    where id = p_job_id;
+    return current_status;
+  end if;
+
+  raise exception 'unsupported client signal';
+end;
+$$;
+
+revoke all on function public.pdf_translation_client_signal(uuid, text) from public;
+grant execute on function public.pdf_translation_client_signal(uuid, text) to authenticated;
 
 -- AFTER INSERT trigger wrapper.
 create or replace function public.dispatch_pdf_translation_worker_after_insert()
@@ -339,6 +443,8 @@ begin
     from public.translation_jobs
     where
       status = 'queued'
+      and client_active = true
+      and client_heartbeat_at >= now() - interval '45 seconds'
       and created_at < now() - interval '20 seconds'
       and dispatch_attempts < 8
       and (
@@ -410,6 +516,6 @@ begin
   end if;
 
   raise notice
-    'PDF Translator: immediate trigger + Supabase recovery cron installed.';
+    'PDF Translator: immediate trigger + recovery cron + client heartbeat installed.';
 end
 $$;

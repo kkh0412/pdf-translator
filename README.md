@@ -1,4 +1,21 @@
-# 대관령산양의 번역기 v8.3
+# 대관령산양의 번역기 v8.4
+
+## Resilient figure extraction
+- Vision bbox 좌표는 먼저 정렬/클램프하므로 x0>x1, y0>y1이 문서를 중단시키지 않습니다.
+- 너무 얇은 bbox는 원본 PDF의 실제 embedded image/vector drawing geometry로 복구합니다.
+- native vector/raster 보존이 실패하면 해당 영역만 안전한 raster crop으로 fallback합니다.
+- 신뢰할 수 있는 visual object를 전혀 찾지 못하면 그 figure 하나만 건너뛰고 전체 번역은 계속합니다.
+- hybrid PDF-text 복구 뒤 중복 prose block도 제거해 100%를 크게 넘는 coverage/중복 삽입을 줄였습니다.
+
+## Browser heartbeat / worker stop
+- 번역 중 브라우저는 8초마다 소유 job에 heartbeat RPC를 보냅니다.
+- worker는 별도 thread에서 heartbeat를 감시합니다. 기본 45초 동안 heartbeat가 없으면 현재 checkpoint를 저장하고 status=paused로 바꾼 뒤 GitHub worker 프로세스를 정상 종료합니다.
+- paused job은 recovery cron이 자동으로 다시 실행하지 않습니다.
+- 같은 브라우저가 다시 접속하면 localStorage의 job id를 복구하고 heartbeat/resume RPC가 status를 queued로 바꿔 저장된 checkpoint부터 새 worker를 실행합니다.
+- Gemini rate-limit 대기, Vision/translation API 호출, math preflight에도 cooperative cancellation check를 추가했습니다.
+
+## Required database update
+이 버전의 heartbeat/resume 기능을 사용하려면 최신 `supabase/UPDATE_EXISTING_SUPABASE.sql`을 한 번 실행해야 합니다.
 
 ## Hybrid PDF reconstruction safety architecture
 

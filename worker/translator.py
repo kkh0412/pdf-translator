@@ -12,11 +12,13 @@ import urllib.request
 from typing import Callable, Iterable
 
 from .gemini_rate import (
+    check_cancel,
     daily_quota_exhausted,
     impose_cooldown,
     is_daily_quota_error,
     mark_daily_quota_exhausted,
     retry_delay_from_text,
+    run_cancellable_io,
     wait_for_slot,
 )
 
@@ -233,11 +235,18 @@ def _call(api_key: str, model: str, prompt: str, count: int) -> dict:
             "x-goog-api-key": api_key,
         },
     )
+    check_cancel()
     wait_for_slot(model)
+    check_cancel()
 
     try:
-        with urllib.request.urlopen(req, timeout=150) as response:
-            return json.loads(response.read().decode("utf-8"))
+        def perform_request():
+            with urllib.request.urlopen(req, timeout=150) as response:
+                return json.loads(response.read().decode("utf-8"))
+
+        payload = run_cancellable_io(perform_request)
+        check_cancel()
+        return payload
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         retry_after = None
@@ -673,6 +682,7 @@ def translate_blocks(
     result: dict[str, str] = {}
 
     for key, value in initial.items():
+        check_cancel()
         item = item_by_id.get(key)
         if item is None or not isinstance(value, str) or not value.strip():
             continue
@@ -730,6 +740,7 @@ def translate_blocks(
 
     def run_one(index: int, batch: list[dict]) -> list[str]:
         nonlocal started_batches
+        check_cancel()
         with lock:
             started_batches += 1
             start_number = started_batches

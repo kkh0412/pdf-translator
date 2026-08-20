@@ -33,6 +33,9 @@ let elapsedStartedAt = null;
 let elapsedTimer = null;
 let activeStatusMessage = '';
 let showElapsedTime = false;
+let heartbeatTimer = null;
+let activeJobId = null;
+const ACTIVE_JOB_KEY = 'daegwallyeong-translator-active-job';
 
 function friendlyProgressMessage(job, fallback) {
   const raw = String(job?.progress_message || '').trim();
@@ -162,15 +165,108 @@ async function ensureAnonymousSession() {
   return signed.session;
 }
 
-async function poll(jobId) {
-  while (true) {
-    const { data: job, error } = await supabaseClient
-      .from('translation_jobs')
-      .select('*')
-      .eq('id', jobId)
-      .single();
 
-    if (error) throw new Error(`작업 상태 확인 실패: ${error.message}`);
+async function signalClient(jobId, action = 'heartbeat') {
+  if (!supabaseClient || !jobId) return null;
+  const { data, error } = await supabaseClient.rpc(
+    'pdf_translation_client_signal',
+    { p_job_id: jobId, p_action: action }
+  );
+  if (error) throw error;
+  return data;
+}
+
+function stopHeartbeat() {
+  if (heartbeatTimer !== null) {
+    window.clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+}
+
+function startHeartbeat(jobId) {
+  activeJobId = jobId;
+  stopHeartbeat();
+
+  const beat = async () => {
+    try {
+      await signalClient(jobId, 'heartbeat');
+    } catch (_error) {
+      // A lost connection intentionally produces no heartbeat. The worker
+      // notices the stale timestamp and checkpoints/stops itself.
+    }
+  };
+
+  beat();
+  heartbeatTimer = window.setInterval(beat, 8000);
+}
+
+function rememberActiveJob(jobId) {
+  activeJobId = jobId;
+  window.localStorage.setItem(ACTIVE_JOB_KEY, jobId);
+}
+
+function forgetActiveJob() {
+  stopHeartbeat();
+  activeJobId = null;
+  window.localStorage.removeItem(ACTIVE_JOB_KEY);
+}
+
+async function restoreActiveJob() {
+  const jobId = window.localStorage.getItem(ACTIVE_JOB_KEY);
+  if (!jobId || !supabaseClient) return;
+
+  const { data: job, error } = await supabaseClient
+    .from('translation_jobs')
+    .select('*')
+    .eq('id', jobId)
+    .maybeSingle();
+
+  if (error || !job || ['done', 'failed'].includes(job.status)) {
+    forgetActiveJob();
+    return;
+  }
+
+  currentJob = job;
+  spinner.classList.remove('hidden');
+  statusBox.classList.remove('hidden');
+  resultBox.classList.add('hidden');
+  errorBox.classList.add('hidden');
+  submitBtn.disabled = true;
+  elapsedStartedAt = Date.now();
+  startHeartbeat(jobId);
+
+  poll(jobId).catch((pollError) => {
+    setStatusMessage(
+      '연결 상태를 확인하고 있습니다. 연결이 복구되면 저장된 지점부터 이어서 진행합니다.',
+      true
+    );
+    console.warn(pollError);
+  });
+}
+
+async function poll(jobId) {
+  startHeartbeat(jobId);
+  rememberActiveJob(jobId);
+
+  while (true) {
+    let job = null;
+    try {
+      const response = await supabaseClient
+        .from('translation_jobs')
+        .select('*')
+        .eq('id', jobId)
+        .single();
+
+      if (response.error) throw response.error;
+      job = response.data;
+    } catch (_error) {
+      setStatusMessage(
+        '연결 상태를 확인하고 있습니다. 연결이 복구되면 저장된 지점부터 이어서 진행합니다.',
+        true
+      );
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      continue;
+    }
 
     currentJob = job;
 
@@ -235,6 +331,18 @@ async function poll(jobId) {
           true
         );
       }
+    } else if (job.status === 'paused') {
+      statusTitle.textContent = '번역 일시정지';
+      updateProgress(
+        job.progress ?? 4,
+        '연결이 복구되었습니다. 저장된 진행 지점부터 번역을 다시 시작하고 있습니다.',
+        true
+      );
+      try {
+        await signalClient(jobId, 'resume');
+      } catch (_error) {
+        // Stay paused until the connection is usable again.
+      }
     } else if (job.status === 'done') {
       updateProgress(100, '번역이 완료되었습니다.');
       stopLocalElapsedClock();
@@ -243,8 +351,10 @@ async function poll(jobId) {
       resultBox.classList.remove('hidden');
       resultMeta.textContent = `${job.pages ?? '?'}페이지 · ${job.translated_segments ?? '?'}개 텍스트 영역 처리`;
       submitBtn.disabled = false;
+      forgetActiveJob();
       return job;
     } else if (job.status === 'failed') {
+      forgetActiveJob();
       throw new Error(job.error || '번역에 실패했습니다.');
     }
 
@@ -353,12 +463,16 @@ form.addEventListener('submit', async (event) => {
         original_name: file.name,
         target_language: targetLanguage,
         original_path: originalPath,
+        client_heartbeat_at: new Date().toISOString(),
+        client_active: true,
       });
 
     if (insertError) {
       throw new Error(`작업 생성 실패: ${insertError.message}`);
     }
 
+    rememberActiveJob(jobId);
+    startHeartbeat(jobId);
     queuedStartedAt = Date.now();
     elapsedStartedAt = queuedStartedAt;
     statusTitle.textContent = '번역 준비 중';
@@ -399,9 +513,15 @@ function initializeSupabase() {
     }
   );
 
-  ensureAnonymousSession().catch((error) => {
-    showError(error.message || String(error));
-  });
+  ensureAnonymousSession()
+    .then(() => restoreActiveJob())
+    .catch((error) => {
+      showError(error.message || String(error));
+    });
 }
+
+window.addEventListener('online', () => {
+  if (activeJobId) startHeartbeat(activeJobId);
+});
 
 initializeSupabase();

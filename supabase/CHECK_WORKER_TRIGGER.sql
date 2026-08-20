@@ -82,3 +82,15 @@ from pg_stat_activity
 where
   backend_type ilike '%pg_net%'
   or application_name ilike '%pg_cron%';
+
+
+-- v8.4 heartbeat diagnostics
+select
+  id, status, progress, checkpoint_stage,
+  client_active, client_heartbeat_at, paused_at,
+  now() - client_heartbeat_at as heartbeat_age
+from public.translation_jobs
+order by created_at desc
+limit 10;
+
+select to_regprocedure('public.pdf_translation_client_signal(uuid,text)') as client_signal_rpc;

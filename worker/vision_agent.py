@@ -5,6 +5,7 @@ import json
 import os
 import re
 import statistics
+import difflib
 import time
 import urllib.error
 import urllib.request
@@ -13,11 +14,13 @@ from pathlib import Path
 import pymupdf
 
 from .gemini_rate import (
+    check_cancel,
     daily_quota_exhausted,
     impose_cooldown,
     is_daily_quota_error,
     mark_daily_quota_exhausted,
     retry_delay_from_text,
+    run_cancellable_io,
     wait_for_slot,
 )
 
@@ -127,6 +130,7 @@ def _call_json(
     last_error: Exception | None = None
 
     for model in _model_candidates():
+        check_cancel()
         if daily_quota_exhausted(model):
             print(
                 f"Vision model {model} skipped: daily quota already exhausted.",
@@ -138,6 +142,7 @@ def _call_json(
 
         for format_mode in ("enum_response_format", "legacy_json_schema"):
             for attempt in range(2):
+                check_cancel()
                 parts = [{"text": prompt}]
                 for image_bytes, mime in images:
                     parts.append(
@@ -174,8 +179,14 @@ def _call_json(
                         flush=True,
                     )
                     wait_for_slot(model)
-                    with urllib.request.urlopen(request, timeout=180) as response:
-                        payload = json.loads(response.read().decode("utf-8"))
+                    check_cancel()
+
+                    def perform_request():
+                        with urllib.request.urlopen(request, timeout=180) as response:
+                            return json.loads(response.read().decode("utf-8"))
+
+                    payload = run_cancellable_io(perform_request)
+                    check_cancel()
                     return json.loads(_response_text(payload))
 
                 except urllib.error.HTTPError as exc:
@@ -229,6 +240,7 @@ def _call_json(
                     if exc.code in {500, 502, 503, 504}:
                         if attempt == 0:
                             time.sleep(2)
+                            check_cancel()
                             continue
                         break
 
@@ -238,6 +250,7 @@ def _call_json(
                     last_error = exc
                     if attempt == 0:
                         time.sleep(2)
+                        check_cancel()
                         continue
                     break
 
@@ -1624,6 +1637,79 @@ def _recover_missing_prose_from_source(
     return recovered
 
 
+
+def _normalized_prose_signature(block: dict) -> str:
+    if block.get("kind") in {"equation", "figure", "table"}:
+        return ""
+    text = "".join(
+        str(part.get("content", ""))
+        for part in (block.get("parts") or [])
+        if part.get("type") == "text"
+    )
+    text = " ".join(text.casefold().split())
+    return re.sub(r"[^\w\s]", "", text, flags=re.UNICODE).strip()
+
+
+def _deduplicate_hybrid_prose(blocks: list[dict], page_number: int) -> int:
+    """Remove duplicate prose introduced when Vision and text-layer recovery overlap."""
+    kept: list[dict] = []
+    removed = 0
+
+    for block in blocks:
+        sig = _normalized_prose_signature(block)
+        if len(sig) < 18:
+            kept.append(block)
+            continue
+
+        duplicate_index = None
+        for index, existing in enumerate(kept):
+            other = _normalized_prose_signature(existing)
+            if len(other) < 18:
+                continue
+
+            exact = sig == other
+            similar = False
+            if not exact:
+                bb = block.get("bbox", [])
+                eb = existing.get("bbox", [])
+                overlap = _bbox_intersection_area(bb, eb)
+                overlap_fraction = overlap / max(1.0, min(_bbox_area(bb), _bbox_area(eb)))
+                if overlap_fraction >= 0.28:
+                    ratio = difflib.SequenceMatcher(None, sig, other).ratio()
+                    containment = (
+                        min(len(sig), len(other)) >= 30
+                        and (sig in other or other in sig)
+                    )
+                    similar = ratio >= 0.92 or containment
+
+            if exact or similar:
+                duplicate_index = index
+                break
+
+        if duplicate_index is None:
+            kept.append(block)
+            continue
+
+        existing = kept[duplicate_index]
+        # Prefer a source-anchored block, otherwise the longer text block.
+        block_source = bool(block.get("source_text_recovered") or block.get("source_text_fallback"))
+        existing_source = bool(existing.get("source_text_recovered") or existing.get("source_text_fallback"))
+        if block_source and not existing_source:
+            kept[duplicate_index] = block
+        elif block_source == existing_source and len(sig) > len(_normalized_prose_signature(existing)):
+            kept[duplicate_index] = block
+        removed += 1
+
+    if removed:
+        blocks[:] = kept
+        print(
+            f"Vision page {page_number}: removed {removed} duplicate prose block(s) "
+            "after hybrid text-layer recovery.",
+            flush=True,
+        )
+    return removed
+
+
 def _math_transport_problem(math: str) -> str | None:
     decoded = _decode_math_transport(str(math or "")).strip()
     if not decoded:
@@ -1726,6 +1812,7 @@ def _stabilize_blocks_from_source(
     _repair_prose_glyphs_from_source(blocks, hints)
     _anchor_plain_prose_to_source(blocks, hints, page_number)
     _recover_missing_prose_from_source(blocks, hints, page_number, local_hint)
+    _deduplicate_hybrid_prose(blocks, page_number)
     _apply_source_paragraph_indent(blocks, hints)
     _apply_source_font_weight(blocks, hints)
 
@@ -1908,11 +1995,13 @@ def parse_pages(
     if not page_indices:
         return {}
 
+    check_cancel()
     doc = pymupdf.open(pdf_path)
     try:
         page_payloads = []
         images = []
         for page_index in page_indices:
+            check_cancel()
             page = doc[page_index]
             hints = _page_hints(page)
             page_payloads.append(
@@ -2050,6 +2139,7 @@ def parse_pages(
 
     last_error: Exception | None = None
     for retry in range(2):
+        check_cancel()
         try:
             response = _call_json(
                 prompt

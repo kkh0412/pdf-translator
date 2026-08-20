@@ -2,14 +2,59 @@ from __future__ import annotations
 
 import os
 import re
+import queue
 import threading
 import time
+from collections.abc import Callable
 
 
 _lock = threading.Lock()
 _last_started: dict[str, float] = {}
 _cooldown_until: dict[str, float] = {}
 _daily_exhausted_models: set[str] = set()
+_cancel_check: Callable[[], None] | None = None
+
+
+def set_cancel_check(callback: Callable[[], None] | None) -> None:
+    global _cancel_check
+    with _lock:
+        _cancel_check = callback
+
+
+def check_cancel() -> None:
+    with _lock:
+        callback = _cancel_check
+    if callback is not None:
+        callback()
+
+
+def run_cancellable_io(callback: Callable[[], object], poll_seconds: float = 0.5):
+    """Run blocking network I/O in a daemon thread while honoring cancellation.
+
+    If the browser heartbeat expires, the main worker can unwind immediately
+    instead of waiting for a long Gemini socket timeout. The daemon I/O thread
+    is terminated when the worker process exits.
+    """
+    result_queue: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
+
+    def runner() -> None:
+        try:
+            result_queue.put((True, callback()))
+        except BaseException as exc:
+            result_queue.put((False, exc))
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+
+    while True:
+        check_cancel()
+        try:
+            ok, value = result_queue.get(timeout=max(0.1, poll_seconds))
+        except queue.Empty:
+            continue
+        if ok:
+            return value
+        raise value  # type: ignore[misc]
 
 
 def _safe_rpm() -> float:
@@ -82,10 +127,11 @@ def impose_cooldown(model: str, seconds: float) -> None:
 
 
 def wait_for_slot(model: str) -> None:
-    """Space request starts across local Vision/translation worker threads."""
+    """Space request starts while remaining responsive to worker cancellation."""
     interval = 60.0 / _safe_rpm()
 
     while True:
+        check_cancel()
         with _lock:
             now = time.monotonic()
             earliest = max(
@@ -97,4 +143,5 @@ def wait_for_slot(model: str) -> None:
                 _last_started[model] = now
                 return
 
-        time.sleep(min(remaining, 1.0))
+        time.sleep(min(remaining, 0.5))
+        check_cancel()

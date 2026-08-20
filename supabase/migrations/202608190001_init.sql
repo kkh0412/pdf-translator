@@ -410,3 +410,9 @@ begin
     'PDF Translator: immediate trigger + Supabase recovery cron installed.';
 end
 $$;
+
+
+-- v8.4 browser heartbeat columns (UPDATE_EXISTING_SUPABASE.sql installs the RPC/dispatch logic).
+alter table public.translation_jobs add column if not exists client_heartbeat_at timestamptz not null default now();
+alter table public.translation_jobs add column if not exists client_active boolean not null default true;
+alter table public.translation_jobs add column if not exists paused_at timestamptz;
