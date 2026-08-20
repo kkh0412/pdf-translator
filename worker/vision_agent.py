@@ -323,6 +323,26 @@ def _page_hints(page: pymupdf.Page) -> list[dict]:
             fonts[font] = fonts.get(font, 0) + max(1, len(span.get("text", "")))
             sizes.append(float(span.get("size", 10.0)))
 
+        text_lines = [
+            line
+            for line in block.get("lines", [])
+            if any(span.get("text", "").strip() for span in line.get("spans", []))
+        ]
+        line_x0s = [float(line.get("bbox", [x0, 0, 0, 0])[0]) for line in text_lines]
+
+        paragraph_indent = "unknown"
+        first_line_indent_em = None
+        if len(line_x0s) >= 2:
+            comparison = line_x0s[1:min(len(line_x0s), 6)]
+            baseline_x0 = statistics.median(comparison)
+            typical_size = statistics.median(sizes) if sizes else 10.0
+            delta_em = (line_x0s[0] - baseline_x0) / max(1.0, typical_size)
+            first_line_indent_em = round(delta_em, 3)
+            if delta_em >= 0.32:
+                paragraph_indent = "yes"
+            elif delta_em <= 0.16:
+                paragraph_indent = "no"
+
         weighted_chars = sum(
             max(1, len(span.get("text", "")))
             for span in spans
@@ -352,6 +372,8 @@ def _page_hints(page: pymupdf.Page) -> list[dict]:
                 "font_size": round(statistics.median(sizes), 2) if sizes else 10.0,
                 "bold_ratio": round(bold_chars / max(1, weighted_chars), 3),
                 "italic_ratio": round(italic_chars / max(1, weighted_chars), 3),
+                "paragraph_indent": paragraph_indent,
+                "first_line_indent_em": first_line_indent_em,
             }
         )
 
@@ -1209,6 +1231,57 @@ def _repair_prose_glyphs_from_source(
             part["content"] = repaired
 
 
+
+def _apply_source_paragraph_indent(blocks: list[dict], hints: list[dict]) -> None:
+    """Apply first-line indentation from source-PDF line geometry."""
+    for block in blocks:
+        if block.get("kind") != "paragraph":
+            continue
+        bbox = block.get("bbox") or []
+        if len(bbox) != 4:
+            continue
+        block_area = max(1.0, (float(bbox[2])-float(bbox[0]))*(float(bbox[3])-float(bbox[1])))
+        best = None
+        for hint in hints:
+            decision = hint.get("paragraph_indent")
+            hb = hint.get("bbox", [])
+            if decision not in {"yes","no"} or len(hb) != 4:
+                continue
+            area = _bbox_intersection_area(bbox, hb)
+            if area <= 0:
+                continue
+            hint_area = max(1.0, (float(hb[2])-float(hb[0]))*(float(hb[3])-float(hb[1])))
+            score = area/block_area + area/hint_area
+            if best is None or score > best[0]:
+                best=(score,hint)
+        if best is None:
+            continue
+        hint=best[1]
+        if hint["paragraph_indent"] == "yes":
+            try: measured=float(hint.get("first_line_indent_em"))
+            except (TypeError,ValueError): measured=1.0
+            block["paragraph_indent_em"] = round(max(0.45,min(1.8,measured)),2)
+        else:
+            block["paragraph_indent_em"] = 0.0
+        block["paragraph_indent_source"] = "pdf_geometry"
+
+
+def apply_source_paragraph_indentation(pdf_path: Path, blocks: list[dict]) -> None:
+    """Refresh paragraph indentation without another Gemini request."""
+    by_page: dict[int,list[dict]] = {}
+    for block in blocks:
+        try: page_index=int(block.get("page",-1))
+        except (TypeError,ValueError): continue
+        if page_index >= 0: by_page.setdefault(page_index,[]).append(block)
+    if not by_page: return
+    doc=pymupdf.open(pdf_path)
+    try:
+        for page_index,page_blocks in by_page.items():
+            if page_index < doc.page_count:
+                _apply_source_paragraph_indent(page_blocks,_page_hints(doc[page_index]))
+    finally:
+        doc.close()
+
 def _apply_source_font_weight(
     blocks: list[dict],
     hints: list[dict],
@@ -1386,6 +1459,7 @@ def _validate_blocks(
             raise GeminiVisionError(f"Page {page_number}: invalid bbox")
 
     _repair_prose_glyphs_from_source(blocks, hints)
+    _apply_source_paragraph_indent(blocks, hints)
     _apply_source_font_weight(blocks, hints)
 
     if src_letters >= 500 and out_letters < src_letters * 0.46:
@@ -1480,8 +1554,11 @@ def parse_pages(
         "2. Every inline mathematical expression MUST be its own part with type=math and VALID LaTeX "
         "under this § transport convention. Never place §rho, §gamma, §Pi_y, §mathcal{M}, "
         "C_{§mathcal M}, D(§rho§Vert§gamma), or any other LaTeX transport syntax inside "
-        "a type=text part. Split surrounding prose into text/math/text parts. "
-        "without $ delimiters. Natural prose must remain type=text. "
+        "a type=text part. Split surrounding prose into text/math/text parts, BUT keep those "
+        "text/math/text parts inside the SAME paragraph block whenever the formula is inline in "
+        "one sentence. Never create a separate equation block merely because inline mathematics "
+        "has small visual spacing around it. Use kind=equation only for genuinely standalone/display "
+        "mathematics. Use no $ delimiters. Natural prose must remain type=text. "
         "IMPORTANT: § is reserved ONLY as a LaTeX-backslash transport character inside math fields. "
         "Never use § as a substitute for a real Unicode prose letter. Preserve names exactly from "
         "the page/text hints: for example `Šafránek` must stay `Šafránek`, never `§afránek`.\n"

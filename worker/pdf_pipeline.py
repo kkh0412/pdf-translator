@@ -19,6 +19,7 @@ from .vision_agent import (
     _decode_math_transport,
     repair_math_formula,
     analyze_document,
+    apply_source_paragraph_indentation,
     parse_pages,
 )
 
@@ -1146,6 +1147,44 @@ def _checkpoint_emit(
         checkpoint_callback(checkpoint_state)
 
 
+
+_SENTENCE_END_CHARS = ".!?。！？"
+
+def _ends_complete_sentence(text: str) -> bool:
+    text=str(text or "").rstrip()
+    return bool(text) and text[-1] in _SENTENCE_END_CHARS
+
+def _context_text_for_block(block: dict | None) -> str:
+    if not block: return ""
+    if block.get("kind") == "equation":
+        latex=_clean_math(block.get("equation_latex", ""))
+        return "[DISPLAY EQUATION: " + latex[:260] + "]" if latex else "[DISPLAY EQUATION]"
+    return str(block.get("source_text", "") or "").strip()
+
+def _annotate_translation_context(blocks: list[dict], translation_items: list[dict]) -> None:
+    """Attach read-only neighboring context for cross-equation continuity."""
+    index_by_id={str(b.get("id")):i for i,b in enumerate(blocks) if b.get("id")}
+    for item in translation_items:
+        index=index_by_id.get(str(item.get("id", "")))
+        if index is None:
+            item.update(previous_context="",next_context="",continues_from_previous=False,continues_to_next=False)
+            continue
+        page=blocks[index].get("page"); current=str(item.get("text", "") or "")
+        prev=None
+        for cand in reversed(blocks[:index]):
+            if cand.get("page") != page: break
+            if cand.get("kind") in {"footer","figure","table"}: continue
+            if _context_text_for_block(cand): prev=cand; break
+        nxt=None
+        for cand in blocks[index+1:]:
+            if cand.get("page") != page: break
+            if cand.get("kind") in {"footer","figure","table"}: continue
+            if _context_text_for_block(cand): nxt=cand; break
+        pc=_context_text_for_block(prev)[-260:]; nc=_context_text_for_block(nxt)[:260]
+        item["previous_context"]=pc; item["next_context"]=nc
+        item["continues_from_previous"]=bool(prev and (prev.get("kind")=="equation" or not _ends_complete_sentence(pc)))
+        item["continues_to_next"]=bool(nxt and (nxt.get("kind")=="equation" or not _ends_complete_sentence(current)))
+
 def reconstruct_document(
     pdf_path: Path,
     target_language: str,
@@ -1183,6 +1222,9 @@ def reconstruct_document(
     ):
         blocks = copy.deepcopy(saved_blocks)
         _restore_figure_assets(pdf_path, blocks, work_dir)
+        apply_source_paragraph_indentation(pdf_path, blocks)
+        restored_items = copy.deepcopy(saved_items)
+        _annotate_translation_context(blocks, restored_items)
         if progress_callback:
             progress_callback(
                 55,
@@ -1197,7 +1239,7 @@ def reconstruct_document(
             copy.deepcopy(saved_style),
             copy.deepcopy(saved_strategy),
             blocks,
-            copy.deepcopy(saved_items),
+            restored_items,
         )
 
     print(
@@ -1429,6 +1471,9 @@ def reconstruct_document(
                     )
     finally:
         doc.close()
+
+    apply_source_paragraph_indentation(pdf_path, all_blocks)
+    _annotate_translation_context(all_blocks, translation_items)
 
     _checkpoint_emit(
         checkpoint_state,
@@ -1702,6 +1747,25 @@ def _align_math_lines(lines: list[str]) -> list[str]:
 
 
 
+
+def _math_visual_width_score(latex: str) -> int:
+    text=str(latex or "")
+    text=re.sub(r"\\(?:left|right|displaystyle|textstyle|scriptstyle|scriptscriptstyle)\b","",text)
+    text=re.sub(r"\\(?:mathcal|mathrm|mathbf|mathsf|mathtt|boldsymbol|operatorname|text)\b","",text)
+    text=re.sub(r"\\[A-Za-z]+","x",text)
+    text=re.sub(r"\\.","x",text)
+    text=re.sub(r"[{}]","",text)
+    text=re.sub(r"\s+"," ",text).strip()
+    return len(text)
+
+def _short_equation_should_stay_single(body: str, target: int) -> bool:
+    if not body or r"\begin{" in body or r"\\" in body: return False
+    return len(body) <= int(target*0.92) or _math_visual_width_score(body) <= int(target*0.60)
+
+def _remove_alignment_tabs_for_single_line(body: str) -> str:
+    if r"\begin{" in body: return body
+    return re.sub(r"(?<!\\)&\s*","",body).strip()
+
 def _semantic_equation_lines(body: str, target: int) -> list[str] | None:
     """Split common 'definition ... and definition ...' displays semantically."""
     # Typical paper form:
@@ -1757,7 +1821,11 @@ def _equation_tex(block: dict) -> str:
     else:
         target = 52
 
-    if supplied_lines:
+    keep_single = _short_equation_should_stay_single(body, target)
+
+    if keep_single:
+        lines = [_remove_alignment_tabs_for_single_line(body)]
+    elif supplied_lines:
         lines = supplied_lines
         # A vision-provided line can still be too wide. Subdivide only that line.
         refined: list[str] = []
@@ -2576,6 +2644,26 @@ def build_latex(
                 + text
                 + "}\\par\\vspace{0.32em}\n"
             )
+
+        elif kind == "paragraph":
+            measured_indent = block.get("paragraph_indent_em")
+            if measured_indent is None:
+                out.append(text + "\\par\n")
+            else:
+                try:
+                    indent_em = float(measured_indent)
+                except (TypeError, ValueError):
+                    indent_em = float(style.get("paragraph_indent_em", 1.0))
+                if indent_em <= 0.12:
+                    out.append("\\noindent " + text + "\\par\n")
+                else:
+                    out.append(
+                        "{\\setlength{\\parindent}{"
+                        + f"{indent_em:.2f}em"
+                        + "}\\indent "
+                        + text
+                        + "\\par}\n"
+                    )
 
         elif kind == "reference":
             out.append("\\noindent{\\small " + text + "}\\par\n")

@@ -297,6 +297,34 @@ def _strategy_prompt(strategy: dict) -> str:
     )
 
 
+
+_SENTENCE_TERMINATORS = ".!?。！？"
+
+def _nearest_nonspace_left(text: str, index: int) -> str:
+    i=index-1
+    while i>=0 and text[i].isspace(): i-=1
+    return text[i] if i>=0 else ""
+
+def _nearest_nonspace_right(text: str, index: int) -> str:
+    i=index
+    while i<len(text) and text[i].isspace(): i+=1
+    return text[i] if i<len(text) else ""
+
+def _validate_inline_math_continuity(source: str, translated: str) -> None:
+    """Reject a sentence boundary introduced solely beside embedded inline math."""
+    for match in PLACEHOLDER_RE.finditer(source):
+        token=match.group(0)
+        sl=_nearest_nonspace_left(source,match.start()); sr=_nearest_nonspace_right(source,match.end())
+        if not (sl and sr and sl not in _SENTENCE_TERMINATORS and sr not in _SENTENCE_TERMINATORS):
+            continue
+        ti=translated.find(token)
+        if ti<0: continue
+        tl=_nearest_nonspace_left(translated,ti); tr=_nearest_nonspace_right(translated,ti+len(token))
+        if tl in _SENTENCE_TERMINATORS:
+            raise GeminiOutputError("Translation introduced a sentence break immediately before embedded inline math")
+        if tr in _SENTENCE_TERMINATORS:
+            raise GeminiOutputError("Translation introduced a sentence break immediately after embedded inline math")
+
 def _translate_once(
     api_key: str,
     model: str,
@@ -309,6 +337,10 @@ def _translate_once(
             "index": i,
             "kind": item["kind"],
             "text": item["text"],
+            "previous_context": item.get("previous_context", ""),
+            "next_context": item.get("next_context", ""),
+            "continues_from_previous": bool(item.get("continues_from_previous", False)),
+            "continues_to_next": bool(item.get("continues_to_next", False)),
         }
         for i, item in enumerate(batch)
     ]
@@ -337,7 +369,15 @@ def _translate_once(
         "variable names, or acronyms unless the strategy explicitly says otherwise.\n"
         "CRITICAL: [[MATH_0]], [[MATH_1]], ... are protected mathematical expressions. "
         "Preserve every placeholder EXACTLY, character-for-character. You may move it for "
-        "natural grammar, but never edit, merge, duplicate, translate, or delete it.\n"
+        "natural grammar, but never edit, merge, duplicate, translate, or delete it. "
+        "An inline math placeholder is a grammatical constituent INSIDE the surrounding sentence, "
+        "not a sentence separator. Translate the complete sentence around it coherently. Never add "
+        "a period or other sentence-ending punctuation merely because inline mathematics appears "
+        "between prose fragments.\n"
+        "previous_context and next_context are READ-ONLY context. Never copy them into the returned "
+        "translation. If continues_from_previous or continues_to_next is true, preserve the grammatical "
+        "continuation across the neighboring block/display equation instead of forcing the current "
+        "fragment into a standalone sentence.\n"
         "Do not add Markdown, commentary, or explanations.\n"
         f"Return exactly {len(batch)} strings in the same order.\n\n"
         + json.dumps(compact, ensure_ascii=False)
@@ -372,6 +412,10 @@ def _translate_once(
             item["text"],
             value,
             target_language,
+        )
+        _validate_inline_math_continuity(
+            item["text"],
+            value,
         )
 
         out.append(value)
@@ -625,12 +669,23 @@ def translate_blocks(
         return {}
 
     initial = dict(initial_translations or {})
-    valid_ids = {item["id"] for item in items}
-    result: dict[str, str] = {
-        key: value
-        for key, value in initial.items()
-        if key in valid_ids and isinstance(value, str) and value.strip()
-    }
+    item_by_id = {item["id"]: item for item in items}
+    result: dict[str, str] = {}
+
+    for key, value in initial.items():
+        item = item_by_id.get(key)
+        if item is None or not isinstance(value, str) or not value.strip():
+            continue
+        try:
+            _validate_translation_quality(item["text"], value, target_language)
+            _validate_inline_math_continuity(item["text"], value)
+        except GeminiOutputError:
+            print(
+                f"Checkpoint translation {key} failed current quality rules; retranslating only this block.",
+                flush=True,
+            )
+            continue
+        result[key] = value
 
     if os.getenv("MOCK_TRANSLATION", "false").lower() == "true":
         result.update({item["id"]: item["text"] for item in items})
