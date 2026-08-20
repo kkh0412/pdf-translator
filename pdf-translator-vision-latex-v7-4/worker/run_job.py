@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import gzip
+import hashlib
+import json
 import os
 import shutil
+import threading
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -14,6 +18,107 @@ from .pdf_pipeline import process_pdf
 
 
 MAX_STORAGE_BYTES = 50 * 1024 * 1024
+CHECKPOINT_BUCKET = "translation-checkpoints"
+CHECKPOINT_VERSION = 1
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _checkpoint_jsonable(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {
+            str(key): _checkpoint_jsonable(item)
+            for key, item in value.items()
+            if key != "asset"
+        }
+    if isinstance(value, (list, tuple)):
+        return [_checkpoint_jsonable(item) for item in value]
+    return value
+
+
+def _load_checkpoint(
+    db,
+    checkpoint_path: str,
+    *,
+    source_sha256: str,
+    target_language: str,
+) -> dict | None:
+    try:
+        compressed = db.storage.from_(CHECKPOINT_BUCKET).download(checkpoint_path)
+    except Exception as exc:
+        text = str(exc).lower()
+        if "not found" not in text and "404" not in text:
+            print(f"Checkpoint download skipped: {exc}", flush=True)
+        return None
+
+    try:
+        payload = json.loads(gzip.decompress(compressed).decode("utf-8"))
+    except Exception as exc:
+        print(f"Checkpoint is unreadable and will be ignored: {exc}", flush=True)
+        return None
+
+    if payload.get("version") != CHECKPOINT_VERSION:
+        print("Checkpoint version mismatch; starting this job from structure analysis.", flush=True)
+        return None
+    if payload.get("source_sha256") != source_sha256:
+        print("Checkpoint source fingerprint mismatch; ignoring stale checkpoint.", flush=True)
+        return None
+    if payload.get("target_language") != target_language:
+        print("Checkpoint language mismatch; ignoring stale checkpoint.", flush=True)
+        return None
+
+    state = payload.get("state")
+    return state if isinstance(state, dict) else None
+
+
+def _save_checkpoint(
+    db,
+    checkpoint_path: str,
+    state: dict,
+    *,
+    source_sha256: str,
+    target_language: str,
+) -> int:
+    payload = {
+        "version": CHECKPOINT_VERSION,
+        "source_sha256": source_sha256,
+        "target_language": target_language,
+        "saved_at": now(),
+        "state": _checkpoint_jsonable(state),
+    }
+    compressed = gzip.compress(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        compresslevel=6,
+    )
+    if len(compressed) > MAX_STORAGE_BYTES:
+        raise RuntimeError(
+            "Checkpoint became unexpectedly large and cannot be persisted safely."
+        )
+
+    db.storage.from_(CHECKPOINT_BUCKET).upload(
+        checkpoint_path,
+        compressed,
+        {
+            "content-type": "application/gzip",
+            "upsert": "true",
+        },
+    )
+    return len(compressed)
+
+
+def _delete_checkpoint(db, checkpoint_path: str) -> None:
+    try:
+        db.storage.from_(CHECKPOINT_BUCKET).remove([checkpoint_path])
+    except Exception as exc:
+        print(f"Checkpoint cleanup skipped: {exc}", flush=True)
 
 
 def now():
@@ -74,16 +179,18 @@ def main(job_id: str) -> int:
     db = create_client(url, key)
 
     progress_updates_enabled = True
+    progress_floor = 0
     last_progress = -1
     last_progress_message = None
 
     def update_progress(percent: int, message: str) -> None:
-        nonlocal progress_updates_enabled, last_progress, last_progress_message
+        nonlocal progress_updates_enabled, progress_floor, last_progress, last_progress_message
 
         if not progress_updates_enabled:
             return
 
-        percent = max(0, min(100, int(percent)))
+        percent = max(progress_floor, max(0, min(100, int(percent))))
+        progress_floor = percent
         message = str(message)[:500]
 
         if percent == last_progress and message == last_progress_message:
@@ -129,6 +236,7 @@ def main(job_id: str) -> int:
         return 2
 
     job = rows[0]
+    progress_floor = max(0, min(100, int(job.get("progress") or 0)))
 
     # On-demand dispatch, browser retries, and the scheduled recovery path can
     # occasionally target the same job. Never process it twice.
@@ -156,7 +264,6 @@ def main(job_id: str) -> int:
             "error": None,
         }
     ).eq("id", job_id).execute()
-    update_progress(4, "문서를 불러오고 있습니다.")
 
     temp = Path(tempfile.mkdtemp(prefix=f"pdfjob-{job_id[:8]}-"))
 
@@ -172,7 +279,83 @@ def main(job_id: str) -> int:
             f"Input PDF: {_mb(input_path.stat().st_size):.2f} MB",
             flush=True,
         )
-        update_progress(6, "문서를 불러왔습니다 · 분석을 준비하고 있습니다.")
+
+        source_sha256 = _sha256(input_path)
+        checkpoint_path = f"{job['user_id']}/{job_id}/state-v1.json.gz"
+        checkpoint_state = _load_checkpoint(
+            db,
+            checkpoint_path,
+            source_sha256=source_sha256,
+            target_language=job["target_language"],
+        )
+        resumed = checkpoint_state is not None
+        checkpoint_state = checkpoint_state or {}
+
+        # A legacy requeued job may have a high visible progress value but no
+        # persistent checkpoint. Only preserve the old percentage when a real
+        # checkpoint exists.
+        if not resumed:
+            progress_floor = 0
+            last_progress = -1
+            update_progress(4, "문서를 불러오고 있습니다.")
+            update_progress(6, "문서를 불러왔습니다 · 분석을 준비하고 있습니다.")
+        else:
+            try:
+                db.table("translation_jobs").update(
+                    {
+                        "resume_count": int(job.get("resume_count") or 0) + 1,
+                        "checkpoint_stage": str(checkpoint_state.get("stage", "saved"))[:80],
+                        "checkpoint_updated_at": now(),
+                    }
+                ).eq("id", job_id).execute()
+            except Exception as exc:
+                print(f"Checkpoint metadata columns unavailable: {exc}", flush=True)
+
+            update_progress(
+                progress_floor,
+                "이전 진행 지점을 불러왔습니다 · 완료된 부분은 건너뛰고 이어서 처리합니다.",
+            )
+
+        checkpoint_lock = threading.Lock()
+        checkpoint_enabled = True
+
+        def persist_checkpoint(state: dict) -> None:
+            nonlocal checkpoint_enabled
+            if not checkpoint_enabled:
+                return
+
+            with checkpoint_lock:
+                try:
+                    size = _save_checkpoint(
+                        db,
+                        checkpoint_path,
+                        state,
+                        source_sha256=source_sha256,
+                        target_language=job["target_language"],
+                    )
+                    try:
+                        db.table("translation_jobs").update(
+                            {
+                                "checkpoint_stage": str(state.get("stage", "saved"))[:80],
+                                "checkpoint_updated_at": now(),
+                            }
+                        ).eq("id", job_id).execute()
+                    except Exception:
+                        pass
+                    print(
+                        f"Checkpoint saved: stage={state.get('stage')} "
+                        f"size={_mb(size):.2f} MB",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    # Translation should still be usable if the optional
+                    # checkpoint bucket has not been installed yet.
+                    checkpoint_enabled = False
+                    print(
+                        "Persistent checkpointing is unavailable until the latest "
+                        f"Supabase SQL is applied: {exc}",
+                        flush=True,
+                    )
 
         output_path = temp / "translated.pdf"
         info = process_pdf(
@@ -182,6 +365,8 @@ def main(job_id: str) -> int:
             output_path,
             max_pages=int(os.getenv("MAX_PAGES", "100")),
             progress_callback=update_progress,
+            checkpoint_state=checkpoint_state,
+            checkpoint_callback=persist_checkpoint,
         )
 
         update_progress(96, "생성된 PDF를 최적화하고 있습니다.")
@@ -235,6 +420,7 @@ def main(job_id: str) -> int:
             )
 
         db.table("translation_jobs").update(done_payload).eq("id", job_id).execute()
+        _delete_checkpoint(db, checkpoint_path)
 
         print(f"Completed {job_id}: {info}", flush=True)
         return 0
@@ -254,8 +440,8 @@ def main(job_id: str) -> int:
                 retry_payload.update(
                     {
                         "progress_message": (
-                            "현재 요청이 많아 잠시 기다리는 중입니다. "
-                            "준비되는 대로 자동으로 이어서 처리합니다."
+                            "현재 요청이 많아 잠시 대기 중입니다. "
+                            "저장된 진행 지점부터 자동으로 이어서 처리합니다."
                         ),
                         "progress_updated_at": now(),
                     }

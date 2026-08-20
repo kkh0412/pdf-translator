@@ -1,40 +1,28 @@
--- Run this once in Supabase Dashboard > SQL Editor.
--- Safe to run repeatedly.
+create extension if not exists pgcrypto;
 
--- Supabase Free allows a global maximum object limit of 50 MB.
--- The original demo set this bucket to only 20 MB, which can reject
--- a translated result even when the uploaded source PDF was accepted.
-update storage.buckets
-set
-  file_size_limit = 52428800,
-  allowed_mime_types = array['application/pdf'],
-  public = false
-where id = 'documents';
+create table if not exists public.translation_jobs (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  status text not null default 'queued'
+    check (status in ('queued','processing','done','failed')),
+  original_name text not null,
+  target_language text not null
+    check (target_language in ('ko','en','ja','zh-CN','fr','de','es')),
+  original_path text not null,
+  result_path text,
+  pages integer,
+  translated_segments integer,
+  progress smallint not null default 0
+    check (progress between 0 and 100),
+  progress_message text,
+  progress_updated_at timestamptz,
+  error text,
+  created_at timestamptz not null default now(),
+  started_at timestamptz,
+  finished_at timestamptz
+);
 
--- Live progress fields for long-running PDF jobs.
-alter table public.translation_jobs
-add column if not exists progress smallint not null default 0;
-
-alter table public.translation_jobs
-add column if not exists progress_message text;
-
-alter table public.translation_jobs
-add column if not exists progress_updated_at timestamptz;
-
-alter table public.translation_jobs
-drop constraint if exists translation_jobs_progress_check;
-
-alter table public.translation_jobs
-add constraint translation_jobs_progress_check
-check (progress between 0 and 100);
-
--- Keep the existing job policies.
-alter table public.translation_jobs
-drop constraint if exists translation_jobs_status_check;
-
-alter table public.translation_jobs
-add constraint translation_jobs_status_check
-check (status in ('uploading','queued','processing','done','failed'));
+alter table public.translation_jobs enable row level security;
 
 revoke all on table public.translation_jobs from anon, authenticated;
 grant select, insert on table public.translation_jobs to authenticated;
@@ -69,6 +57,15 @@ with check (
   and started_at is null
   and finished_at is null
 );
+
+insert into storage.buckets
+  (id, name, public, file_size_limit, allowed_mime_types)
+values
+  ('documents', 'documents', false, 52428800, array['application/pdf'])
+on conflict (id) do update set
+  public = excluded.public,
+  file_size_limit = excluded.file_size_limit,
+  allowed_mime_types = excluded.allowed_mime_types;
 
 drop policy if exists "users can upload their own document objects"
 on storage.objects;
@@ -119,6 +116,28 @@ add column if not exists dispatch_request_id bigint;
 alter table public.translation_jobs
 add column if not exists dispatch_last_at timestamptz;
 
+
+-- Persistent checkpoint metadata. The actual compressed state lives in the
+-- private translation-checkpoints Storage bucket.
+alter table public.translation_jobs
+add column if not exists checkpoint_stage text;
+
+alter table public.translation_jobs
+add column if not exists checkpoint_updated_at timestamptz;
+
+alter table public.translation_jobs
+add column if not exists resume_count integer not null default 0;
+
+insert into storage.buckets
+  (id, name, public, file_size_limit, allowed_mime_types)
+values
+  ('translation-checkpoints', 'translation-checkpoints', false, 52428800,
+   array['application/gzip'])
+on conflict (id) do update set
+  public = excluded.public,
+  file_size_limit = excluded.file_size_limit,
+  allowed_mime_types = excluded.allowed_mime_types;
+
 -- Dispatch exactly one queued job. This function can be called by both the
 -- AFTER INSERT trigger and the recovery cron.
 create or replace function public.dispatch_pdf_translation_worker(
@@ -156,7 +175,7 @@ begin
     set
       progress = greatest(progress, 1),
       progress_message =
-        'GitHub worker token이 없습니다 · Supabase Vault에 github_actions_token을 추가하세요.',
+        '번역 서비스를 시작하지 못했습니다. 잠시 후 다시 시도해 주세요.',
       progress_updated_at = now()
     where id = p_job_id;
 
@@ -191,9 +210,9 @@ begin
       progress = greatest(progress, 2),
       progress_message =
         case
-          when p_reason = 'insert'
-            then 'GitHub worker 실행 요청 전송 완료 · runner 시작을 기다리고 있습니다.'
-          else 'GitHub worker 실행 요청 재전송 완료 · runner 시작을 기다리고 있습니다.'
+          when progress >= 4 or checkpoint_stage is not null
+            then '이전 진행 지점부터 이어갈 준비를 하고 있습니다.'
+          else '번역을 시작할 준비를 하고 있습니다.'
         end,
       progress_updated_at = now()
     where id = p_job_id;
@@ -208,7 +227,7 @@ begin
         dispatch_last_at = now(),
         progress = greatest(progress, 1),
         progress_message =
-          'GitHub worker 요청을 생성하지 못했습니다 · Supabase pg_net 설정을 확인하세요.',
+          '번역 요청을 준비하지 못했습니다. 잠시 후 다시 시도합니다.',
         progress_updated_at = now()
       where id = p_job_id;
 
@@ -260,17 +279,19 @@ begin
       progress_message =
         case
           when r.status_code in (200, 204)
-            then 'GitHub가 worker 실행 요청을 승인했습니다 · runner 시작을 기다리고 있습니다.'
+            then case when j.progress >= 4 or j.checkpoint_stage is not null
+                 then '이전 진행 지점부터 이어갈 준비를 하고 있습니다.'
+                 else '번역을 시작할 준비를 하고 있습니다.' end
           when r.status_code = 401
-            then 'GitHub token 인증 실패(401) · Vault의 github_actions_token을 다시 확인하세요.'
+            then '번역 서비스를 시작하지 못했습니다. 잠시 후 다시 시도해 주세요.'
           when r.status_code = 403
-            then 'GitHub token 권한 부족(403) · pdf-translator 저장소의 Actions: Read and write 권한이 필요합니다.'
+            then '번역 서비스를 시작하지 못했습니다. 잠시 후 다시 시도해 주세요.'
           when r.status_code = 404
-            then 'GitHub workflow를 찾지 못했습니다(404) · 저장소/branch/process-pdf.yml을 확인하세요.'
+            then '번역 서비스를 시작하지 못했습니다. 잠시 후 다시 시도해 주세요.'
           when r.status_code is not null
-            then 'GitHub worker 요청 실패 · HTTP ' || r.status_code::text
+            then '번역 요청을 처리하지 못했습니다. 잠시 후 다시 시도합니다.'
           when r.error_msg is not null
-            then 'GitHub worker 네트워크 요청 실패 · ' || left(r.error_msg, 180)
+            then '네트워크 상태를 확인하며 번역 요청을 다시 준비하고 있습니다.'
           else j.progress_message
         end,
       progress = case

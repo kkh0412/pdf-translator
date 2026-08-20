@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import copy
 import os
 import re
 import shutil
@@ -8,7 +9,7 @@ import subprocess
 import time
 import unicodedata
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import pymupdf
 
@@ -1063,13 +1064,99 @@ def _page_batches(page_count: int, pages_per_call: int) -> list[list[int]]:
     ]
 
 
+
+def _checkpoint_copy_blocks(blocks: list[dict]) -> list[dict]:
+    """Return checkpoint-safe blocks without ephemeral local asset paths."""
+    saved = copy.deepcopy(blocks)
+    for block in saved:
+        block.pop("asset", None)
+    return saved
+
+
+def _checkpoint_page_results(value: object) -> dict[int, list[dict]]:
+    if not isinstance(value, dict):
+        return {}
+
+    out: dict[int, list[dict]] = {}
+    for key, blocks in value.items():
+        try:
+            page_index = int(key)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(blocks, list):
+            out[page_index] = blocks
+    return out
+
+
+def _restore_figure_assets(
+    pdf_path: Path,
+    blocks: list[dict],
+    work_dir: Path,
+) -> None:
+    """Recreate ephemeral figure files from source PDF after checkpoint resume."""
+    figures = [block for block in blocks if block.get("kind") == "figure"]
+    if not figures:
+        return
+
+    assets_dir = work_dir / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    # Remove stale assets from an earlier local runner. Their paths do not
+    # survive GitHub-hosted runner restarts.
+    for old in assets_dir.glob("figure_*"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+    doc = pymupdf.open(pdf_path)
+    try:
+        asset_index = 0
+        for block in blocks:
+            if block.get("kind") != "figure":
+                continue
+            page_index = int(block.get("page", 0))
+            asset_path, asset_type = _extract_figure_asset(
+                doc,
+                page_index,
+                block["bbox"],
+                assets_dir,
+                asset_index,
+            )
+            block["asset"] = asset_path
+            block["asset_type"] = asset_type
+            asset_index += 1
+    finally:
+        doc.close()
+
+
+def _checkpoint_emit(
+    checkpoint_state: dict | None,
+    checkpoint_callback: Callable[[dict], None] | None,
+    *,
+    stage: str,
+    **updates: Any,
+) -> None:
+    if checkpoint_state is None:
+        return
+
+    checkpoint_state.update(updates)
+    checkpoint_state["stage"] = stage
+    if checkpoint_callback:
+        checkpoint_callback(checkpoint_state)
+
+
 def reconstruct_document(
     pdf_path: Path,
     target_language: str,
     work_dir: Path,
     max_pages: int,
     progress_callback: Callable[[int, str], None] | None = None,
+    checkpoint_state: dict | None = None,
+    checkpoint_callback: Callable[[dict], None] | None = None,
 ) -> tuple[dict, dict, list[dict], list[dict]]:
+    checkpoint_state = checkpoint_state if checkpoint_state is not None else {}
+
     doc = pymupdf.open(pdf_path)
     try:
         if doc.page_count == 0:
@@ -1082,18 +1169,68 @@ def reconstruct_document(
     finally:
         doc.close()
 
+    # A completed semantic structure checkpoint skips all remote Vision parsing.
+    saved_blocks = checkpoint_state.get("blocks")
+    saved_items = checkpoint_state.get("translation_items")
+    saved_style = checkpoint_state.get("style")
+    saved_strategy = checkpoint_state.get("strategy")
+    if (
+        checkpoint_state.get("structure_complete")
+        and isinstance(saved_blocks, list)
+        and isinstance(saved_items, list)
+        and isinstance(saved_style, dict)
+        and isinstance(saved_strategy, dict)
+    ):
+        blocks = copy.deepcopy(saved_blocks)
+        _restore_figure_assets(pdf_path, blocks, work_dir)
+        if progress_callback:
+            progress_callback(
+                55,
+                "이전에 완료한 문서 분석 결과를 불러왔습니다.",
+            )
+        print(
+            "Checkpoint resume: semantic document structure restored; "
+            "Vision reconstruction skipped.",
+            flush=True,
+        )
+        return (
+            copy.deepcopy(saved_style),
+            copy.deepcopy(saved_strategy),
+            blocks,
+            copy.deepcopy(saved_items),
+        )
+
     print(
         f"Document pre-scan: style + field + terminology strategy "
         f"({source_pages} pages total)",
         flush=True,
     )
-    if progress_callback:
-        progress_callback(
-            8,
-            "문서 분야·스타일·전문용어 번역 전략을 먼저 분석하고 있습니다.",
-        )
 
-    style, strategy = analyze_document(pdf_path, target_language)
+    style = checkpoint_state.get("style")
+    strategy = checkpoint_state.get("strategy")
+    if not isinstance(style, dict) or not isinstance(strategy, dict):
+        if progress_callback:
+            progress_callback(
+                8,
+                "문서 분야·스타일·전문용어 번역 전략을 먼저 분석하고 있습니다.",
+            )
+        style, strategy = analyze_document(pdf_path, target_language)
+        _checkpoint_emit(
+            checkpoint_state,
+            checkpoint_callback,
+            stage="analysis_complete",
+            style=style,
+            strategy=strategy,
+            source_pages=source_pages,
+            page_results={},
+        )
+    else:
+        if progress_callback:
+            progress_callback(
+                12,
+                "이전에 완료한 문서 사전 분석 결과를 불러왔습니다.",
+            )
+        print("Checkpoint resume: document pre-scan restored.", flush=True)
 
     if progress_callback:
         field_label = " / ".join(
@@ -1112,11 +1249,22 @@ def reconstruct_document(
         1, min(3, int(os.getenv("VISION_PAGES_PER_CALL", "2")))
     )
     workers = max(1, min(3, int(os.getenv("VISION_WORKERS", "2"))))
-    batches = _page_batches(source_pages, pages_per_call)
+
+    page_results = _checkpoint_page_results(
+        checkpoint_state.get("page_results")
+    )
+    missing_indices = [
+        index for index in range(source_pages) if index not in page_results
+    ]
+    batches = [
+        missing_indices[start:start + pages_per_call]
+        for start in range(0, len(missing_indices), pages_per_call)
+    ]
 
     print(
-        f"Vision reconstruction plan: {source_pages} pages -> "
-        f"{len(batches)} calls, up to {pages_per_call} pages/call, workers={workers}",
+        f"Vision reconstruction plan: {source_pages} pages, "
+        f"already saved={len(page_results)}, remaining={len(missing_indices)}, "
+        f"calls={len(batches)}, workers={workers}",
         flush=True,
     )
 
@@ -1136,8 +1284,7 @@ def reconstruct_document(
                 merged.update(parse_pages(pdf_path, [index], style, strategy))
             return merged
 
-    page_results: dict[int, list[dict]] = {}
-    completed_pages = 0
+    completed_pages = len(page_results)
 
     def report_vision_progress(done_pages: int) -> None:
         if not progress_callback:
@@ -1149,21 +1296,38 @@ def reconstruct_document(
             f"페이지 구조·수식·컬럼 분석 중 · {done_pages}/{source_pages}페이지",
         )
 
-    if workers == 1 or len(batches) <= 1:
-        for batch in batches:
-            page_results.update(parse_batch(batch))
-            completed_pages += len(batch)
-            report_vision_progress(completed_pages)
-    else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            future_map = {
-                executor.submit(parse_batch, batch): batch for batch in batches
-            }
-            for future in concurrent.futures.as_completed(future_map):
-                batch = future_map[future]
-                page_results.update(future.result())
+    def save_page_checkpoint() -> None:
+        _checkpoint_emit(
+            checkpoint_state,
+            checkpoint_callback,
+            stage="vision_partial",
+            style=style,
+            strategy=strategy,
+            source_pages=source_pages,
+            page_results={str(k): v for k, v in page_results.items()},
+        )
+
+    if missing_indices:
+        if workers == 1 or len(batches) <= 1:
+            for batch in batches:
+                page_results.update(parse_batch(batch))
                 completed_pages += len(batch)
+                save_page_checkpoint()
                 report_vision_progress(completed_pages)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                future_map = {
+                    executor.submit(parse_batch, batch): batch for batch in batches
+                }
+                for future in concurrent.futures.as_completed(future_map):
+                    batch = future_map[future]
+                    page_results.update(future.result())
+                    completed_pages += len(batch)
+                    # Checkpoint writes happen only from this coordinator thread.
+                    save_page_checkpoint()
+                    report_vision_progress(completed_pages)
+    else:
+        report_vision_progress(completed_pages)
 
     missing_pages = [
         index for index in range(source_pages) if index not in page_results
@@ -1265,6 +1429,19 @@ def reconstruct_document(
                     )
     finally:
         doc.close()
+
+    _checkpoint_emit(
+        checkpoint_state,
+        checkpoint_callback,
+        stage="structure_complete",
+        style=style,
+        strategy=strategy,
+        source_pages=source_pages,
+        page_results={},
+        blocks=_checkpoint_copy_blocks(all_blocks),
+        translation_items=copy.deepcopy(translation_items),
+        structure_complete=True,
+    )
 
     return style, strategy, all_blocks, translation_items
 
@@ -1754,6 +1931,7 @@ def preflight_math_blocks(
     work_dir: Path,
     pdf_path: Path,
     progress_callback: Callable[[int, str], None] | None = None,
+    repair_checkpoint_callback: Callable[[], None] | None = None,
 ) -> None:
     """Preflight every formula independently and repair failures source-faithfully.
 
@@ -1922,6 +2100,19 @@ def preflight_math_blocks(
                     )
                     method = "source-image Gemini repair"
                 except Exception as exc:
+                    error_text = str(exc).lower()
+                    if (
+                        "transient_gemini_error" in error_text
+                        or "resource_exhausted" in error_text
+                        or "quota exceeded" in error_text
+                        or "all configured vision models" in error_text
+                        or "rate limited" in error_text
+                    ):
+                        raise RuntimeError(
+                            "TRANSIENT_GEMINI_ERROR: 수식 복구를 잠시 이어갈 수 없습니다. "
+                            "저장된 진행 지점부터 자동으로 다시 시도합니다."
+                        ) from exc
+
                     print(
                         f"Math repair failed for {record['label']}: {exc}",
                         flush=True,
@@ -1941,6 +2132,8 @@ def preflight_math_blocks(
                 record["block"]["math_map"][record["key"]] = repaired
 
             record["formula"] = repaired
+            if repair_checkpoint_callback:
+                repair_checkpoint_callback()
             to_recompile.append(idx)
 
         if not to_recompile:
@@ -2484,9 +2677,12 @@ def process_pdf(
     output_path: Path,
     max_pages: int,
     progress_callback: Callable[[int, str], None] | None = None,
+    checkpoint_state: dict | None = None,
+    checkpoint_callback: Callable[[dict], None] | None = None,
 ) -> dict:
     started = time.perf_counter()
     work_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_state = checkpoint_state if checkpoint_state is not None else {}
 
     src_doc = pymupdf.open(pdf_path)
     try:
@@ -2501,8 +2697,23 @@ def process_pdf(
         work_dir,
         max_pages=max_pages,
         progress_callback=progress_callback,
+        checkpoint_state=checkpoint_state,
+        checkpoint_callback=checkpoint_callback,
     )
     vision_seconds = time.perf_counter() - phase
+
+    # Keep the canonical semantic state synchronized after restoring ephemeral
+    # figure assets into this runner's local filesystem.
+    checkpoint_state.update(
+        {
+            "style": style,
+            "strategy": strategy,
+            "source_pages": source_pages,
+            "blocks": _checkpoint_copy_blocks(blocks),
+            "translation_items": copy.deepcopy(translation_items),
+            "structure_complete": True,
+        }
+    )
 
     flow_counts = sorted(
         {
@@ -2516,42 +2727,108 @@ def process_pdf(
         flush=True,
     )
 
-    if progress_callback:
-        progress_callback(56, "수식이 올바르게 조판되는지 확인하고 있습니다.")
+    if checkpoint_state.get("math_preflight_complete"):
+        if progress_callback:
+            progress_callback(
+                58,
+                "이전에 완료한 수식 검사를 불러왔습니다.",
+            )
+        print("Checkpoint resume: math preflight skipped.", flush=True)
+    else:
+        if progress_callback:
+            progress_callback(56, "수식이 올바르게 조판되는지 확인하고 있습니다.")
 
-    preflight_math_blocks(
-        blocks,
-        work_dir,
-        pdf_path,
-        progress_callback=progress_callback,
-    )
+        def save_math_repairs() -> None:
+            _checkpoint_emit(
+                checkpoint_state,
+                checkpoint_callback,
+                stage="math_repair",
+                blocks=_checkpoint_copy_blocks(blocks),
+                math_preflight_complete=False,
+            )
+
+        preflight_math_blocks(
+            blocks,
+            work_dir,
+            pdf_path,
+            progress_callback=progress_callback,
+            repair_checkpoint_callback=save_math_repairs,
+        )
+        _checkpoint_emit(
+            checkpoint_state,
+            checkpoint_callback,
+            stage="math_complete",
+            blocks=_checkpoint_copy_blocks(blocks),
+            math_preflight_complete=True,
+        )
 
     phase = time.perf_counter()
+    existing_translations = checkpoint_state.get("translations")
+    if not isinstance(existing_translations, dict):
+        existing_translations = {}
+
+    completed_saved = sum(
+        1 for item in translation_items if item.get("id") in existing_translations
+    )
     print(
-        f"Translation agent: translating {len(translation_items)} semantic text blocks; "
-        "all inline/display math remains protected LaTeX",
+        f"Translation agent: {len(translation_items)} total semantic text blocks; "
+        f"checkpoint already has {completed_saved}",
         flush=True,
     )
+
     if progress_callback:
-        progress_callback(
-            58,
-            f"수식 사전 검사 완료 · 전문용어 전략을 적용해 본문 번역을 시작합니다 · "
-            f"{len(translation_items)}개 텍스트 블록",
-        )
+        if completed_saved:
+            progress_callback(
+                58 + int(round(32 * completed_saved / max(1, len(translation_items)))),
+                f"이전 번역 {completed_saved}/{len(translation_items)}개 블록을 불러왔습니다 · "
+                "남은 부분부터 이어서 진행합니다.",
+            )
+        else:
+            progress_callback(
+                58,
+                f"수식 검사 완료 · 본문 번역을 시작합니다 · "
+                f"{len(translation_items)}개 텍스트 블록",
+            )
 
     def translation_progress(fraction: float, detail: str) -> None:
         if not progress_callback:
             return
-        # Translation remains the longest visible interval: 58% -> 90%.
         percent = 58 + int(round(32 * max(0.0, min(1.0, fraction))))
         progress_callback(min(90, percent), detail)
 
-    translations = translate_blocks(
-        translation_items,
-        target_language,
-        strategy,
-        progress_callback=translation_progress,
-    )
+    def save_translation_checkpoint(values: dict[str, str]) -> None:
+        _checkpoint_emit(
+            checkpoint_state,
+            checkpoint_callback,
+            stage="translation_partial",
+            blocks=_checkpoint_copy_blocks(blocks),
+            translations=dict(values),
+            translation_complete=False,
+        )
+
+    if checkpoint_state.get("translation_complete") and all(
+        item.get("id") in existing_translations for item in translation_items
+    ):
+        translations = dict(existing_translations)
+        if progress_callback:
+            progress_callback(90, "이전에 완료한 본문 번역을 불러왔습니다.")
+        print("Checkpoint resume: translation phase skipped.", flush=True)
+    else:
+        translations = translate_blocks(
+            translation_items,
+            target_language,
+            strategy,
+            progress_callback=translation_progress,
+            initial_translations=existing_translations,
+            checkpoint_callback=save_translation_checkpoint,
+        )
+        _checkpoint_emit(
+            checkpoint_state,
+            checkpoint_callback,
+            stage="translation_complete",
+            translations=dict(translations),
+            translation_complete=True,
+        )
 
     integrity_errors: list[str] = []
     for item in translation_items:
@@ -2573,7 +2850,7 @@ def process_pdf(
     translation_seconds = time.perf_counter() - phase
 
     if progress_callback:
-        progress_callback(91, "번역 완료 · LaTeX 문서를 조립하고 있습니다.")
+        progress_callback(91, "번역 완료 · 문서를 조립하고 있습니다.")
 
     phase = time.perf_counter()
     tex_source = build_latex(
@@ -2628,5 +2905,6 @@ def process_pdf(
         "column_flows": flow_counts,
         "field": strategy.get("field"),
         "subfield": strategy.get("subfield"),
-        "render_mode": "vision-first-dynamic-columns-latex-v6.2",
+        "render_mode": "vision-checkpoint-resume-latex-v7.4",
     }
+

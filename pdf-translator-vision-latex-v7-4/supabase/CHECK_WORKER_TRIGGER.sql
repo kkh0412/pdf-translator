@@ -1,4 +1,4 @@
--- PDF Translator v6.8 worker diagnostics
+-- PDF Translator v7.4 worker/checkpoint diagnostics
 -- Safe: does not print the actual GitHub token.
 
 select
@@ -42,6 +42,9 @@ select
   dispatch_attempts,
   dispatch_request_id,
   dispatch_last_at,
+  checkpoint_stage,
+  checkpoint_updated_at,
+  resume_count,
   created_at,
   progress_updated_at
 from public.translation_jobs
@@ -60,6 +63,16 @@ left join net._http_response r
 where j.dispatch_request_id is not null
 order by j.created_at desc
 limit 8;
+
+
+select
+  id as bucket_id,
+  public,
+  file_size_limit,
+  allowed_mime_types
+from storage.buckets
+where id in ('documents', 'translation-checkpoints')
+order by id;
 
 select
   pid,

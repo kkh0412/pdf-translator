@@ -34,6 +34,24 @@ let elapsedTimer = null;
 let activeStatusMessage = '';
 let showElapsedTime = false;
 
+function friendlyProgressMessage(job, fallback) {
+  const raw = String(job?.progress_message || '').trim();
+  if (!raw) return fallback;
+
+  // Older database functions may still have stored implementation-specific
+  // messages. Never expose infrastructure vocabulary in the user-facing card.
+  if (/(github|worker|runner|supabase|pg_net|workflow|vault|token)/i.test(raw)) {
+    const progress = Number(job?.progress ?? 0);
+    const hasCheckpoint = Boolean(job?.checkpoint_stage) || Number(job?.resume_count ?? 0) > 0;
+    if (progress >= 4 || hasCheckpoint) {
+      return '이전 진행 지점부터 이어갈 준비를 하고 있습니다.';
+    }
+    return '번역을 시작할 준비를 하고 있습니다.';
+  }
+
+  return raw;
+}
+
 function formatElapsed(ms) {
   const totalSeconds = Math.max(0, Math.floor(ms / 1000));
   const minutes = Math.floor(totalSeconds / 60);
@@ -171,13 +189,20 @@ async function poll(jobId) {
       if (hasDetailedProgress && (dbProgress > 0 || job.progress_message)) {
         updateProgress(
           dbProgress,
-          job.progress_message || '번역 작업을 준비하고 있습니다.',
+          friendlyProgressMessage(
+            job,
+            '번역 작업을 준비하고 있습니다.'
+          ),
           true
         );
       } else if (queuedForMs >= 8000) {
+        const waitingMessage =
+          job.checkpoint_stage || Number(job.resume_count ?? 0) > 0 || dbProgress >= 4
+            ? '현재 요청 순서를 기다리고 있습니다. 저장된 진행 지점부터 자동으로 이어집니다.'
+            : '현재 요청 순서를 기다리고 있습니다. 준비되는 대로 자동으로 시작합니다.';
         updateProgress(
           Math.max(1, dbProgress),
-          '현재 요청 순서를 기다리고 있습니다. 준비되는 대로 자동으로 시작합니다.',
+          waitingMessage,
           true
         );
       } else {
@@ -195,8 +220,10 @@ async function poll(jobId) {
       if (hasDetailedProgress) {
         updateProgress(
           job.progress ?? 4,
-          job.progress_message ||
-            '문서 구조와 수식을 살펴 번역하고, 결과를 다시 조판하고 있습니다.',
+          friendlyProgressMessage(
+            job,
+            '문서 구조와 수식을 살펴 번역하고, 결과를 다시 조판하고 있습니다.'
+          ),
           true
         );
       } else {

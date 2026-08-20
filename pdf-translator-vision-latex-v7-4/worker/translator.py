@@ -618,12 +618,25 @@ def translate_blocks(
     target_language: str,
     strategy: dict,
     progress_callback: Callable[[float, str], None] | None = None,
+    initial_translations: dict[str, str] | None = None,
+    checkpoint_callback: Callable[[dict[str, str]], None] | None = None,
 ) -> dict[str, str]:
     if not items:
         return {}
 
+    initial = dict(initial_translations or {})
+    valid_ids = {item["id"] for item in items}
+    result: dict[str, str] = {
+        key: value
+        for key, value in initial.items()
+        if key in valid_ids and isinstance(value, str) and value.strip()
+    }
+
     if os.getenv("MOCK_TRANSLATION", "false").lower() == "true":
-        return {item["id"]: item["text"] for item in items}
+        result.update({item["id"]: item["text"] for item in items})
+        if checkpoint_callback:
+            checkpoint_callback(dict(result))
+        return result
 
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
@@ -631,18 +644,30 @@ def translate_blocks(
     if target_language not in LANGUAGE_NAMES:
         raise RuntimeError(f"Unsupported target language: {target_language}")
 
-    batches = list(_chunks(items))
+    pending_items = [item for item in items if item["id"] not in result]
+    total_blocks = max(1, len(items))
+    completed_blocks = len(items) - len(pending_items)
+
+    if progress_callback and completed_blocks:
+        progress_callback(
+            completed_blocks / total_blocks,
+            f"저장된 번역 · {completed_blocks}/{len(items)}개 블록 완료 · "
+            "남은 부분부터 이어서 진행합니다.",
+        )
+
+    if not pending_items:
+        return result
+
+    batches = list(_chunks(pending_items))
     workers = max(1, min(2, int(os.getenv("TRANSLATION_WORKERS", "2"))))
     print(
-        f"Translation plan: {len(batches)} batches, workers={workers}",
+        f"Translation resume plan: {completed_blocks}/{len(items)} blocks saved, "
+        f"remaining={len(pending_items)}, batches={len(batches)}, workers={workers}",
         flush=True,
     )
 
-    translated_batches: list[list[str] | None] = [None] * len(batches)
-    completed_blocks = 0
     started_batches = 0
     lock = threading.Lock()
-    total_blocks = max(1, len(items))
 
     def emit(fraction: float, message: str) -> None:
         if progress_callback:
@@ -653,16 +678,14 @@ def translate_blocks(
         with lock:
             started_batches += 1
             start_number = started_batches
-            # Starting a request moves a small amount within the current
-            # translation range even before the remote call finishes.
             visible_fraction = min(
                 0.96,
                 (completed_blocks + min(len(batch) * 0.18, 2.0)) / total_blocks,
             )
             emit(
                 visible_fraction,
-                f"번역 요청 {start_number}/{len(batches)} 처리 중 · "
-                f"{len(batch)}개 텍스트 블록",
+                f"본문 번역 중 · 남은 묶음 {start_number}/{len(batches)} · "
+                f"{len(batch)}개 블록",
             )
 
         try:
@@ -685,24 +708,36 @@ def translate_blocks(
             with lock:
                 emit(
                     completed_blocks / total_blocks,
-                    f"번역 요청 {index + 1}/{len(batches)}를 더 작은 묶음으로 복구 중",
+                    f"문장 품질을 확인하며 현재 묶음을 다시 처리하고 있습니다.",
                 )
             raise
 
-    def mark_complete(batch: list[dict], index: int) -> None:
+    def mark_complete(
+        batch: list[dict],
+        translated: list[str],
+        index: int,
+    ) -> None:
         nonlocal completed_blocks
+
+        # This coordinator is the only place that mutates/persists result.
         with lock:
+            for item, value in zip(batch, translated):
+                result[item["id"]] = value
             completed_blocks += len(batch)
+            snapshot = dict(result)
             emit(
                 completed_blocks / total_blocks,
                 f"본문 번역 · {completed_blocks}/{len(items)}개 블록 완료 "
-                f"({index + 1}/{len(batches)} 묶음)",
+                f"({index + 1}/{len(batches)} 남은 묶음)",
             )
+
+        if checkpoint_callback:
+            checkpoint_callback(snapshot)
 
     if workers == 1 or len(batches) <= 1:
         for index, batch in enumerate(batches):
-            translated_batches[index] = run_one(index, batch)
-            mark_complete(batch, index)
+            translated = run_one(index, batch)
+            mark_complete(batch, translated, index)
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_index = {
@@ -711,13 +746,15 @@ def translate_blocks(
             }
             for future in concurrent.futures.as_completed(future_to_index):
                 index = future_to_index[future]
-                translated_batches[index] = future.result()
-                mark_complete(batches[index], index)
+                translated = future.result()
+                mark_complete(batches[index], translated, index)
 
-    result: dict[str, str] = {}
-    for batch, translated in zip(batches, translated_batches):
-        assert translated is not None
-        for item, value in zip(batch, translated):
-            result[item["id"]] = value
+    missing = [item["id"] for item in items if item["id"] not in result]
+    if missing:
+        raise RuntimeError(
+            "Translation checkpoint merge missed blocks: "
+            + ", ".join(missing[:12])
+        )
 
     return result
+
