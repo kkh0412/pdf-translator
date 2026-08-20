@@ -20,43 +20,41 @@ button, input, select { font: inherit; }
 
 .hero-title-row {
   display: flex;
+  flex-direction: row;
   align-items: center;
-  gap: clamp(16px, 2vw, 24px);
-  margin-top: 0;
+  gap: 14px;
+  width: 100%;
 }
 
 .hero-title-row h1 {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
   margin: 0;
-  min-width: 0;
 }
 
 .hero-logo {
   display: block;
-  flex: 0 0 auto;
-  width: clamp(54px, 5.2vw, 72px);
-  height: clamp(54px, 5.2vw, 72px);
-  object-fit: cover;
-  border-radius: 14px;
+  flex: 0 0 44px;
+  width: 44px !important;
+  height: 44px !important;
+  max-width: 44px;
+  max-height: 44px;
+  object-fit: contain;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  background: #f5f4ef;
 }
 
-.hero-layout {
-  display: grid;
-  grid-template-columns: clamp(88px, 9vw, 128px) minmax(0, 1fr);
-  gap: clamp(26px, 3vw, 44px);
-  align-items: start;
-}
 
-.hero-logo {
-  display: block;
-  width: 100%;
-  height: auto;
-  margin-top: 4px;
-  border-radius: 24%;
-}
 
-.hero-copy {
-  min-width: 0;
-}
+
+
+
+
 
 .eyebrow { font-size: 11px; font-weight: 750; letter-spacing: .16em; margin-bottom: 18px; color: #77756d; }
 .hero h1 { margin: 0; font-size: clamp(42px, 7vw, 76px); line-height: 1.02; letter-spacing: -.055em; font-weight: 650; }
@@ -159,16 +157,24 @@ footer { padding-top: 30px; color: #8a887f; font-size: 12px; letter-spacing: .01
 
 @media (max-width: 720px) {
   .hero-title-row {
+    display: flex;
+    flex-direction: row;
     align-items: flex-start;
-    gap: 12px;
+    gap: 10px;
   }
 
   .hero-logo {
-    width: 46px;
-    height: 46px;
-    border-radius: 10px;
-    margin-top: 4px;
+    flex-basis: 34px;
+    width: 34px !important;
+    height: 34px !important;
+    max-width: 34px;
+    max-height: 34px;
+    margin-top: 5px;
   }
+
+  
+
+  
 
 
 

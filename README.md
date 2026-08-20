@@ -1,4 +1,11 @@
-# 대관령산양의 번역기 v7.8
+# 대관령산양의 번역기 v7.9
+
+## Homepage logo fix
+- 이전 CSS의 `.hero-logo { width: 100%; }` 중복 규칙을 완전히 제거했습니다.
+- 홈페이지 로고는 데스크톱 44px, 모바일 34px로 고정했습니다.
+- 제목은 항상 flex row에서 로고의 오른쪽에 배치됩니다.
+- 기존 둥근 사각형 타일 배경/외곽선을 제거한 `hero-logo.png`를 새로 만들었습니다.
+- 이미지 주변은 홈페이지 배경과 정확히 같은 `#f5f4ef`이며 JPEG 압축 halo도 없습니다.
 
 ## Homepage logo refinement
 - 홈페이지용 로고를 `hero-logo.jpg`로 분리했습니다.
