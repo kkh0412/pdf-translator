@@ -1,4 +1,18 @@
-# 대관령산양의 번역기 v8.5
+# 대관령산양의 번역기 v8.5.2
+
+## Heartbeat SQL hotfix correction
+- v8.5.1 standalone hotfix의 잘못된 literal `\n` 줄바꿈을 수정했습니다.
+- `paused` 상태를 허용하도록 `translation_jobs_status_check`를 함께 갱신합니다.
+- heartbeat 컬럼과 RPC를 여러 번 실행 가능한 형태로 설치합니다.
+- resume dispatch 호출은 dynamic SQL로 처리하여 dispatch 함수가 없는 DB에서도 hotfix 자체는 설치됩니다.
+- 마지막에 PostgREST schema cache를 reload하고 설치 상태를 검증합니다.
+
+## Heartbeat schema-cache hotfix
+- 작업 생성 INSERT에서 `client_active`/`client_heartbeat_at`을 제거했습니다.
+- heartbeat schema/RPC가 아직 없거나 PostgREST cache가 오래되어도 작업 생성은 실패하지 않습니다.
+- heartbeat는 job 생성 후 fail-soft RPC로 활성화됩니다.
+- `supabase/V851_HEARTBEAT_SCHEMA_HOTFIX.sql`을 추가했습니다.
+- hotfix는 필요한 컬럼/RPC를 idempotent하게 추가하고 `notify pgrst, 'reload schema'`로 schema cache를 새로고칩니다.
 
 ## Google Translate final fallback
 - 모든 Gemini 본문 번역 모델의 일일 한도/가용성이 소진되면 official Cloud Translation - Basic(v2) NMT로 자동 전환합니다.

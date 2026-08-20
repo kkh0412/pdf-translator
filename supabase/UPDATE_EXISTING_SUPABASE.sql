@@ -325,7 +325,13 @@ begin
         dispatch_last_at = null
       where id = p_job_id;
 
-      perform public.dispatch_pdf_translation_worker(p_job_id, 'client-resume');
+      if to_regprocedure(
+           'public.dispatch_pdf_translation_worker(uuid,text)'
+         ) is not null then
+        execute
+          'select public.dispatch_pdf_translation_worker($1, $2)'
+          using p_job_id, 'client-resume';
+      end if;
       return 'queued';
     end if;
 
@@ -519,3 +525,7 @@ begin
     'PDF Translator: immediate trigger + recovery cron + client heartbeat installed.';
 end
 $$;
+
+
+-- Refresh Supabase/PostgREST schema cache after DDL.
+notify pgrst, 'reload schema';

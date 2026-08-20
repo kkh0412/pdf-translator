@@ -463,8 +463,6 @@ form.addEventListener('submit', async (event) => {
         original_name: file.name,
         target_language: targetLanguage,
         original_path: originalPath,
-        client_heartbeat_at: new Date().toISOString(),
-        client_active: true,
       });
 
     if (insertError) {
@@ -472,6 +470,19 @@ form.addEventListener('submit', async (event) => {
     }
 
     rememberActiveJob(jobId);
+
+    // Heartbeat is an optional resilience layer, not a prerequisite for job
+    // creation. If the Supabase migration/schema cache is not ready yet, the
+    // translation still starts; heartbeat becomes active automatically once
+    // the RPC is available.
+    try {
+      await signalClient(jobId, 'resume');
+    } catch (heartbeatSetupError) {
+      console.warn(
+        'Client heartbeat is not available yet; continuing without it.',
+        heartbeatSetupError
+      );
+    }
     startHeartbeat(jobId);
     queuedStartedAt = Date.now();
     elapsedStartedAt = queuedStartedAt;
