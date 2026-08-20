@@ -39,6 +39,10 @@ jobs:
         if: steps.runtime-cache.outputs.cache-hit != 'true'
         run: bash worker/setup_runtime.sh
 
+      - name: Verify cached Python dependencies
+        shell: bash
+        run: bash worker/ensure_python_runtime.sh
+
       - name: Smoke test two-column Korean + real LaTeX math
         if: steps.runtime-cache.outputs.cache-hit != 'true'
         shell: bash

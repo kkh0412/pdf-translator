@@ -1,4 +1,26 @@
-# 대관령산양의 번역기 v8.6
+# 대관령산양의 번역기 v8.6.1
+
+## googletrans runtime self-healing
+
+v8.6 could restore an older cached `.venv` and skip `pip install`, leaving
+`googletrans` unavailable even though it was present in `worker/requirements.txt`.
+
+v8.6.1 fixes this at three levels:
+
+1. `setup_runtime.sh` always synchronizes `worker/requirements.txt`, even when
+   `.venv` already exists.
+2. Every PDF-processing workflow runs `worker/ensure_python_runtime.sh` after
+   cache restore. It imports `pymupdf`, `supabase`, and `googletrans`; if any are
+   missing, it installs the current requirements and verifies again.
+3. `runtime-cache-version=8.6.1` changes the cache key so the first deployment
+   cannot accidentally reuse the broken v8.6 runtime as an exact cache hit.
+
+The worker therefore starts document processing only after `googletrans` is
+actually importable. No `GOOGLE_TRANSLATE_API_KEY` is required.
+
+Translation policy is unchanged: any Gemini prose-translation 429 immediately
+switches the remainder of the translation job to Python Google Translate with
+no Retry-After wait.
 
 ## Python Google Translate fallback
 

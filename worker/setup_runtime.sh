@@ -5,9 +5,20 @@ export PATH="$HOME/.TinyTeX/bin/x86_64-linux:$PATH"
 
 if [ ! -x ".venv/bin/python" ]; then
   python3 -m venv .venv
-  .venv/bin/python -m pip install --upgrade pip
-  .venv/bin/pip install --disable-pip-version-check -r worker/requirements.txt
 fi
+
+# A restored GitHub Actions cache can contain an older virtualenv. Always
+# synchronize requirements with the current repository before using it.
+.venv/bin/python -m pip install --disable-pip-version-check --upgrade pip
+.venv/bin/python -m pip install --disable-pip-version-check -r worker/requirements.txt
+
+# Fail during runtime preparation rather than much later, after a Gemini 429.
+.venv/bin/python - <<'PYVERIFY'
+import pymupdf
+import supabase
+import googletrans
+print(f"Python runtime dependencies OK · googletrans={googletrans.__version__}")
+PYVERIFY
 
 if ! command -v xelatex >/dev/null 2>&1; then
   export TINYTEX_VERSION=2026.07

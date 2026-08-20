@@ -80,6 +80,11 @@ jobs:
             .venv
           key: ${{ steps.runtime-cache.outputs.cache-primary-key }}
 
+      - name: Verify Python runtime dependencies
+        if: steps.target.outputs.has_jobs == 'true'
+        shell: bash
+        run: bash worker/ensure_python_runtime.sh
+
       - name: Process requested PDF
         if: steps.target.outputs.has_jobs == 'true'
         env:

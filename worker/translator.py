@@ -509,8 +509,9 @@ def _translate_with_quota_retries(
         # If Python Google Translate is unavailable, still do not sleep. Let the
         # caller try the next Gemini model immediately.
         print(
-            f"{context}: Gemini 429 on {model}; no wait, trying next model "
-            "because Google Translate is not configured.",
+            f"{context}: Gemini 429 on {model}; Python Google Translate "
+            "runtime is unexpectedly unavailable, trying the next model "
+            "without waiting.",
             flush=True,
         )
         if is_daily_quota_error(exc.detail):
