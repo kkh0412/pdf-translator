@@ -506,7 +506,7 @@ def _translate_with_quota_retries(
             )
             raise Gemini429UseGoogle(model, exc.detail) from exc
 
-        # If Google Translate was not configured, still do not sleep. Let the
+        # If Python Google Translate is unavailable, still do not sleep. Let the
         # caller try the next Gemini model immediately.
         print(
             f"{context}: Gemini 429 on {model}; no wait, trying next model "
@@ -528,7 +528,7 @@ def _google_translate_fallback(
     if not google_translate_configured():
         raise RuntimeError(
             "TRANSIENT_GEMINI_ERROR: all Gemini translation models are unavailable "
-            "and GOOGLE_TRANSLATE_API_KEY is not configured."
+            "and the Python Google Translate fallback is unavailable."
         )
 
     values = google_translate_batch(
@@ -651,7 +651,7 @@ def _request_batch(
             raise
 
     # All Gemini translation paths are exhausted/unavailable. As the final
-    # prose-translation fallback, use the official Google Cloud Translation API.
+    # prose-translation fallback, use the local Python googletrans fallback.
     # Vision/math reconstruction still remains Gemini/source-PDF based.
     try:
         return _google_translate_fallback(
@@ -750,7 +750,7 @@ def _recover(
             except RuntimeError:
                 continue
 
-        # Last resort for a single prose block: official Google Translate.
+        # Last resort for a single prose block: Python Google Translate.
         # This is preferable to emitting the original English block unchanged.
         try:
             return _google_translate_fallback(

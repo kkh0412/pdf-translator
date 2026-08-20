@@ -88,8 +88,8 @@ jobs:
           SUPABASE_URL: ${{ vars.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GOOGLE_TRANSLATE_API_KEY: ${{ secrets.GOOGLE_TRANSLATE_API_KEY }}
-          GOOGLE_TRANSLATE_MAX_RETRIES: '3'
+          PY_GOOGLE_TRANSLATE_TIMEOUT_SECONDS: '12'
+          PY_GOOGLE_TRANSLATE_SERVICE_URLS: translate.googleapis.com,translate.google.com,translate.google.co.kr
           GEMINI_VISION_MODEL: gemini-3.5-flash-lite
           GEMINI_TRANSLATION_MODEL: gemini-3.5-flash-lite
           GEMINI_VISION_MODELS: gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-2.5-flash-lite,gemini-2.5-flash,gemini-3.5-flash,gemini-3.6-flash

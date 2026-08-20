@@ -1,21 +1,19 @@
 from __future__ import annotations
 
-import html
-import json
+import asyncio
+import importlib.util
+import inspect
 import os
 import re
-import time
-import urllib.error
-import urllib.request
 from typing import Callable
 
-from .gemini_rate import check_cancel, retry_delay_from_text, run_cancellable_io
+from .gemini_rate import check_cancel, run_cancellable_io
 
 
 PLACEHOLDER_RE = re.compile(r"\[\[MATH_\d+\]\]")
-SPAN_RE = re.compile(
-    r'<span\b(?=[^>]*\bdata-pdftr-token=["\'](?P<token>\d+)["\'])[^>]*>.*?</span>',
-    flags=re.I | re.S,
+PROTECTED_TOKEN_RE = re.compile(
+    r"ZXQPDFTRTOKEN\s*(?P<token>\d+)\s*QXZ",
+    flags=re.I,
 )
 
 
@@ -24,7 +22,12 @@ class GoogleTranslateError(RuntimeError):
 
 
 def configured() -> bool:
-    return bool(os.getenv("GOOGLE_TRANSLATE_API_KEY", "").strip())
+    """No API key is required; only the Python package must be installed."""
+    if os.getenv("PY_GOOGLE_TRANSLATE_DISABLED", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        return False
+    return importlib.util.find_spec("googletrans") is not None
 
 
 def _protected_terms(strategy: dict) -> list[str]:
@@ -39,13 +42,8 @@ def _protected_terms(strategy: dict) -> list[str]:
     return terms
 
 
-def _protect_html(text: str, strategy: dict) -> tuple[str, dict[str, str]]:
-    """Protect math placeholders and KEEP-ENGLISH terms as HTML elements.
-
-    Cloud Translation does not translate HTML tags. The original token lives in
-    our local mapping, not in translatable text, so even if surrounding word
-    order changes the math/term itself remains exact.
-    """
+def _protect_text(text: str, strategy: dict) -> tuple[str, dict[str, str]]:
+    """Protect math placeholders and KEEP-ENGLISH terms with opaque text tokens."""
     text = str(text or "")
     keep_terms = _protected_terms(strategy)
 
@@ -59,110 +57,146 @@ def _protect_html(text: str, strategy: dict) -> tuple[str, dict[str, str]]:
     token_index = 0
 
     for match in combined.finditer(text):
-        out.append(html.escape(text[cursor:match.start()], quote=False))
-        original = match.group(0)
+        out.append(text[cursor:match.start()])
         key = str(token_index)
-        mapping[key] = original
-        # Empty/marker span is inline, immovable content. Both translate=no and
-        # class=notranslate are included; the data attribute is our restoration key.
-        out.append(
-            f'<span translate="no" class="notranslate" '
-            f'data-pdftr-token="{key}">PDFTRTOKEN{key}</span>'
-        )
+        mapping[key] = match.group(0)
+        # An intentionally ugly all-caps nonce is much less likely to be
+        # translated than a natural-language marker. Restoration is validated.
+        out.append(f"ZXQPDFTRTOKEN{key}QXZ")
         token_index += 1
         cursor = match.end()
 
-    out.append(html.escape(text[cursor:], quote=False))
+    out.append(text[cursor:])
     return "".join(out), mapping
 
 
-def _restore_html(translated_html: str, mapping: dict[str, str]) -> str:
+def _restore_text(translated: str, mapping: dict[str, str]) -> str:
+    translated = str(translated or "")
     seen: set[str] = set()
 
     def repl(match: re.Match) -> str:
         key = match.group("token")
         if key not in mapping:
             raise GoogleTranslateError(
-                f"Google Translate returned an unknown protected token: {key}"
+                f"Python Google Translate returned an unknown protected token: {key}"
             )
         seen.add(key)
         return mapping[key]
 
-    restored = SPAN_RE.sub(repl, str(translated_html or ""))
+    restored = PROTECTED_TOKEN_RE.sub(repl, translated)
     missing = sorted(set(mapping) - seen)
     if missing:
         raise GoogleTranslateError(
-            "Google Translate dropped protected inline tokens: " + ", ".join(missing)
+            "Python Google Translate dropped protected tokens: "
+            + ", ".join(missing)
         )
 
-    # Source prose was HTML-escaped before submission; decode entities back to text.
-    return html.unescape(restored)
+    if re.search(r"ZXQPDFTRTOKEN", restored, flags=re.I):
+        raise GoogleTranslateError(
+            "Python Google Translate left an unrecovered protection token"
+        )
+
+    return restored
 
 
-def _sleep_cancellable(seconds: float) -> None:
-    deadline = time.monotonic() + max(0.0, float(seconds))
-    while True:
-        check_cancel()
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return
-        time.sleep(min(0.5, remaining))
+def _target_code(language: str) -> str:
+    value = str(language or "").strip()
+    mapping = {
+        "zh-CN": "zh-cn",
+        "zh-TW": "zh-tw",
+    }
+    return mapping.get(value, value.lower())
 
 
-def _call_once(
-    api_key: str,
-    html_inputs: list[str],
+def _service_urls() -> list[str]:
+    configured_urls = [
+        value.strip()
+        for value in os.getenv(
+            "PY_GOOGLE_TRANSLATE_SERVICE_URLS",
+            "translate.googleapis.com,translate.google.com,translate.google.co.kr",
+        ).split(",")
+        if value.strip()
+    ]
+    return configured_urls or ["translate.google.com"]
+
+
+async def _translate_async(
+    texts: list[str],
     target_language: str,
 ) -> list[str]:
-    endpoint = "https://translation.googleapis.com/language/translate/v2"
-    body = {
-        "q": html_inputs,
-        "target": target_language,
-        "format": "html",
-        "model": "nmt",
-    }
-    request = urllib.request.Request(
-        endpoint,
-        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        method="POST",
-        headers={
-            "Content-Type": "application/json; charset=utf-8",
-            "X-Goog-Api-Key": api_key,
-        },
+    try:
+        from googletrans import Translator
+    except Exception as exc:
+        raise GoogleTranslateError(
+            "googletrans is not installed in the worker runtime"
+        ) from exc
+
+    timeout = max(
+        3.0,
+        float(os.getenv("PY_GOOGLE_TRANSLATE_TIMEOUT_SECONDS", "12")),
     )
 
-    check_cancel()
     try:
-        def perform_request():
-            with urllib.request.urlopen(request, timeout=120) as response:
-                return json.loads(response.read().decode("utf-8"))
-
-        payload = run_cancellable_io(perform_request)
-        check_cancel()
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise GoogleTranslateError(
-            f"Cloud Translation API HTTP {exc.code}: {detail}"
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise GoogleTranslateError(
-            f"TRANSIENT_GOOGLE_TRANSLATE_ERROR: {exc}"
-        ) from exc
-
-    translations = payload.get("data", {}).get("translations")
-    if not isinstance(translations, list) or len(translations) != len(html_inputs):
-        raise GoogleTranslateError(
-            "Cloud Translation API returned the wrong number of translations"
+        translator = Translator(
+            service_urls=_service_urls(),
+            raise_exception=True,
+            timeout=timeout,
         )
 
-    result: list[str] = []
-    for item in translations:
-        value = item.get("translatedText") if isinstance(item, dict) else None
+        async def perform(active_translator):
+            result = active_translator.translate(
+                texts,
+                dest=_target_code(target_language),
+                src="auto",
+            )
+            if inspect.isawaitable(result):
+                result = await result
+            return result
+
+        # googletrans 4.x is async-context-manager based. This fallback keeps
+        # compatibility with older/sync implementations as well.
+        if hasattr(translator, "__aenter__"):
+            async with translator as active:
+                result = await perform(active)
+        else:
+            result = await perform(translator)
+
+    except Exception as exc:
+        raise GoogleTranslateError(
+            f"TRANSIENT_PY_GOOGLE_TRANSLATE_ERROR: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    if not isinstance(result, (list, tuple)):
+        result = [result]
+
+    if len(result) != len(texts):
+        raise GoogleTranslateError(
+            "Python Google Translate returned the wrong number of translations"
+        )
+
+    values: list[str] = []
+    for item in result:
+        value = getattr(item, "text", None)
         if not isinstance(value, str):
             raise GoogleTranslateError(
-                "Cloud Translation API returned a non-string translation"
+                "Python Google Translate returned a non-string translation"
             )
-        result.append(value)
+        values.append(value)
+    return values
+
+
+def _call_googletrans(
+    protected: list[str],
+    target_language: str,
+) -> list[str]:
+    def run() -> list[str]:
+        return asyncio.run(
+            _translate_async(protected, target_language)
+        )
+
+    check_cancel()
+    result = run_cancellable_io(run)
+    check_cancel()
     return result
 
 
@@ -173,17 +207,20 @@ def translate_batch(
     *,
     status_callback: Callable[[str], None] | None = None,
 ) -> list[str]:
-    api_key = os.getenv("GOOGLE_TRANSLATE_API_KEY", "").strip()
-    if not api_key:
+    if not configured():
         raise GoogleTranslateError(
-            "GOOGLE_TRANSLATE_API_KEY is not configured"
+            "Python Google Translate fallback is unavailable because "
+            "googletrans is not installed"
         )
 
     protected: list[str] = []
     mappings: list[dict[str, str]] = []
     for item in batch:
-        html_text, mapping = _protect_html(item.get("text", ""), strategy)
-        protected.append(html_text)
+        protected_text, mapping = _protect_text(
+            item.get("text", ""),
+            strategy,
+        )
+        protected.append(protected_text)
         mappings.append(mapping)
 
     if status_callback:
@@ -192,44 +229,17 @@ def translate_batch(
         )
 
     print(
-        f"Google Translate fallback: blocks={len(batch)}, "
+        "Python Google Translate fallback: "
+        f"blocks={len(batch)}, "
         f"chars={sum(len(item.get('text', '')) for item in batch)}",
         flush=True,
     )
 
-    max_attempts = max(1, int(os.getenv("GOOGLE_TRANSLATE_MAX_RETRIES", "3")))
-    last_error: Exception | None = None
-    for attempt in range(1, max_attempts + 1):
-        check_cancel()
-        try:
-            raw = _call_once(api_key, protected, target_language)
-            return [
-                _restore_html(value, mapping)
-                for value, mapping in zip(raw, mappings)
-            ]
-        except GoogleTranslateError as exc:
-            last_error = exc
-            text = str(exc)
-            # Retry transient throttling / server failures, but not configuration
-            # or authorization failures.
-            retryable = any(
-                marker in text.lower()
-                for marker in (
-                    "http 429",
-                    "http 500",
-                    "http 502",
-                    "http 503",
-                    "http 504",
-                    "transient_google_translate_error",
-                )
-            )
-            if not retryable or attempt >= max_attempts:
-                raise
-            wait = retry_delay_from_text(text, default=min(30.0, 2.0 ** attempt))
-            if status_callback:
-                status_callback(
-                    "Google 번역 요청이 잠시 지연되어 자동으로 다시 시도하고 있습니다."
-                )
-            _sleep_cancellable(wait)
-
-    raise GoogleTranslateError(str(last_error))
+    # No deliberate Retry-After / long sleep here. The whole point of this
+    # fallback is low latency after a Gemini 429. If the web translator itself
+    # is unavailable, preserve the checkpoint and retry on a later worker run.
+    raw = _call_googletrans(protected, target_language)
+    return [
+        _restore_text(value, mapping)
+        for value, mapping in zip(raw, mappings)
+    ]
