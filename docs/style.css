@@ -22,7 +22,7 @@ button, input, select { font: inherit; }
   display: flex;
   flex-direction: row;
   align-items: center;
-  gap: 20px;
+  gap: 18px;
   width: 100%;
 }
 
@@ -30,16 +30,29 @@ button, input, select { font: inherit; }
   flex: 1 1 auto;
   width: auto;
   min-width: 0;
+  max-width: 980px;
   margin: 0;
+}
+
+@media (min-width: 1100px) {
+  .hero-title-row {
+    align-items: flex-start;
+  }
+
+  .hero-title-row h1 {
+    font-size: clamp(4.15rem, 5.4vw, 5.6rem);
+    line-height: 0.94;
+    letter-spacing: -0.04em;
+  }
 }
 
 .hero-logo {
   display: block;
-  flex: 0 0 clamp(120px, 11vw, 156px);
-  width: clamp(120px, 11vw, 156px) !important;
-  height: clamp(120px, 11vw, 156px) !important;
-  max-width: 156px;
-  max-height: 156px;
+  flex: 0 0 clamp(88px, 8.5vw, 112px);
+  width: clamp(88px, 8.5vw, 112px) !important;
+  height: clamp(88px, 8.5vw, 112px) !important;
+  max-width: 112px;
+  max-height: 112px;
   object-fit: contain;
   margin: 0;
   padding: 0;
@@ -164,12 +177,12 @@ footer { padding-top: 30px; color: #8a887f; font-size: 12px; letter-spacing: .01
   }
 
   .hero-logo {
-    flex-basis: 72px;
-    width: 72px !important;
-    height: 72px !important;
-    max-width: 72px;
-    max-height: 72px;
-    margin-top: 2px;
+    flex-basis: 58px;
+    width: 58px !important;
+    height: 58px !important;
+    max-width: 58px;
+    max-height: 58px;
+    margin-top: 4px;
   }
 
   
