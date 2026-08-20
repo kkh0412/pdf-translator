@@ -1,4 +1,9 @@
-# 대관령산양의 번역기 v8.4
+# 대관령산양의 번역기 v8.4.1
+
+## Supabase SQL hotfix
+- `pdf_translation_client_signal` 함수의 PL/pgSQL 지역변수 `current_user`를 `v_client_user_id`로 변경했습니다.
+- PostgreSQL 예약 표현 `CURRENT_USER`와의 충돌로 발생하던 `42601 syntax error`를 수정했습니다.
+- v8.4의 resilient figure 처리와 client-heartbeat worker pause 기능은 그대로 유지됩니다.
 
 ## Resilient figure extraction
 - Vision bbox 좌표는 먼저 정렬/클램프하므로 x0>x1, y0>y1이 문서를 중단시키지 않습니다.

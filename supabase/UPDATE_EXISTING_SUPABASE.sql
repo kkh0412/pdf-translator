@@ -284,13 +284,13 @@ security definer
 set search_path = public, pg_temp
 as $$
 declare
-  current_user uuid;
+  v_client_user_id uuid;
   current_owner uuid;
   current_status text;
   normalized_action text;
 begin
-  current_user := auth.uid();
-  if current_user is null then
+  v_client_user_id := auth.uid();
+  if v_client_user_id is null then
     raise exception 'authentication required';
   end if;
 
@@ -301,7 +301,7 @@ begin
   from public.translation_jobs
   where id = p_job_id;
 
-  if current_owner is null or current_owner <> current_user then
+  if current_owner is null or current_owner <> v_client_user_id then
     raise exception 'job not found';
   end if;
 
