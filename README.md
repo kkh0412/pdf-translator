@@ -1,4 +1,9 @@
-# 대관령산양의 번역기 v8.6.1
+# 대관령산양의 번역기 v8.6.2
+
+## v8.6.2 frontend refresh behavior
+
+This is a frontend-only update based on v8.6.1. A manual browser reload now resets the visible translation status/progress UI instead of immediately restoring the previous progress card. The active job id is intentionally kept in `localStorage`, so a later normal visit can still restore the existing server-side job/checkpoint. No Supabase schema or SQL migration changes are required.
+
 
 ## googletrans runtime self-healing
 

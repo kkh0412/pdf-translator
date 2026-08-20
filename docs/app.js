@@ -37,6 +37,44 @@ let heartbeatTimer = null;
 let activeJobId = null;
 const ACTIVE_JOB_KEY = 'daegwallyeong-translator-active-job';
 
+function isReloadNavigation() {
+  // A manual browser reload is treated as an explicit UI reset. Keep the
+  // active job id in localStorage so a later normal visit can still resume
+  // from the server-side checkpoint, but do not immediately restore the old
+  // progress card on the reloaded page.
+  try {
+    const entries = window.performance?.getEntriesByType?.('navigation') || [];
+    if (entries.length > 0 && typeof entries[0].type === 'string') {
+      return entries[0].type === 'reload';
+    }
+
+    // Legacy fallback for browsers without PerformanceNavigationTiming.
+    return window.performance?.navigation?.type === 1;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function resetStatusUiForReload() {
+  stopLocalElapsedClock();
+  stopHeartbeat();
+  currentJob = null;
+  activeJobId = null;
+  queuedStartedAt = null;
+  elapsedStartedAt = null;
+  activeStatusMessage = '';
+  showElapsedTime = false;
+
+  spinner.classList.add('hidden');
+  statusBox.classList.add('hidden');
+  resultBox.classList.add('hidden');
+  errorBox.classList.add('hidden');
+  progressValue.textContent = '0%';
+  progressFill.style.width = '0%';
+  progressTrack.setAttribute('aria-valuenow', '0');
+  submitBtn.disabled = false;
+}
+
 function friendlyProgressMessage(job, fallback) {
   const raw = String(job?.progress_message || '').trim();
   if (!raw) return fallback;
@@ -525,7 +563,13 @@ function initializeSupabase() {
   );
 
   ensureAnonymousSession()
-    .then(() => restoreActiveJob())
+    .then(() => {
+      if (isReloadNavigation()) {
+        resetStatusUiForReload();
+        return null;
+      }
+      return restoreActiveJob();
+    })
     .catch((error) => {
       showError(error.message || String(error));
     });
