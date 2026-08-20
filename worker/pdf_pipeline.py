@@ -218,6 +218,73 @@ def _normalize_repeated_scripts(text: str) -> str:
     return "".join(out)
 
 
+
+_DIFFERENTIAL_SHORTHANDS = {
+    "dt": r"\,\mathrm{d}t",
+    "dx": r"\,\mathrm{d}x",
+    "dy": r"\,\mathrm{d}y",
+    "dz": r"\,\mathrm{d}z",
+    "dr": r"\,\mathrm{d}r",
+    "ds": r"\,\mathrm{d}s",
+    "du": r"\,\mathrm{d}u",
+    "dv": r"\,\mathrm{d}v",
+    "dw": r"\,\mathrm{d}w",
+    "dq": r"\,\mathrm{d}q",
+    "dp": r"\,\mathrm{d}p",
+    "dtheta": r"\,\mathrm{d}\theta",
+    "dphi": r"\,\mathrm{d}\phi",
+    "dpsi": r"\,\mathrm{d}\psi",
+    "domega": r"\,\mathrm{d}\omega",
+    "dlambda": r"\,\mathrm{d}\lambda",
+    "dmu": r"\,\mathrm{d}\mu",
+    "dnu": r"\,\mathrm{d}\nu",
+}
+
+
+def _normalize_differential_shorthands(latex: str) -> str:
+    r"""Expand common source-defined differential macros into standard LaTeX.
+
+    Physics papers often define macros such as \dt or \dx in their private
+    preamble. A reconstructed formula has no access to that private preamble,
+    so these shorthands must not survive into the standalone XeLaTeX document.
+
+    This is deliberately an allow-list rather than a generic "\d..." rewrite:
+    standard commands such as \det, \dim, \dagger, \dfrac, etc. must never be
+    modified.
+    """
+    if not latex:
+        return latex
+
+    names = sorted(
+        _DIFFERENTIAL_SHORTHANDS,
+        key=len,
+        reverse=True,
+    )
+    pattern = re.compile(
+        r"\\(" + "|".join(re.escape(name) for name in names) + r")\b"
+    )
+
+    return pattern.sub(
+        lambda match: _DIFFERENTIAL_SHORTHANDS[match.group(1)],
+        latex,
+    )
+
+
+def _normalize_equation_number(value: object) -> str:
+    r"""Return a clean \tag payload without duplicated outer parentheses."""
+    number = str(value or "").strip()
+
+    # Vision often returns "(27)" even though amsmath \tag{27} already prints
+    # the intended equation label. Repeatedly strip only a complete outer pair.
+    while True:
+        match = re.fullmatch(r"\(\s*([^()]*)\s*\)", number)
+        if not match:
+            break
+        number = match.group(1).strip()
+
+    return number
+
+
 def _clean_math(latex: str) -> str:
     # Decode § transport / repair JSON controls before generic sanitation.
     # This is the critical ordering: sanitation must not delete the evidence first.
@@ -281,6 +348,10 @@ def _clean_math(latex: str) -> str:
 
     if DANGEROUS_MATH.search(latex):
         raise RuntimeError("Unsafe LaTeX command returned by the vision agent")
+
+    # Expand source-private differential macros such as \dt into standard,
+    # portable LaTeX before preflight and final rendering.
+    latex = _normalize_differential_shorthands(latex)
 
     # Normalize notation aliases that are not guaranteed to exist in a minimal
     # TeX installation. This keeps the mathematical meaning while avoiding
@@ -412,6 +483,7 @@ _MATH_TRANSPORT_COMMAND = re.compile(
     r"math(?:cal|bf|rm|sf|tt)?|"
     r"boldsymbol|mathbf|mathrm|operatorname|text(?:sf|bf|it|tt|rm)?|"
     r"frac|dfrac|tfrac|sqrt|sum|prod|int|iint|iiint|oint|lim|log|ln|exp|"
+    r"dt|dx|dy|dz|dr|ds|du|dv|dw|dq|dp|dtheta|dphi|dpsi|domega|dlambda|dmu|dnu|"
     r"alpha|beta|gamma|delta|epsilon|varepsilon|zeta|eta|theta|vartheta|"
     r"iota|kappa|lambda|mu|nu|xi|pi|varpi|rho|varrho|sigma|varsigma|"
     r"tau|upsilon|phi|varphi|chi|psi|omega|"
@@ -1452,6 +1524,34 @@ def _align_math_lines(lines: list[str]) -> list[str]:
     return aligned
 
 
+
+def _semantic_equation_lines(body: str, target: int) -> list[str] | None:
+    """Split common 'definition ... and definition ...' displays semantically."""
+    # Typical paper form:
+    # A := ... \quad \text{and} \quad B := ...
+    separator = re.compile(
+        r"\s*\\quad\s*\\text\{and\}\s*\\quad\s*"
+    )
+    parts = separator.split(body)
+
+    if len(parts) <= 1:
+        return None
+
+    lines: list[str] = []
+    for index, part in enumerate(parts):
+        part = part.strip()
+        if not part:
+            continue
+
+        if index > 0:
+            part = r"\text{and}\quad " + part
+
+        broken = _auto_break_equation(part, target)
+        lines.extend(broken)
+
+    return lines or None
+
+
 def _equation_tex(block: dict) -> str:
     body = _clean_math(block.get("equation_latex", ""))
     supplied_lines = [
@@ -1459,7 +1559,9 @@ def _equation_tex(block: dict) -> str:
         for line in block.get("equation_lines", [])
         if str(line).strip()
     ]
-    number = _escape_text(str(block.get("equation_number", "")).strip())
+    number = _escape_text(
+        _normalize_equation_number(block.get("equation_number", ""))
+    )
 
     if not body and supplied_lines:
         body = " ".join(supplied_lines)
@@ -1488,7 +1590,8 @@ def _equation_tex(block: dict) -> str:
     elif r"\\" in body and r"\begin{" not in body:
         lines = [part.strip() for part in body.split(r"\\") if part.strip()]
     else:
-        lines = _auto_break_equation(body, target)
+        semantic_lines = _semantic_equation_lines(body, target)
+        lines = semantic_lines if semantic_lines else _auto_break_equation(body, target)
 
     tag = rf"\tag{{{number}}}" if number else ""
 
@@ -1584,6 +1687,23 @@ def _last_control_sequence_from_error(output: str) -> str | None:
     candidates_source = source_lines[-1] if source_lines else tail
     commands = re.findall(r"\\([A-Za-z]+)", candidates_source)
     return commands[-1] if commands else None
+
+
+
+def _repair_undefined_differential(
+    formula: str,
+    command: str | None,
+) -> str | None:
+    """Repair an undefined allow-listed differential command deterministically."""
+    if not command or command not in _DIFFERENTIAL_SHORTHANDS:
+        return None
+
+    pattern = re.compile(r"\\" + re.escape(command) + r"\b")
+    repaired = pattern.sub(
+        lambda _match: _DIFFERENTIAL_SHORTHANDS[command],
+        formula,
+    )
+    return repaired if repaired != formula else None
 
 
 def _repair_simple_undefined_script(formula: str, command: str | None) -> str | None:
@@ -1766,12 +1886,29 @@ def preflight_math_blocks(
             record["repair_count"] += 1
             command = _last_control_sequence_from_error(compiler_output)
 
-            # Deterministic, semantically conservative repair first.
-            repaired = _repair_simple_undefined_script(record["formula"], command)
+            # Deterministic, semantically conservative repairs first.
+            repaired = _repair_undefined_differential(
+                record["formula"],
+                command,
+            )
             method = None
+
             if repaired:
-                method = f"undefined script \\{command} -> \\mathrm{{{command}}}"
+                method = (
+                    f"undefined differential \\{command} -> standard LaTeX"
+                )
             else:
+                repaired = _repair_simple_undefined_script(
+                    record["formula"],
+                    command,
+                )
+                if repaired:
+                    method = (
+                        f"undefined script \\{command} -> "
+                        f"\\mathrm{{{command}}}"
+                    )
+
+            if not repaired:
                 # Anything less obvious is reconstructed from the original PDF crop.
                 crop = _math_source_crop(pdf_path, record["block"])
                 try:

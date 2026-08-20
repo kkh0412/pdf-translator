@@ -1,38 +1,50 @@
-# PDF Translator v7.1
+# PDF Translator v7.2
 
-## Fixed: bare math transport embedded in prose
+## Math: source-private differential macros
 
-v7.0 could still abort a page when Vision returned a normal prose block with a
-small inline formula mistakenly encoded inside the text part.
+Physics/math papers often define private shorthand commands in their original
+LaTeX preamble, e.g. `\dt` for the differential `dt`. Reconstructed formulas
+do not have access to those private macros.
 
-v7.1 repairs this deterministically before translation:
+v7.2 deterministically expands an allow-list into portable standard LaTeX:
 
-    §rho
-      -> \rho
+    \dt      -> \,\mathrm{d}t
+    \dx      -> \,\mathrm{d}x
+    \dy      -> \,\mathrm{d}y
+    \dz      -> \,\mathrm{d}z
+    \dr      -> \,\mathrm{d}r
+    \dtheta  -> \,\mathrm{d}\theta
+    \dphi    -> \,\mathrm{d}\phi
+    ...
 
-    §Pi_y
-      -> \Pi_y
+The allow-list avoids corrupting standard commands such as `\det`, `\dfrac`,
+`\dagger`, etc.
 
-    C_{§mathcal{M}}
-      -> C_{\mathcal{M}}
+The exact reported Eq. (27) regression is included in the test suite.
 
-    D(§rho§Vert§gamma)
-      -> D(\rho\Vert\gamma)
+## Equation labels and paired definitions
 
-    S_{§mathcal M,§gamma}^{(j)}
-      -> S_{\mathcal M,\gamma}^{(j)}
+Vision sometimes returns an equation number already wrapped as `(27)`. v7.2
+normalizes this before amsmath `\tag`, so it becomes `\tag{27}` rather than
+`\tag{(27)}`.
 
-The recovered formula is stored behind the normal `[[MATH_n]]` placeholder, so
-the translation model cannot alter it.
+Displays of the form
 
-Sentence punctuation remains prose:
-`§gamma,` protects only `\gamma`, while the comma remains outside the math span.
-Internal punctuation such as the comma in `S_{\mathcal M,\gamma}` remains inside
-the formula.
+    A := ... \quad \text{and} \quad B := ...
 
-Only recognized mathematical transport commands are consumed. `§afránek` and
-literal `§ 3` remain prose and retain the v6.14 source-text correction path.
+are split at the semantic `and` boundary before generic line breaking.
 
-The Vision prompt also explicitly forbids §-based math transport in text parts.
+## Gemini fallback quota behavior
 
-All v7.0 semantic LaTeX tables and source-native vector/raster figures remain.
+The v7.1 single-block quality fallback could still terminate immediately on a
+429 after merely setting a cooldown.
+
+v7.2 uses the same Retry-After loop for fallback models:
+- read Google's Retry-After / retry-in delay;
+- apply the shared model cooldown;
+- retry the same fallback model;
+- stop only after the configured retry budget is genuinely exhausted.
+
+It still never inserts untranslated source prose into a "successful" PDF.
+
+All v7.1 transport recovery and v7.0 LaTeX-table/vector-raster features remain.

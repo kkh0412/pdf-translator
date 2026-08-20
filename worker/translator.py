@@ -348,6 +348,63 @@ def _translate_once(
     return out
 
 
+
+def _translate_with_quota_retries(
+    api_key: str,
+    model: str,
+    batch: list[dict],
+    target_language: str,
+    strategy: dict,
+    *,
+    context: str,
+) -> list[str]:
+    """Run one model and honor 429 Retry-After instead of aborting immediately."""
+    max_429 = max(
+        1,
+        int(os.getenv("GEMINI_MAX_429_RETRIES", "8")),
+    )
+    quota_attempt = 0
+
+    while True:
+        try:
+            return _translate_once(
+                api_key,
+                model,
+                batch,
+                target_language,
+                strategy,
+            )
+        except GeminiHTTPError as exc:
+            if exc.status != 429:
+                raise
+
+            quota_attempt += 1
+            if quota_attempt > max_429:
+                raise RuntimeError(
+                    f"{context}: Gemini rate limit did not recover after "
+                    f"{max_429} Retry-After waits on model {model}."
+                ) from exc
+
+            wait_seconds = max(
+                2.0,
+                float(
+                    exc.retry_after
+                    or retry_delay_from_text(exc.detail)
+                ),
+            ) + 1.0
+
+            impose_cooldown(model, wait_seconds)
+            print(
+                f"{context}: Gemini 429 on {model}; waiting "
+                f"{wait_seconds:.1f}s before retry "
+                f"{quota_attempt}/{max_429}.",
+                flush=True,
+            )
+
+            # _translate_once -> _call -> wait_for_slot() observes the shared
+            # cooldown on the next loop. Do not split the batch or switch models.
+
+
 def _request_batch(
     api_key: str,
     batch: list[dict],
@@ -439,25 +496,16 @@ def _request_batch(
                 f"Translation service fallback model={model}, blocks={len(batch)}",
                 flush=True,
             )
-            return _translate_once(
+            return _translate_with_quota_retries(
                 api_key,
                 model,
                 batch,
                 target_language,
                 strategy,
+                context="Translation service fallback",
             )
         except GeminiHTTPError as exc:
             last_error = exc
-            if exc.status == 429:
-                wait_seconds = max(
-                    2.0,
-                    float(exc.retry_after or retry_delay_from_text(exc.detail)),
-                ) + 1.0
-                impose_cooldown(model, wait_seconds)
-                raise RuntimeError(
-                    f"Gemini fallback model {model} is rate limited. "
-                    "The job is stopped instead of preserving untranslated source text."
-                ) from exc
             if exc.status not in {404, 500, 502, 503, 504}:
                 raise
         except GeminiOutputError:
@@ -491,27 +539,18 @@ def _recover(
                     f"Single-block quality fallback model={model}",
                     flush=True,
                 )
-                return _translate_once(
+                return _translate_with_quota_retries(
                     api_key,
                     model,
                     batch,
                     target_language,
                     strategy,
+                    context="Single-block quality fallback",
                 )
             except GeminiHTTPError as fallback_http:
-                if fallback_http.status == 429:
-                    wait_seconds = max(
-                        2.0,
-                        float(
-                            fallback_http.retry_after
-                            or retry_delay_from_text(fallback_http.detail)
-                        ),
-                    ) + 1.0
-                    impose_cooldown(model, wait_seconds)
-                    raise RuntimeError(
-                        "Gemini quota blocked the single-block fallback. "
-                        "The document is stopped rather than emitted partly untranslated."
-                    ) from fallback_http
+                if fallback_http.status not in {404, 500, 502, 503, 504}:
+                    raise
+                continue
             except GeminiOutputError:
                 continue
 
