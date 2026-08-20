@@ -22,7 +22,7 @@ button, input, select { font: inherit; }
   display: flex;
   flex-direction: row;
   align-items: center;
-  gap: 14px;
+  gap: 20px;
   width: 100%;
 }
 
@@ -35,11 +35,11 @@ button, input, select { font: inherit; }
 
 .hero-logo {
   display: block;
-  flex: 0 0 44px;
-  width: 44px !important;
-  height: 44px !important;
-  max-width: 44px;
-  max-height: 44px;
+  flex: 0 0 clamp(120px, 11vw, 156px);
+  width: clamp(120px, 11vw, 156px) !important;
+  height: clamp(120px, 11vw, 156px) !important;
+  max-width: 156px;
+  max-height: 156px;
   object-fit: contain;
   margin: 0;
   padding: 0;
@@ -164,12 +164,12 @@ footer { padding-top: 30px; color: #8a887f; font-size: 12px; letter-spacing: .01
   }
 
   .hero-logo {
-    flex-basis: 34px;
-    width: 34px !important;
-    height: 34px !important;
-    max-width: 34px;
-    max-height: 34px;
-    margin-top: 5px;
+    flex-basis: 72px;
+    width: 72px !important;
+    height: 72px !important;
+    max-width: 72px;
+    max-height: 72px;
+    margin-top: 2px;
   }
 
   
