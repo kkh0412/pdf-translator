@@ -85,7 +85,7 @@ jobs:
         shell: bash
         run: bash worker/ensure_python_runtime.sh
 
-      - name: Run translation routing regression tests
+      - name: Run worker regression tests
         if: steps.target.outputs.has_jobs == 'true'
         shell: bash
         run: .venv/bin/python -m unittest discover -s worker/tests -v

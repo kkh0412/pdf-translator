@@ -1,4 +1,49 @@
-# 대관령산양의 번역기 v8.6.3
+# 대관령산양의 번역기 v8.6.4
+
+## v8.6.4 layout fidelity update
+
+v8.6.3의 번역/429/checkpoint 신뢰성 구조를 유지하면서 최종 LaTeX 조판 경로를 수정한 버전입니다.
+Supabase schema 변경은 없으며 SQL을 다시 실행할 필요가 없습니다.
+
+### 1. display equation이 간헐적으로 커지는 문제 수정
+
+긴 단일 수식을 `\resizebox{0.98\linewidth}{!}{...}`로 처리하면 자연 폭이 더 작은 수식까지
+목표 폭으로 **확대**될 수 있었습니다. 이제 `\SourceFitDisplayMath`가 실제 수식 폭을 먼저 측정하고,
+컬럼을 넘는 경우에만 축소합니다. 짧거나 이미 들어맞는 수식은 원래 크기로 조판합니다.
+
+### 2. figure/table 크기를 source geometry에서 복원
+
+모든 figure를 일괄적으로 약 90% 폭으로 키우던 방식을 제거했습니다. figure asset의 실제 source PDF bbox
+(잘못된 Vision bbox를 native PDF geometry로 고친 경우에는 그 repaired bbox)를 사용해 원본 컬럼/본문 폭 대비
+비율을 계산합니다. semantic table도 같은 source geometry 비율을 사용합니다. vector/raster 보존 정책은 그대로입니다.
+
+### 3. list bullet 중복 제거
+
+`list_item`의 원문/번역문에 `•`, `-`, `▪` 등의 marker가 남아 있는데 LaTeX `itemize`가 marker를 하나 더
+붙여 `••`처럼 보이던 경로를 정리했습니다. 구조가 list item으로 확정된 경우 source marker는 제거하고
+LaTeX marker 하나만 사용합니다. 오래된 checkpoint 번역에 bullet이 남아 있어도 render 직전에 다시 제거합니다.
+
+### 4. section/subsection 앞 여백
+
+section 앞에는 `\addvspace{0.92em}`, subsection 앞에는 `\addvspace{0.68em}`을 적용합니다. 단순 `\vspace`보다
+연속 heading/column transition에서 불필요한 여백 누적이 적습니다. heading font family도 document scan에서 검출한
+serif/sans 설정을 사용하도록 수정했습니다.
+
+### 5. caption source style 보존
+
+PDF text layer에서 caption의 source font size/family/weight를 다시 측정해 checkpoint resume에서도 복구합니다.
+caption이 직전 figure/table과 연결되면 해당 visual의 원본 폭을 caption container에도 반영하고, source bbox 관계를
+이용해 left/center/right alignment를 결정합니다. text layer가 없는 scan은 안전한 기본 caption style로 fallback합니다.
+
+### 6. layout regression tests
+
+worker 시작 전 회귀 테스트에 다음을 추가했습니다.
+
+- 긴 단일 수식이 shrink-only 경로를 쓰는지
+- 2-column figure 폭이 source bbox 비율로 계산되는지
+- caption alignment/font size/container width 보존
+- structural bullet 제거
+- section/subsection 앞 여백 생성
 
 ## v8.6.3 translation reliability update
 

@@ -20,7 +20,7 @@ from .vision_agent import (
     _decode_math_transport,
     repair_math_formula,
     analyze_document,
-    apply_source_paragraph_indentation,
+    apply_source_layout_metadata,
     parse_pages,
     stabilize_page_blocks,
 )
@@ -876,6 +876,22 @@ def _normalized_bbox_to_rect(
     )
 
 
+def _rect_to_normalized_bbox(
+    page: pymupdf.Page,
+    rect: pymupdf.Rect,
+) -> list[float]:
+    """Convert a trustworthy source-PDF rectangle back to 0..1000 geometry."""
+    width = max(1.0, float(page.rect.width))
+    height = max(1.0, float(page.rect.height))
+    rect = rect & page.rect
+    return [
+        round(1000.0 * float(rect.x0) / width, 3),
+        round(1000.0 * float(rect.y0) / height, 3),
+        round(1000.0 * float(rect.x1) / width, 3),
+        round(1000.0 * float(rect.y1) / height, 3),
+    ]
+
+
 def _rect_intersection_area(a: pymupdf.Rect, b: pymupdf.Rect) -> float:
     inter = a & b
     if inter.is_empty or inter.width <= 0 or inter.height <= 0:
@@ -1183,7 +1199,7 @@ def _extract_figure_asset(
     bbox_norm: list[float],
     assets_dir: Path,
     index: int,
-) -> tuple[Path | None, str]:
+) -> tuple[Path | None, str, list[float] | None]:
     """Extract a figure without ever letting a malformed Vision bbox kill the PDF."""
     check_cancel()
     page = doc[page_index]
@@ -1209,7 +1225,7 @@ def _extract_figure_asset(
                 "skipping this figure instead of failing the document.",
                 flush=True,
             )
-            return None, "skipped"
+            return None, "skipped", None
 
     try:
         source_type, candidate = _classify_figure_source(doc, page, rect)
@@ -1220,14 +1236,14 @@ def _extract_figure_asset(
                 f"Figure asset {index}: bitmap source preserved as {asset.name}",
                 flush=True,
             )
-            return asset, "raster"
+            return asset, "raster", _rect_to_normalized_bbox(page, rect)
 
         asset = _save_vector_asset(doc, page_index, rect, assets_dir, index)
         print(
             f"Figure asset {index}: vector/mixed source preserved as {asset.name}",
             flush=True,
         )
-        return asset, "vector_or_mixed"
+        return asset, "vector_or_mixed", _rect_to_normalized_bbox(page, rect)
 
     except Exception as exc:
         # If native preservation itself fails but the repaired rectangle is
@@ -1240,14 +1256,18 @@ def _extract_figure_asset(
                     f"using safe raster fallback {asset.name}.",
                     flush=True,
                 )
-                return asset, "safe_raster_fallback"
+                return (
+                    asset,
+                    "safe_raster_fallback",
+                    _rect_to_normalized_bbox(page, rect),
+                )
         except Exception as fallback_exc:
             print(
                 f"Warning: figure {index} extraction and fallback both failed: "
                 f"{fallback_exc}; figure skipped.",
                 flush=True,
             )
-        return None, "skipped"
+        return None, "skipped", None
 
 
 def _page_batches(page_count: int, pages_per_call: int) -> list[list[int]]:
@@ -1310,7 +1330,7 @@ def _restore_figure_assets(
                 continue
             page_index = int(block.get("page", 0))
             check_cancel()
-            asset_path, asset_type = _extract_figure_asset(
+            asset_path, asset_type, asset_bbox = _extract_figure_asset(
                 doc,
                 page_index,
                 block["bbox"],
@@ -1322,6 +1342,8 @@ def _restore_figure_assets(
                 continue
             block["asset"] = asset_path
             block["asset_type"] = asset_type
+            if asset_bbox is not None:
+                block["asset_bbox"] = asset_bbox
             asset_index += 1
         blocks[:] = [
             block for block in blocks
@@ -1422,7 +1444,7 @@ def reconstruct_document(
     ):
         blocks = copy.deepcopy(saved_blocks)
         _restore_figure_assets(pdf_path, blocks, work_dir)
-        apply_source_paragraph_indentation(pdf_path, blocks)
+        apply_source_layout_metadata(pdf_path, blocks)
         restored_items = copy.deepcopy(saved_items)
         _annotate_translation_context(blocks, restored_items)
         if progress_callback:
@@ -1606,13 +1628,14 @@ def reconstruct_document(
                 block_id = f"p{pno}_b{local_index}"
                 block["id"] = block_id
                 block["page"] = pno
+                block["source_page_width_pt"] = float(doc[pno].rect.width)
                 block["flow_columns"] = max(
                     1, min(3, int(block.get("flow_columns", style["columns"])))
                 )
 
                 if block["kind"] == "figure":
                     check_cancel()
-                    asset_path, asset_type = _extract_figure_asset(
+                    asset_path, asset_type, asset_bbox = _extract_figure_asset(
                         doc,
                         pno,
                         block["bbox"],
@@ -1623,6 +1646,8 @@ def reconstruct_document(
                         continue
                     block["asset"] = asset_path
                     block["asset_type"] = asset_type
+                    if asset_bbox is not None:
+                        block["asset_bbox"] = asset_bbox
                     asset_index += 1
                     all_blocks.append(block)
                     continue
@@ -1687,7 +1712,7 @@ def reconstruct_document(
     finally:
         doc.close()
 
-    apply_source_paragraph_indentation(pdf_path, all_blocks)
+    apply_source_layout_metadata(pdf_path, all_blocks)
     _annotate_translation_context(all_blocks, translation_items)
 
     _checkpoint_emit(
@@ -2071,13 +2096,15 @@ def _equation_tex(block: dict) -> str:
     single = lines[0]
 
     # Last resort only: if there is no safe mathematical breakpoint at all,
-    # scale that indivisible expression instead of letting it leave the column.
+    # shrink that indivisible expression instead of letting it leave the column.
+    # SourceFitDisplayMath is explicitly shrink-only: graphicx \resizebox by
+    # itself would also enlarge naturally short expressions to the full width.
     if len(single) > int(target * 1.30):
         return (
             "\\begin{equation}\n"
-            "\\resizebox{0.98\\linewidth}{!}{$\\displaystyle "
+            "\\SourceFitDisplayMath{"
             + single
-            + "$}"
+            + "}"
             + tag
             + "\n\\end{equation}\n"
         )
@@ -2489,6 +2516,7 @@ def _table_multicolumn_type(alignment: str) -> str:
 def _render_table_tex(
     block: dict,
     translations: dict[str, str],
+    style: dict,
 ) -> str:
     """Convert the semantic table block into actual LaTeX table syntax."""
     rows = block.get("table_rows") or []
@@ -2510,8 +2538,11 @@ def _render_table_tex(
         min(int(block.get("table_header_rows", 0) or 0), len(rows)),
     )
 
+    width_ratio = max(0.30, _source_visual_width_ratio(style, block))
+
     output = [
         r"\begin{center}",
+        rf"\begin{{minipage}}{{{width_ratio:.3f}\linewidth}}",
         r"\begingroup",
         r"\small",
         r"\setlength{\tabcolsep}{3.8pt}",
@@ -2564,10 +2595,103 @@ def _render_table_tex(
             r"\bottomrule",
             r"\end{tabularx}",
             r"\endgroup",
+            r"\end{minipage}",
             r"\end{center}",
         ]
     )
     return "\n".join(output) + "\n"
+
+
+_STRUCTURAL_LIST_MARKER_RE = re.compile(
+    r"^\s*(?:(?:[•◦▪‣●○◆■□✓✔➢➤]\s*)|(?:[-–—*+]\s+))+"
+)
+
+
+def _strip_structural_list_marker(text: str) -> str:
+    """Remove a source bullet when list structure already supplies one."""
+    return _STRUCTURAL_LIST_MARKER_RE.sub("", str(text or ""), count=1)
+
+
+def _source_text_width_pt(style: dict) -> float:
+    page_width = float(style.get("page_width_pt", 612.0))
+    left = float(style.get("left_margin_pt", 55.0))
+    right = float(style.get("right_margin_pt", 55.0))
+    return max(72.0, page_width - left - right)
+
+
+def _source_visual_width_ratio(style: dict, block: dict) -> float:
+    """Recover a visual's physical width relative to its source flow.
+
+    Figure assets are cropped tightly from the source PDF.  Rendering every
+    crop as ~93% of a column destroys the original publication geometry, so
+    derive the target width from the source bbox and the local column width.
+    """
+    bbox = _normalized_bbox_values(block.get("asset_bbox") or block.get("bbox"))
+    if bbox is None:
+        return 0.93
+    source_page_width = max(
+        1.0,
+        float(block.get("source_page_width_pt", style.get("page_width_pt", 612.0))),
+    )
+    source_width = source_page_width * max(0.0, bbox[2] - bbox[0]) / 1000.0
+
+    flow_columns = max(1, min(3, int(block.get("flow_columns", 1) or 1)))
+    is_full = block.get("column") == "full" or flow_columns == 1
+    text_width = _source_text_width_pt(style)
+    if is_full:
+        reference_width = text_width
+    else:
+        gap = max(0.0, float(style.get("column_gap_pt", 18.0)))
+        reference_width = (
+            text_width - gap * max(0, flow_columns - 1)
+        ) / flow_columns
+    if reference_width <= 1.0:
+        return 0.93
+    return max(0.16, min(0.995, source_width / reference_width))
+
+
+def _caption_alignment(block: dict, visual: dict | None) -> str:
+    """Infer caption text alignment from its source geometry."""
+    if visual is None:
+        return "left"
+    caption_bbox = _normalized_bbox_values(block.get("bbox"))
+    visual_bbox = _normalized_bbox_values(
+        visual.get("asset_bbox") or visual.get("bbox")
+    )
+    if caption_bbox is None or visual_bbox is None:
+        return "left"
+
+    cap_width = max(1.0, caption_bbox[2] - caption_bbox[0])
+    vis_width = max(1.0, visual_bbox[2] - visual_bbox[0])
+    cap_center = (caption_bbox[0] + caption_bbox[2]) / 2.0
+    vis_center = (visual_bbox[0] + visual_bbox[2]) / 2.0
+    tolerance = max(14.0, min(34.0, vis_width * 0.055))
+
+    # A short caption centered under a visual is strong evidence for centered
+    # caption typography.  Full-width multi-line captions are usually left set.
+    if cap_width <= vis_width * 0.88 and abs(cap_center - vis_center) <= tolerance:
+        return "center"
+    if abs(caption_bbox[0] - visual_bbox[0]) <= tolerance:
+        return "left"
+    if abs(caption_bbox[2] - visual_bbox[2]) <= tolerance:
+        return "right"
+    return "left"
+
+
+def _caption_font_size_pt(
+    style: dict,
+    block: dict,
+    body_size: float,
+) -> float:
+    detected_body = max(1.0, float(style.get("body_size_pt", body_size)))
+    try:
+        source_size = float(block.get("source_font_size_pt", 0.0))
+    except (TypeError, ValueError):
+        source_size = 0.0
+    if source_size > 0.0:
+        scaled = source_size * body_size / detected_body
+        return max(6.2, min(body_size * 1.06, scaled))
+    return max(6.2, body_size * 0.90)
 
 
 def build_latex(
@@ -2596,6 +2720,12 @@ def build_latex(
         r"\bfseries"
         if style.get("section_weight", "normal") == "bold"
         else ""
+    )
+    body_family_cmd = (
+        r"\sffamily" if style.get("body_family") == "sans" else r"\rmfamily"
+    )
+    heading_family_cmd = (
+        r"\sffamily" if style.get("heading_family") == "sans" else r"\rmfamily"
     )
 
     preamble = rf"""\documentclass[10pt]{{article}}
@@ -2644,10 +2774,18 @@ def build_latex(
 \setlength{{\multicolsep}}{{0.35em}}
 \setlength{{\premulticols}}{{0.2em}}
 \setlength{{\postmulticols}}{{0.2em}}
-\AtBeginDocument{{\fontsize{{{body_size:.2f}pt}}{{{baseline:.2f}pt}}\selectfont}}
+\AtBeginDocument{{{body_family_cmd}\fontsize{{{body_size:.2f}pt}}{{{baseline:.2f}pt}}\selectfont}}
 \setlist[itemize]{{leftmargin=1.5em,itemsep=0.12em,topsep=0.25em,parsep=0pt}}
 \allowdisplaybreaks[2]
 \raggedbottom
+\newsavebox{{\SourceDisplayMathBox}}
+\newcommand{{\SourceFitDisplayMath}}[1]{{%
+  \sbox{{\SourceDisplayMathBox}}{{$\displaystyle #1$}}%
+  \ifdim\wd\SourceDisplayMathBox>0.98\linewidth
+    \resizebox{{0.98\linewidth}}{{!}}{{\usebox{{\SourceDisplayMathBox}}}}%
+  \else
+    \usebox{{\SourceDisplayMathBox}}%
+  \fi}}
 \makeatletter
 \def\ps@sourcepage{{%
   \def\@oddhead{{}}\def\@evenhead{{}}%
@@ -2657,12 +2795,12 @@ def build_latex(
 \makeatother
 \pagestyle{{sourcepage}}
 \newcommand{{\SourceSection}}[1]{{%
-  \par\vspace{{0.52em}}\noindent
-  {{\sffamily {section_weight_cmd}\fontsize{{{section_size:.2f}pt}}{{{section_size*1.18:.2f}pt}}\selectfont #1}}
+  \par\addvspace{{0.92em}}\noindent
+  {{{heading_family_cmd} {section_weight_cmd}\fontsize{{{section_size:.2f}pt}}{{{section_size*1.18:.2f}pt}}\selectfont #1}}
   \par\vspace{{0.25em}}}}
 \newcommand{{\SourceSubsection}}[1]{{%
-  \par\vspace{{0.40em}}\noindent
-  {{\sffamily {section_weight_cmd} #1}}\par\vspace{{0.16em}}}}
+  \par\addvspace{{0.68em}}\noindent
+  {{{heading_family_cmd} {section_weight_cmd} #1}}\par\vspace{{0.18em}}}}
 \begin{{document}}
 """
 
@@ -2685,6 +2823,8 @@ def build_latex(
     def block_text(block: dict) -> str:
         source = block.get("source_text", "")
         translated = translations.get(block["id"], source)
+        if block.get("kind") == "list_item":
+            translated = _strip_structural_list_marker(translated)
         return _render_translated_text(
             translated,
             block.get("math_map", {}),
@@ -2784,13 +2924,14 @@ def build_latex(
 
     def render_nonfloat_visual(block: dict) -> str:
         asset = Path(block["asset"]).relative_to(work_dir).as_posix()
-        full = block.get("column") == "full"
-        width = r"0.93\linewidth" if not full else r"0.90\textwidth"
+        width_ratio = _source_visual_width_ratio(style, block)
         return (
             "\\begin{center}\n"
-            rf"\includegraphics[width={width}]{{\detokenize{{{asset}}}}}"
+            rf"\includegraphics[width={width_ratio:.3f}\linewidth]{{\detokenize{{{asset}}}}}"
             "\n\\end{center}\n"
         )
+
+    last_visual: dict | None = None
 
     for block in body_blocks:
         kind = block["kind"]
@@ -2802,7 +2943,16 @@ def build_latex(
             1,
             min(3, int(block.get("flow_columns", style.get("columns", 1)))),
         )
-        full_width = block.get("column") == "full" and desired_columns > 1
+        caption_after_full_visual = bool(
+            kind == "caption"
+            and last_visual is not None
+            and last_visual.get("page") == block.get("page")
+            and last_visual.get("column") == "full"
+        )
+        full_width = (
+            (block.get("column") == "full" and desired_columns > 1)
+            or caption_after_full_visual
+        )
 
         if full_width:
             # A wide equation/figure/title-like block temporarily leaves the
@@ -2816,20 +2966,24 @@ def build_latex(
                 out.append("\\begin{itemize}\n")
                 in_items = True
             out.append("\\item " + block_text(block) + "\n")
+            last_visual = None
             continue
 
         close_items()
 
         if kind == "equation":
             out.append(_equation_tex(block))
+            last_visual = None
             continue
 
         if kind == "figure":
             out.append(render_nonfloat_visual(block))
+            last_visual = block
             continue
 
         if kind == "table":
-            out.append(_render_table_tex(block, translations))
+            out.append(_render_table_tex(block, translations, style))
+            last_visual = block
             continue
 
         text = block_text(block)
@@ -2854,11 +3008,51 @@ def build_latex(
             out.append("\\SourceSubsection{" + text + "}\n")
 
         elif kind == "caption":
-            out.append(
-                "\\noindent{\\small "
-                + text
-                + "}\\par\\vspace{0.32em}\n"
+            associated = None
+            if last_visual is not None and last_visual.get("page") == block.get("page"):
+                cap_bbox = _normalized_bbox_values(block.get("bbox"))
+                vis_bbox = _normalized_bbox_values(
+                    last_visual.get("asset_bbox") or last_visual.get("bbox")
+                )
+                if cap_bbox is not None and vis_bbox is not None:
+                    # Captions normally follow the visual and should be close in
+                    # source geometry. Avoid styling an unrelated later caption.
+                    if cap_bbox[1] >= vis_bbox[1] - 8 and cap_bbox[1] - vis_bbox[3] <= 150:
+                        associated = last_visual
+
+            container_ratio = (
+                _source_visual_width_ratio(style, associated)
+                if associated is not None
+                else 1.0
             )
+            caption_size = _caption_font_size_pt(style, block, body_size)
+            caption_leading = caption_size * 1.18
+            caption_family = (
+                r"\sffamily"
+                if block.get("source_font_family", style.get("body_family")) == "sans"
+                else r"\rmfamily"
+            )
+            alignment = _caption_alignment(block, associated)
+            align_cmd = {
+                "center": r"\centering",
+                "right": r"\raggedleft",
+                "left": r"\raggedright",
+            }[alignment]
+            out.append(
+                "\\par\\vspace{0.08em}\n"
+                "\\noindent\\makebox[\\linewidth][c]{%\n"
+                + rf"\begin{{minipage}}{{{container_ratio:.3f}\linewidth}}"
+                + "\n"
+                + "{"
+                + caption_family
+                + align_cmd
+                + rf"\fontsize{{{caption_size:.2f}pt}}{{{caption_leading:.2f}pt}}\selectfont "
+                + text
+                + "\\par}\n"
+                + "\\end{minipage}}\n"
+                + "\\par\\vspace{0.32em}\n"
+            )
+            last_visual = None
 
         elif kind == "paragraph":
             measured_indent = block.get("paragraph_indent_em")
@@ -2888,6 +3082,9 @@ def build_latex(
 
         else:
             out.append(text + "\\par\n")
+
+        if kind != "caption":
+            last_visual = None
 
     close_columns()
     out.append("\\end{document}\n")

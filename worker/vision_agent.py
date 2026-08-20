@@ -295,6 +295,22 @@ def _font_name_is_bold(font: str) -> bool:
     )
 
 
+def _font_name_family(font: str) -> str:
+    """Best-effort serif/sans classification from embedded PDF font names."""
+    name = str(font or "").lower()
+    sans_tokens = (
+        "sans",
+        "helvetica",
+        "arial",
+        "gothic",
+        "grotesk",
+        "univers",
+        "futura",
+        "calibri",
+    )
+    return "sans" if any(token in name for token in sans_tokens) else "serif"
+
+
 def _span_is_bold(span: dict) -> bool:
     flags = int(span.get("flags", 0) or 0)
     return bool(flags & 16) or _font_name_is_bold(span.get("font", ""))
@@ -1295,6 +1311,35 @@ def apply_source_paragraph_indentation(pdf_path: Path, blocks: list[dict]) -> No
     finally:
         doc.close()
 
+
+def apply_source_layout_metadata(pdf_path: Path, blocks: list[dict]) -> None:
+    """Refresh all deterministic source-layout annotations after resume."""
+    by_page: dict[int, list[dict]] = {}
+    for block in blocks:
+        try:
+            page_index = int(block.get("page", -1))
+        except (TypeError, ValueError):
+            continue
+        if page_index >= 0:
+            by_page.setdefault(page_index, []).append(block)
+    if not by_page:
+        return
+    doc = pymupdf.open(pdf_path)
+    try:
+        for page_index, page_blocks in by_page.items():
+            if page_index < 0 or page_index >= doc.page_count:
+                continue
+            page_width_pt = float(doc[page_index].rect.width)
+            for block in page_blocks:
+                block["source_page_width_pt"] = page_width_pt
+            hints = _page_hints(doc[page_index])
+            _apply_source_paragraph_indent(page_blocks, hints)
+            _apply_source_font_weight(page_blocks, hints)
+            _apply_source_typography_metadata(page_blocks, hints)
+            _normalize_list_item_markers(page_blocks)
+    finally:
+        doc.close()
+
 def _apply_source_font_weight(
     blocks: list[dict],
     hints: list[dict],
@@ -1334,6 +1379,75 @@ def _apply_source_font_weight(
             block["style"] = "italic"
         elif bold_ratio <= 0.18 and italic_ratio <= 0.18:
             block["style"] = "normal"
+
+
+_LIST_MARKER_RE = re.compile(
+    r"^\s*(?:(?:[•◦▪‣●○◆■□✓✔➢➤]\s*)|(?:[-–—*+]\s+))+"
+)
+
+
+def _normalize_list_item_markers(blocks: list[dict]) -> None:
+    """Remove source glyph bullets once a block is structurally a list item.
+
+    The renderer supplies the list marker. Keeping the PDF glyph in the source
+    text would therefore produce two bullets after translation.
+    """
+    for block in blocks:
+        if block.get("kind") != "list_item":
+            continue
+        for part in block.get("parts") or []:
+            if part.get("type") != "text":
+                continue
+            original = str(part.get("content", ""))
+            cleaned = _LIST_MARKER_RE.sub("", original, count=1)
+            if cleaned != original:
+                part["content"] = cleaned
+                block["source_list_marker_removed"] = True
+            # Only the first textual segment can own the structural marker.
+            break
+
+
+def _apply_source_typography_metadata(
+    blocks: list[dict],
+    hints: list[dict],
+) -> None:
+    """Attach deterministic source font metadata used by final layout.
+
+    This is deliberately separate from Gemini's semantic schema. Font size and
+    family can be measured more reliably from the PDF text layer and survive
+    checkpoint resume without spending another vision request.
+    """
+    for block in blocks:
+        if block.get("kind") in {"equation", "figure", "table", "footer"}:
+            continue
+        bbox = block.get("bbox") or []
+        if len(bbox) != 4:
+            continue
+        block_area = max(1.0, _bbox_area(bbox))
+        best: tuple[float, dict] | None = None
+        for hint in hints:
+            hb = hint.get("bbox") or []
+            if len(hb) != 4:
+                continue
+            area = _bbox_intersection_area(bbox, hb)
+            if area <= 0:
+                continue
+            hint_area = max(1.0, _bbox_area(hb))
+            score = area / block_area + area / hint_area
+            if best is None or score > best[0]:
+                best = (score, hint)
+        if best is None:
+            continue
+        hint = best[1]
+        try:
+            size = float(hint.get("font_size", 0.0))
+        except (TypeError, ValueError):
+            size = 0.0
+        if 5.0 <= size <= 36.0:
+            block["source_font_size_pt"] = round(size, 2)
+        block["source_font_family"] = _font_name_family(hint.get("font", ""))
+        block["source_bold_ratio"] = float(hint.get("bold_ratio", 0.0) or 0.0)
+        block["source_italic_ratio"] = float(hint.get("italic_ratio", 0.0) or 0.0)
 
 
 
@@ -1815,6 +1929,8 @@ def _stabilize_blocks_from_source(
     _deduplicate_hybrid_prose(blocks, page_number)
     _apply_source_paragraph_indent(blocks, hints)
     _apply_source_font_weight(blocks, hints)
+    _apply_source_typography_metadata(blocks, hints)
+    _normalize_list_item_markers(blocks)
 
     if local_hint > 1 and not any(int(b.get("flow_columns", 1)) > 1 for b in blocks):
         for block in blocks:
