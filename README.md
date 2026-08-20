@@ -1,4 +1,44 @@
-# 대관령산양의 번역기 v8.2
+# 대관령산양의 번역기 v8.3
+
+## Hybrid PDF reconstruction safety architecture
+
+v8.3 removes two page-fatal assumptions that caused repeated failures on
+equation-heavy scientific pages.
+
+### 1. Prose completeness is source-text-backed, not Vision-count-backed
+The old validator compared all alphabetic characters extracted from the PDF
+(including letters inside equations) against only Vision prose characters.
+Equation-heavy pages could therefore fail with misleading ratios such as
+`226/714` even when most missing characters belonged to mathematics.
+
+Now:
+- ordinary prose uses the PDF text layer as an authoritative wording source;
+- a strongly matched plain-prose Vision block can be restored from source text;
+- source prose blocks genuinely omitted by Vision are inserted deterministically;
+- math-looking source blocks are NEVER converted into prose;
+- completeness is diagnostic only after source recovery, not a page-fatal gate.
+
+### 2. equation_lines can never kill a page
+`equation_lines` is only a layout hint. v8.3 discards it and uses the full
+`equation_latex` plus the renderer's deterministic line breaking. A malformed
+matrix/determinant line hint therefore no longer causes the page to be retried.
+
+### 3. Malformed full formulas are deferred to math preflight
+A brace problem in `equation_latex` or inline math is flagged but does not cause
+page OCR to restart. The formula reaches the existing independent XeLaTeX
+preflight, which can reconstruct only that formula from its original PDF crop.
+
+### 4. Persistent checkpoints are upgraded automatically
+Pages saved by older v7/v8 checkpoints are passed through the same deterministic
+hybrid source-text recovery on resume. Already-finished pages do not need a new
+Vision API call.
+
+Structural failures that cannot be safely guessed (empty equations, broken
+semantic table geometry, invalid bboxes) remain strict and still trigger a
+Vision retry.
+
+All v8.2 homepage behavior and earlier checkpoint, LaTeX-table, vector/raster,
+translation, quota, and math-preflight features are retained.
 
 ## Large logo + fixed two-line title
 - 산양 로고를 다시 데스크톱 120–156px로 복원했습니다.

@@ -21,6 +21,7 @@ from .vision_agent import (
     analyze_document,
     apply_source_paragraph_indentation,
     parse_pages,
+    stabilize_page_blocks,
 )
 
 
@@ -1295,6 +1296,16 @@ def reconstruct_document(
     page_results = _checkpoint_page_results(
         checkpoint_state.get("page_results")
     )
+
+    # v8.3 hybrid recovery is deterministic, so previously checkpointed pages
+    # are upgraded in place without spending another Gemini request.
+    for saved_index in sorted(page_results):
+        page_results[saved_index] = stabilize_page_blocks(
+            pdf_path,
+            saved_index,
+            page_results[saved_index],
+        )
+
     missing_indices = [
         index for index in range(source_pages) if index not in page_results
     ]
@@ -1317,8 +1328,8 @@ def reconstruct_document(
             if len(indices) == 1:
                 raise
             print(
-                f"Vision batch {[i + 1 for i in indices]} failed; "
-                f"retrying pages individually: {exc}",
+                f"Vision structural retry for pages {[i + 1 for i in indices]}; "
+                f"checking pages individually: {exc}",
                 flush=True,
             )
             merged: dict[int, list[dict]] = {}

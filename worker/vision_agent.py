@@ -1323,50 +1323,514 @@ def _apply_source_font_weight(
             block["style"] = "normal"
 
 
+
+_MATH_FONT_TOKENS = (
+    "math", "cmmi", "cmsy", "cmex", "msam", "msbm", "symbol",
+    "stmary", "wasy", "eufm", "eufb", "rsfs", "txsy", "pxsy",
+)
+_MATH_SOURCE_CHARS = set(
+    "=+-−×÷*/^_{}[]()<>|∫∑∏√∞≤≥≠≈∼⊗⊕⊙∂∇†‡→←↔⇒⇔"
+)
+
+
+def _bbox_area(bbox: list[float]) -> float:
+    if len(bbox) != 4:
+        return 0.0
+    return max(
+        0.0,
+        (float(bbox[2]) - float(bbox[0]))
+        * (float(bbox[3]) - float(bbox[1])),
+    )
+
+
+def _hint_is_footer_or_page_number(hint: dict) -> bool:
+    text = " ".join(str(hint.get("text", "")).split())
+    bbox = hint.get("bbox", [])
+    if not text or len(bbox) != 4:
+        return True
+    if re.fullmatch(r"(?:page\s*)?\d+", text, flags=re.I):
+        return True
+    if float(bbox[1]) >= 955 and len(text) <= 140:
+        return True
+    return False
+
+
+def _hint_likely_math(hint: dict) -> bool:
+    """Conservative classifier for PDF text blocks dominated by mathematics.
+
+    This is used only to decide whether a *missing* text-layer block may be
+    safely restored as prose. It never decides mathematical meaning.
+    """
+    text = str(hint.get("text", ""))
+    if not text:
+        return False
+
+    font = str(hint.get("font", "")).lower()
+    if any(token in font for token in _MATH_FONT_TOKENS):
+        return True
+
+    compact = "".join(ch for ch in text if not ch.isspace())
+    if not compact:
+        return False
+
+    math_chars = sum(ch in _MATH_SOURCE_CHARS for ch in compact)
+    letters = _alphabetic_count(compact)
+    math_ratio = math_chars / max(1, len(compact))
+
+    if math_chars >= 5 and math_ratio >= 0.075:
+        return True
+    if math_chars >= 3 and letters <= 45:
+        return True
+    if ("=" in compact or "∫" in compact or "∑" in compact) and math_chars >= 2 and letters <= 90:
+        return True
+
+    return False
+
+
+def _hint_is_prose_candidate(hint: dict) -> bool:
+    return (
+        not _hint_is_footer_or_page_number(hint)
+        and not _hint_likely_math(hint)
+        and _alphabetic_count(str(hint.get("text", ""))) >= 8
+    )
+
+
+def _hint_overlap_fraction(hint: dict, block: dict) -> float:
+    hb = hint.get("bbox", [])
+    bb = block.get("bbox", [])
+    area = _bbox_intersection_area(hb, bb)
+    return area / max(1.0, _bbox_area(hb))
+
+
+def _hint_is_covered(hint: dict, blocks: list[dict]) -> bool:
+    hb = hint.get("bbox", [])
+    if len(hb) != 4:
+        return True
+    cx = (float(hb[0]) + float(hb[2])) / 2.0
+    cy = (float(hb[1]) + float(hb[3])) / 2.0
+
+    for block in blocks:
+        bb = block.get("bbox", [])
+        if len(bb) != 4:
+            continue
+        if _hint_overlap_fraction(hint, block) >= 0.42:
+            return True
+        if (
+            float(bb[0]) <= cx <= float(bb[2])
+            and float(bb[1]) <= cy <= float(bb[3])
+        ):
+            return True
+    return False
+
+
+def _block_has_inline_math(block: dict) -> bool:
+    return any(
+        part.get("type") == "math" and str(part.get("content", "")).strip()
+        for part in (block.get("parts") or [])
+    )
+
+
+def _anchor_plain_prose_to_source(
+    blocks: list[dict],
+    hints: list[dict],
+    page_number: int,
+) -> int:
+    """Make the PDF text layer authoritative for simple prose blocks.
+
+    Vision remains responsible for segmentation and inline-math separation.
+    If a Vision block contains no inline math and clearly corresponds to one
+    source-PDF text block, use the source wording verbatim. This repairs cases
+    where Vision summarizes or truncates a prose paragraph while preserving
+    its bbox.
+    """
+    replaced = 0
+    for block in blocks:
+        if block.get("kind") in {"equation", "figure", "table", "footer"}:
+            continue
+        if _block_has_inline_math(block):
+            continue
+
+        bb = block.get("bbox", [])
+        if len(bb) != 4:
+            continue
+        block_area = max(1.0, _bbox_area(bb))
+
+        strong: list[dict] = []
+        for hint in hints:
+            if not _hint_is_prose_candidate(hint):
+                continue
+            hb = hint.get("bbox", [])
+            inter = _bbox_intersection_area(bb, hb)
+            if inter <= 0:
+                continue
+            if (
+                inter / max(1.0, _bbox_area(hb)) >= 0.78
+                and inter / block_area >= 0.48
+            ):
+                strong.append(hint)
+
+        if len(strong) != 1:
+            continue
+
+        hint_text = str(strong[0].get("text", "")).strip()
+        vision_text = "".join(
+            str(part.get("content", ""))
+            for part in (block.get("parts") or [])
+            if part.get("type") == "text"
+        ).strip()
+
+        source_letters = _alphabetic_count(hint_text)
+        vision_letters = _alphabetic_count(vision_text)
+        if source_letters < 8:
+            continue
+
+        # Source wording is authoritative when Vision is visibly shorter, or
+        # when both are similar-sized but differ. Do not overwrite tiny labels.
+        if source_letters >= max(8, int(vision_letters * 1.08)):
+            block["parts"] = [{"type": "text", "content": hint_text}]
+            block["source_text_recovered"] = True
+            replaced += 1
+
+    if replaced:
+        print(
+            f"Vision page {page_number}: restored {replaced} prose block(s) "
+            "from the source PDF text layer.",
+            flush=True,
+        )
+    return replaced
+
+
+def _column_for_bbox(bbox: list[float], local_hint: int) -> str:
+    if len(bbox) != 4 or local_hint <= 1:
+        return "auto"
+    width = float(bbox[2]) - float(bbox[0])
+    if width >= 720:
+        return "full"
+    center = (float(bbox[0]) + float(bbox[2])) / 2.0
+    if local_hint == 2:
+        return "column1" if center < 500 else "column2"
+    if center < 333:
+        return "column1"
+    if center < 667:
+        return "column2"
+    return "column3"
+
+
+def _fallback_style_from_hint(hint: dict) -> str:
+    if float(hint.get("bold_ratio", 0.0)) >= 0.62:
+        return "bold"
+    if float(hint.get("italic_ratio", 0.0)) >= 0.62:
+        return "italic"
+    return "normal"
+
+
+def _fallback_kind_from_hint(
+    hint: dict,
+    hints: list[dict],
+    page_number: int,
+) -> str:
+    text = " ".join(str(hint.get("text", "")).split())
+    sizes = [
+        float(h.get("font_size", 10.0))
+        for h in hints
+        if _hint_is_prose_candidate(h)
+    ]
+    body = statistics.median(sizes) if sizes else 10.0
+    size = float(hint.get("font_size", 10.0))
+    y0 = float((hint.get("bbox") or [0, 1000, 0, 0])[1])
+
+    if page_number == 1 and y0 < 260 and size >= body * 1.55 and len(text) <= 240:
+        return "title"
+    if size >= body * 1.18 and len(text) <= 180:
+        return "section"
+    return "paragraph"
+
+
+def _insert_fallback_by_geometry(
+    blocks: list[dict],
+    fallback: dict,
+    local_hint: int,
+) -> None:
+    fb_bbox = fallback.get("bbox", [])
+    fb_col = _column_for_bbox(fb_bbox, local_hint)
+    fb_y = float(fb_bbox[1]) if len(fb_bbox) == 4 else 1000.0
+
+    same_column_indices: list[int] = []
+    for index, block in enumerate(blocks):
+        bb = block.get("bbox", [])
+        if len(bb) != 4:
+            continue
+        block_col = block.get("column")
+        if block_col in {None, "auto"}:
+            block_col = _column_for_bbox(bb, local_hint)
+        if fb_col == "full" or block_col == fb_col or local_hint <= 1:
+            same_column_indices.append(index)
+            if float(bb[1]) > fb_y:
+                blocks.insert(index, fallback)
+                return
+
+    if same_column_indices:
+        blocks.insert(same_column_indices[-1] + 1, fallback)
+    else:
+        blocks.append(fallback)
+
+
+def _recover_missing_prose_from_source(
+    blocks: list[dict],
+    hints: list[dict],
+    page_number: int,
+    local_hint: int,
+) -> int:
+    """Add only source-PDF prose blocks that Vision truly omitted.
+
+    Mathematical-looking source blocks are never converted to prose. Their
+    recovery remains the responsibility of Vision / math preflight.
+    """
+    recovered = 0
+    for hint in hints:
+        if not _hint_is_prose_candidate(hint):
+            continue
+        if _hint_is_covered(hint, blocks):
+            continue
+
+        kind = _fallback_kind_from_hint(hint, hints, page_number)
+        fallback = {
+            "kind": kind,
+            "flow_columns": max(1, min(3, int(local_hint or 1))),
+            "column": _column_for_bbox(hint.get("bbox", []), local_hint),
+            "translate": True,
+            "style": _fallback_style_from_hint(hint),
+            "parts": [
+                {"type": "text", "content": str(hint.get("text", "")).strip()}
+            ],
+            "equation_latex": "",
+            "equation_lines": [],
+            "equation_number": "",
+            "table_header_rows": 0,
+            "table_alignments": [],
+            "table_rows": [],
+            "bbox": list(hint.get("bbox", [])),
+            "source_text_fallback": True,
+        }
+        _insert_fallback_by_geometry(blocks, fallback, local_hint)
+        recovered += 1
+
+    if recovered:
+        print(
+            f"Vision page {page_number}: inserted {recovered} missing prose "
+            "block(s) from the source PDF text layer.",
+            flush=True,
+        )
+    return recovered
+
+
+def _math_transport_problem(math: str) -> str | None:
+    decoded = _decode_math_transport(str(math or "")).strip()
+    if not decoded:
+        return "empty LaTeX"
+    return _brace_balance_error(decoded)
+
+
+def _soften_math_fields(blocks: list[dict], page_number: int) -> None:
+    """Defer reparable math transcription defects to the math preflight stage.
+
+    `equation_lines` are merely layout hints; they are never allowed to kill a
+    page. The renderer already has deterministic line breaking from the full
+    equation. A malformed full formula is kept and flagged so source-crop math
+    repair can handle it later without repeating page OCR.
+    """
+    for block in blocks:
+        kind = block.get("kind")
+        if kind == "equation":
+            latex = str(block.get("equation_latex", "")).strip()
+            lines = [
+                str(line).strip()
+                for line in (block.get("equation_lines") or [])
+                if str(line).strip()
+            ]
+
+            if not latex and lines:
+                # Better than losing the block; preflight will verify / repair.
+                latex = " ".join(lines)
+                block["equation_latex"] = latex
+
+            if latex:
+                problem = _math_transport_problem(latex)
+                if problem:
+                    block["needs_math_source_repair"] = True
+                    print(
+                        f"Vision page {page_number}: deferring malformed full "
+                        f"equation to math preflight ({problem}).",
+                        flush=True,
+                    )
+
+            if lines:
+                bad_line = next(
+                    (
+                        _math_transport_problem(line)
+                        for line in lines
+                        if _math_transport_problem(line)
+                    ),
+                    None,
+                )
+                # All line hints are discarded. v7.5+ already generates safer
+                # line breaks from equation_latex, and this removes a frequent
+                # source of false page failures for matrices / determinants.
+                block["equation_lines"] = []
+                block["vision_equation_lines_discarded"] = True
+                if bad_line:
+                    print(
+                        f"Vision page {page_number}: ignored malformed equation "
+                        f"line-break hint ({bad_line}); full equation retained.",
+                        flush=True,
+                    )
+
+        elif kind == "table":
+            for row in (block.get("table_rows") or []):
+                for cell in (row.get("cells") or []):
+                    cleaned_parts = []
+                    for part in (cell.get("parts") or []):
+                        if part.get("type") != "math":
+                            cleaned_parts.append(part)
+                            continue
+                        content = str(part.get("content", "")).strip()
+                        if not content:
+                            continue
+                        if _math_transport_problem(content):
+                            block["needs_math_source_repair"] = True
+                        cleaned_parts.append(part)
+                    cell["parts"] = cleaned_parts
+
+        elif kind != "figure":
+            cleaned_parts = []
+            for part in (block.get("parts") or []):
+                if part.get("type") != "math":
+                    cleaned_parts.append(part)
+                    continue
+                content = str(part.get("content", "")).strip()
+                if not content:
+                    continue
+                if _math_transport_problem(content):
+                    block["needs_math_source_repair"] = True
+                cleaned_parts.append(part)
+            block["parts"] = cleaned_parts
+
+
+def _stabilize_blocks_from_source(
+    blocks: list[dict],
+    hints: list[dict],
+    page_number: int,
+    local_hint: int,
+) -> list[dict]:
+    _soften_math_fields(blocks, page_number)
+    _repair_prose_glyphs_from_source(blocks, hints)
+    _anchor_plain_prose_to_source(blocks, hints, page_number)
+    _recover_missing_prose_from_source(blocks, hints, page_number, local_hint)
+    _apply_source_paragraph_indent(blocks, hints)
+    _apply_source_font_weight(blocks, hints)
+
+    if local_hint > 1 and not any(int(b.get("flow_columns", 1)) > 1 for b in blocks):
+        for block in blocks:
+            if block.get("column") != "full":
+                block["flow_columns"] = local_hint
+
+    source_prose_letters = sum(
+        _alphabetic_count(str(hint.get("text", "")))
+        for hint in hints
+        if _hint_is_prose_candidate(hint)
+    )
+    output_prose_letters = 0
+    for block in blocks:
+        if block.get("kind") in {"equation", "figure", "table"}:
+            continue
+        for part in (block.get("parts") or []):
+            if part.get("type") == "text":
+                output_prose_letters += _alphabetic_count(str(part.get("content", "")))
+
+    if source_prose_letters >= 120:
+        ratio = output_prose_letters / max(1, source_prose_letters)
+        print(
+            f"Vision page {page_number}: hybrid prose coverage "
+            f"{output_prose_letters}/{source_prose_letters} ({ratio:.0%}).",
+            flush=True,
+        )
+        if ratio < 0.70:
+            print(
+                f"Vision page {page_number}: prose coverage remains low after "
+                "source-text recovery; continuing without discarding the page. "
+                "Mathematics is checked independently in preflight.",
+                flush=True,
+            )
+
+    return blocks
+
+
+def stabilize_page_blocks(
+    pdf_path: Path,
+    page_index: int,
+    blocks: list[dict],
+) -> list[dict]:
+    """Re-run deterministic hybrid recovery for a resumed checkpoint page."""
+    doc = pymupdf.open(pdf_path)
+    try:
+        if page_index < 0 or page_index >= doc.page_count:
+            return blocks
+        hints = _page_hints(doc[page_index])
+        return _stabilize_blocks_from_source(
+            blocks,
+            hints,
+            page_index + 1,
+            _local_column_hint(hints),
+        )
+    finally:
+        doc.close()
+
+
 def _validate_blocks(
     blocks: list[dict],
     hints: list[dict],
     page_number: int,
     local_hint: int,
 ) -> list[dict]:
-    if not isinstance(blocks, list) or not blocks:
-        raise GeminiVisionError(f"Page {page_number}: vision agent returned no blocks")
+    """Validate only defects that cannot be safely repaired downstream.
 
-    src_letters = sum(_alphabetic_count(hint["text"]) for hint in hints)
-    out_letters = 0
+    Prose completeness and LaTeX brace balance are no longer page-fatal here.
+    They belong to deterministic source-text recovery and formula preflight.
+    """
+    if not isinstance(blocks, list) or not blocks:
+        raise GeminiVisionError(
+            f"Page {page_number}: vision agent returned no blocks"
+        )
+
     equation_count = 0
-    has_multi_flow = False
 
     for block in blocks:
         kind = block.get("kind")
-        flow = int(block.get("flow_columns", 1))
-        if flow > 1:
-            has_multi_flow = True
+        bbox = block.get("bbox", [])
+        if len(bbox) != 4:
+            raise GeminiVisionError(
+                f"Page {page_number}: invalid bbox in {kind} block"
+            )
+
+        try:
+            flow = int(block.get("flow_columns", 1))
+        except (TypeError, ValueError):
+            flow = 1
+        block["flow_columns"] = max(1, min(3, flow))
 
         if kind == "equation":
             latex = str(block.get("equation_latex", "")).strip()
-            lines = block.get("equation_lines") or []
-            if not latex and not any(str(line).strip() for line in lines):
+            lines = [
+                str(line).strip()
+                for line in (block.get("equation_lines") or [])
+                if str(line).strip()
+            ]
+            if not latex and not lines:
                 raise GeminiVisionError(
                     f"Page {page_number}: equation block has no LaTeX"
                 )
-
-            if latex:
-                _validate_math_transport(
-                    latex,
-                    page_number,
-                    "equation_latex",
-                )
-
-            for line_index, line in enumerate(lines):
-                if str(line).strip():
-                    _validate_math_transport(
-                        str(line),
-                        page_number,
-                        f"equation_lines[{line_index}]",
-                    )
-
             equation_count += 1
+
         elif kind == "table":
             rows = block.get("table_rows") or []
             if not rows:
@@ -1383,31 +1847,12 @@ def _validate_blocks(
                     )
 
                 logical_width = 0
-                for cell_index, cell in enumerate(cells):
+                for cell in cells:
                     logical_width += max(1, int(cell.get("colspan", 1)))
-                    parts = cell.get("parts")
-                    if not isinstance(parts, list):
+                    if not isinstance(cell.get("parts"), list):
                         raise GeminiVisionError(
                             f"Page {page_number}: invalid table cell parts"
                         )
-
-                    for part in parts:
-                        if part.get("type") == "text":
-                            out_letters += _alphabetic_count(
-                                str(part.get("content", ""))
-                            )
-                        elif part.get("type") == "math":
-                            math = str(part.get("content", "")).strip()
-                            if not math:
-                                raise GeminiVisionError(
-                                    f"Page {page_number}: empty table-cell math"
-                                )
-                            _validate_math_transport(
-                                math,
-                                page_number,
-                                f"table row {row_index} cell {cell_index}",
-                            )
-
                 row_widths.append(logical_width)
 
             column_count = max(row_widths)
@@ -1434,46 +1879,17 @@ def _validate_blocks(
                 )
 
         elif kind != "figure":
-            parts = block.get("parts")
-            if not isinstance(parts, list):
+            if not isinstance(block.get("parts"), list):
                 raise GeminiVisionError(
                     f"Page {page_number}: invalid parts in {kind}"
                 )
-            for part in parts:
-                if part.get("type") == "text":
-                    out_letters += _alphabetic_count(str(part.get("content", "")))
-                elif part.get("type") == "math":
-                    math = str(part.get("content", "")).strip()
-                    if not math:
-                        raise GeminiVisionError(
-                            f"Page {page_number}: empty inline math"
-                        )
-                    _validate_math_transport(
-                        math,
-                        page_number,
-                        f"inline math in {kind}",
-                    )
 
-        bbox = block.get("bbox", [])
-        if len(bbox) != 4:
-            raise GeminiVisionError(f"Page {page_number}: invalid bbox")
-
-    _repair_prose_glyphs_from_source(blocks, hints)
-    _apply_source_paragraph_indent(blocks, hints)
-    _apply_source_font_weight(blocks, hints)
-
-    if src_letters >= 500 and out_letters < src_letters * 0.46:
-        raise GeminiVisionError(
-            f"Page {page_number}: vision transcription appears incomplete "
-            f"({out_letters}/{src_letters} alphabetic chars)"
-        )
-
-    # If geometry clearly sees multiple columns but every returned block says
-    # one column, correct the obvious collapse. Mixed layouts are left alone.
-    if local_hint > 1 and not has_multi_flow:
-        for block in blocks:
-            if block.get("column") != "full":
-                block["flow_columns"] = local_hint
+    blocks = _stabilize_blocks_from_source(
+        blocks,
+        hints,
+        page_number,
+        local_hint,
+    )
 
     print(
         f"Vision page {page_number}: blocks={len(blocks)}, "
