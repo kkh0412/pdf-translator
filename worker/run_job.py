@@ -61,6 +61,10 @@ def _is_transient_error(message: str) -> bool:
         "transient_gemini_error:" in text
         or "temporarily unavailable" in text
         or "high demand" in text
+        or "resource_exhausted" in text
+        or "quota exceeded" in text
+        or "all configured vision models" in text
+        or "all configured translation models" in text
     )
 
 
@@ -152,7 +156,7 @@ def main(job_id: str) -> int:
             "error": None,
         }
     ).eq("id", job_id).execute()
-    update_progress(4, "Worker가 작업을 시작했습니다. 원본 PDF를 불러오고 있습니다.")
+    update_progress(4, "문서를 불러오고 있습니다.")
 
     temp = Path(tempfile.mkdtemp(prefix=f"pdfjob-{job_id[:8]}-"))
 
@@ -168,7 +172,7 @@ def main(job_id: str) -> int:
             f"Input PDF: {_mb(input_path.stat().st_size):.2f} MB",
             flush=True,
         )
-        update_progress(6, "원본 PDF 로드 완료 · 문서 분석을 준비하고 있습니다.")
+        update_progress(6, "문서를 불러왔습니다 · 분석을 준비하고 있습니다.")
 
         output_path = temp / "translated.pdf"
         info = process_pdf(
@@ -191,7 +195,7 @@ def main(job_id: str) -> int:
             )
 
         result_path = f"{job['user_id']}/{job_id}/translated.pdf"
-        update_progress(98, "최종 PDF를 Supabase Storage에 업로드하고 있습니다.")
+        update_progress(98, "완성된 번역본을 저장하고 있습니다.")
 
         try:
             db.storage.from_("documents").upload(
@@ -225,7 +229,7 @@ def main(job_id: str) -> int:
             done_payload.update(
                 {
                     "progress": 100,
-                    "progress_message": "번역 PDF가 준비되었습니다.",
+                    "progress_message": "번역이 완료되었습니다.",
                     "progress_updated_at": now(),
                 }
             )
@@ -240,16 +244,25 @@ def main(job_id: str) -> int:
 
         if _is_transient_error(message):
             # Keep the job in the queue. The next scheduled worker will try again.
+            retry_payload = {
+                "status": "queued",
+                "error": None,
+                "started_at": None,
+                "finished_at": None,
+            }
+            if progress_updates_enabled:
+                retry_payload.update(
+                    {
+                        "progress_message": (
+                            "현재 요청이 많아 잠시 기다리는 중입니다. "
+                            "준비되는 대로 자동으로 이어서 처리합니다."
+                        ),
+                        "progress_updated_at": now(),
+                    }
+                )
+
             db.table("translation_jobs").update(
-                {
-                    "status": "queued",
-                    "error": (
-                        "Gemini is temporarily busy. "
-                        "The worker will retry automatically."
-                    ),
-                    "started_at": None,
-                    "finished_at": None,
-                }
+                retry_payload
             ).eq("id", job_id).execute()
             print(
                 f"Temporary Gemini error; requeued {job_id}: {message}",

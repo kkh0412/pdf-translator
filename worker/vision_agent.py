@@ -12,7 +12,14 @@ from pathlib import Path
 
 import pymupdf
 
-from .gemini_rate import impose_cooldown, retry_delay_from_text, wait_for_slot
+from .gemini_rate import (
+    daily_quota_exhausted,
+    impose_cooldown,
+    is_daily_quota_error,
+    mark_daily_quota_exhausted,
+    retry_delay_from_text,
+    wait_for_slot,
+)
 
 
 LANGUAGE_NAMES = {
@@ -31,12 +38,28 @@ class GeminiVisionError(RuntimeError):
 
 
 def _model_candidates() -> list[str]:
-    primary = os.getenv("GEMINI_VISION_MODEL", "gemini-3.5-flash-lite").strip()
+    primary = os.getenv(
+        "GEMINI_VISION_MODEL",
+        "gemini-3.5-flash-lite",
+    ).strip()
+
+    configured = [
+        item.strip()
+        for item in os.getenv("GEMINI_VISION_MODELS", "").split(",")
+        if item.strip()
+    ]
+
     models = [
         primary,
+        *configured,
         "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
+        "gemini-3.5-flash",
         "gemini-3.6-flash",
     ]
+
     out: list[str] = []
     for model in models:
         if model and model not in out:
@@ -104,6 +127,13 @@ def _call_json(
     last_error: Exception | None = None
 
     for model in _model_candidates():
+        if daily_quota_exhausted(model):
+            print(
+                f"Vision model {model} skipped: daily quota already exhausted.",
+                flush=True,
+            )
+            continue
+
         model_unavailable = False
 
         for format_mode in ("enum_response_format", "legacy_json_schema"):
@@ -167,21 +197,34 @@ def _call_json(
                         break
 
                     if exc.code == 429:
+                        if is_daily_quota_error(detail):
+                            mark_daily_quota_exhausted(model)
+                            print(
+                                f"Vision daily quota exhausted for {model}; "
+                                "switching to the next configured model.",
+                                flush=True,
+                            )
+                            model_unavailable = True
+                            break
+
                         wait_seconds = retry_delay_from_text(
                             detail,
                             default=60.0,
                         ) + 1.0
                         impose_cooldown(model, wait_seconds)
                         print(
-                            f"Vision Gemini 429 for {model}: shared cooldown "
-                            f"{wait_seconds:.1f}s; retrying the same model.",
+                            f"Vision transient 429 for {model}: waiting "
+                            f"{wait_seconds:.1f}s before retry.",
                             flush=True,
                         )
                         if attempt == 0:
                             continue
-                        raise GeminiVisionError(
-                            f"Vision rate limited after Retry-After wait: {detail}"
-                        )
+
+                        # Two temporary throttles on the same request are enough;
+                        # continue through the model chain instead of failing the
+                        # entire PDF.
+                        model_unavailable = True
+                        break
 
                     if exc.code in {500, 502, 503, 504}:
                         if attempt == 0:
@@ -209,7 +252,10 @@ def _call_json(
         if model_unavailable:
             continue
 
-    raise GeminiVisionError(f"Vision agent failed for {label}: {last_error}")
+    raise GeminiVisionError(
+        "TRANSIENT_GEMINI_ERROR: all configured vision models are currently "
+        f"unavailable or quota-limited for {label}. Last error: {last_error}"
+    )
 
 
 def _render_page(page: pymupdf.Page, dpi: int = 128) -> bytes:

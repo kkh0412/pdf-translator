@@ -90,6 +90,8 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_VISION_MODEL: gemini-3.5-flash-lite
           GEMINI_TRANSLATION_MODEL: gemini-3.5-flash-lite
+          GEMINI_VISION_MODELS: gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-2.5-flash-lite,gemini-2.5-flash,gemini-3.5-flash,gemini-3.6-flash
+          GEMINI_TRANSLATION_MODELS: gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-2.5-flash-lite,gemini-2.5-flash,gemini-3.5-flash,gemini-3.6-flash
           VISION_PAGES_PER_CALL: '2'
           VISION_WORKERS: '2'
           TRANSLATION_WORKERS: '2'

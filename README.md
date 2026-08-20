@@ -1,50 +1,48 @@
-# PDF Translator v7.2
+# 대관령산양의 번역기 v7.3
 
-## Math: source-private differential macros
+## Model-quota failover
 
-Physics/math papers often define private shorthand commands in their original
-LaTeX preamble, e.g. `\dt` for the differential `dt`. Reconstructed formulas
-do not have access to those private macros.
+A 429 is now classified before retrying.
 
-v7.2 deterministically expands an allow-list into portable standard LaTeX:
+Daily per-model quota (RPD), for example:
+`GenerateRequestsPerDayPerProjectPerModel-FreeTier`
+- mark that model exhausted for the rest of the current job;
+- do not wait for Retry-After on the same model;
+- immediately continue with the next configured model.
 
-    \dt      -> \,\mathrm{d}t
-    \dx      -> \,\mathrm{d}x
-    \dy      -> \,\mathrm{d}y
-    \dz      -> \,\mathrm{d}z
-    \dr      -> \,\mathrm{d}r
-    \dtheta  -> \,\mathrm{d}\theta
-    \dphi    -> \,\mathrm{d}\phi
-    ...
+Temporary RPM/TPM throttling:
+- honor Retry-After;
+- retry the same model;
+- if temporary throttling persists, continue through the model chain.
 
-The allow-list avoids corrupting standard commands such as `\det`, `\dfrac`,
-`\dagger`, etc.
+Default chain:
+1. gemini-3.5-flash-lite
+2. gemini-3.1-flash-lite
+3. gemini-2.5-flash-lite
+4. gemini-2.5-flash
+5. gemini-3.5-flash
+6. gemini-3.6-flash
 
-The exact reported Eq. (27) regression is included in the test suite.
+Vision and translation maintain independent configurable lists through
+`GEMINI_VISION_MODELS` and `GEMINI_TRANSLATION_MODELS`.
 
-## Equation labels and paired definitions
+## Smooth browser-side elapsed timer
 
-Vision sometimes returns an equation number already wrapped as `(27)`. v7.2
-normalizes this before amsmath `\tag`, so it becomes `\tag{27}` rather than
-`\tag{(27)}`.
+The elapsed-time display no longer advances only when the browser receives a
+database polling response. The browser starts one local clock and redraws it
+every 250 ms, so the visible second counter advances continuously even when a
+network poll takes longer than expected.
 
-Displays of the form
+## User-facing waiting/status copy
 
-    A := ... \quad \text{and} \quad B := ...
+Normal progress messages no longer expose implementation terms such as Worker,
+runner, GitHub, or Supabase.
 
-are split at the semantic `and` boundary before generic line breaking.
+Examples:
+- `문서를 불러오고 있습니다.`
+- `현재 요청 순서를 기다리고 있습니다. 준비되는 대로 자동으로 시작합니다.`
+- `현재 요청이 많아 잠시 기다리는 중입니다. 준비되는 대로 자동으로 이어서 처리합니다.`
+- `완성된 번역본을 저장하고 있습니다.`
 
-## Gemini fallback quota behavior
-
-The v7.1 single-block quality fallback could still terminate immediately on a
-429 after merely setting a cooldown.
-
-v7.2 uses the same Retry-After loop for fallback models:
-- read Google's Retry-After / retry-in delay;
-- apply the shared model cooldown;
-- retry the same fallback model;
-- stop only after the configured retry budget is genuinely exhausted.
-
-It still never inserts untranslated source prose into a "successful" PDF.
-
-All v7.1 transport recovery and v7.0 LaTeX-table/vector-raster features remain.
+All v7.2 math fixes, v7.1 inline-math transport recovery, and v7.0 semantic
+LaTeX tables / source-native vector-raster figure handling are retained.

@@ -2517,7 +2517,7 @@ def process_pdf(
     )
 
     if progress_callback:
-        progress_callback(56, "수식 LaTeX 사전 검사를 실행하고 있습니다.")
+        progress_callback(56, "수식이 올바르게 조판되는지 확인하고 있습니다.")
 
     preflight_math_blocks(
         blocks,
@@ -2584,7 +2584,7 @@ def process_pdf(
     )
 
     if progress_callback:
-        progress_callback(93, "XeLaTeX로 최종 PDF를 조판하고 있습니다.")
+        progress_callback(93, "최종 PDF를 조판하고 있습니다.")
 
     compile_latex(
         tex_source,

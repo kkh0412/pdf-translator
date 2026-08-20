@@ -28,21 +28,11 @@ const setupWarning = document.getElementById('setupWarning');
 
 let currentJob = null;
 let supabaseClient = null;
-let processingStartedAt = null;
 let queuedStartedAt = null;
-
-function updateProgress(value, message = null) {
-  const numeric = Number(value);
-  const progress = Number.isFinite(numeric)
-    ? Math.max(0, Math.min(100, Math.round(numeric)))
-    : 0;
-
-  progressValue.textContent = `${progress}%`;
-  progressFill.style.width = `${progress}%`;
-  progressTrack.setAttribute('aria-valuenow', String(progress));
-
-  if (message) statusText.textContent = message;
-}
+let elapsedStartedAt = null;
+let elapsedTimer = null;
+let activeStatusMessage = '';
+let showElapsedTime = false;
 
 function formatElapsed(ms) {
   const totalSeconds = Math.max(0, Math.floor(ms / 1000));
@@ -53,13 +43,58 @@ function formatElapsed(ms) {
     : `${seconds}초`;
 }
 
-function detailedMessage(job, fallback) {
-  const base = job.progress_message || fallback;
-  if (!processingStartedAt) return base;
-  return `${base} · 경과 ${formatElapsed(Date.now() - processingStartedAt)}`;
+function renderStatusMessage() {
+  if (!activeStatusMessage) return;
+
+  if (showElapsedTime && elapsedStartedAt) {
+    statusText.textContent =
+      `${activeStatusMessage} · 경과 ${formatElapsed(Date.now() - elapsedStartedAt)}`;
+  } else {
+    statusText.textContent = activeStatusMessage;
+  }
 }
 
+function startLocalElapsedClock() {
+  if (!elapsedStartedAt) elapsedStartedAt = Date.now();
+  if (elapsedTimer !== null) return;
+
+  // The elapsed clock is purely local. Database polling may be delayed, but
+  // the displayed seconds continue smoothly in the browser.
+  elapsedTimer = window.setInterval(renderStatusMessage, 250);
+  renderStatusMessage();
+}
+
+function stopLocalElapsedClock() {
+  if (elapsedTimer !== null) {
+    window.clearInterval(elapsedTimer);
+    elapsedTimer = null;
+  }
+}
+
+function setStatusMessage(message, withElapsed = false) {
+  if (message) activeStatusMessage = message;
+  showElapsedTime = withElapsed;
+
+  if (withElapsed) startLocalElapsedClock();
+  renderStatusMessage();
+}
+
+function updateProgress(value, message = null, withElapsed = false) {
+  const numeric = Number(value);
+  const progress = Number.isFinite(numeric)
+    ? Math.max(0, Math.min(100, Math.round(numeric)))
+    : 0;
+
+  progressValue.textContent = `${progress}%`;
+  progressFill.style.width = `${progress}%`;
+  progressTrack.setAttribute('aria-valuenow', String(progress));
+
+  if (message) setStatusMessage(message, withElapsed);
+}
+
+
 function showError(message) {
+  stopLocalElapsedClock();
   errorBox.textContent = message;
   errorBox.classList.remove('hidden');
   statusBox.classList.add('hidden');
@@ -127,8 +162,8 @@ async function poll(jobId) {
 
     if (job.status === 'queued') {
       statusTitle.textContent = '번역 준비 중';
-      processingStartedAt = null;
       if (!queuedStartedAt) queuedStartedAt = Date.now();
+      if (!elapsedStartedAt) elapsedStartedAt = queuedStartedAt;
 
       const queuedForMs = Date.now() - queuedStartedAt;
       const dbProgress = Number(job.progress ?? 0);
@@ -136,45 +171,46 @@ async function poll(jobId) {
       if (hasDetailedProgress && (dbProgress > 0 || job.progress_message)) {
         updateProgress(
           dbProgress,
-          detailedMessage(
-            job,
-            '번역 작업을 준비하고 있습니다.'
-          )
+          job.progress_message || '번역 작업을 준비하고 있습니다.',
+          true
         );
       } else if (queuedForMs >= 8000) {
         updateProgress(
-          0,
-          '번역 작업을 시작하지 못했습니다. 잠시 후 다시 시도해 주세요.'
+          Math.max(1, dbProgress),
+          '현재 요청 순서를 기다리고 있습니다. 준비되는 대로 자동으로 시작합니다.',
+          true
         );
       } else {
         updateProgress(
           1,
-          '파일 업로드가 끝났습니다 · 번역 작업을 준비하고 있습니다.'
+          '파일 업로드가 끝났습니다 · 번역을 준비하고 있습니다.',
+          true
         );
       }
     } else if (job.status === 'processing') {
       statusTitle.textContent = '번역 중';
       queuedStartedAt = null;
-      if (!processingStartedAt) processingStartedAt = Date.now();
+      if (!elapsedStartedAt) elapsedStartedAt = Date.now();
 
       if (hasDetailedProgress) {
         updateProgress(
           job.progress ?? 4,
-          detailedMessage(
-            job,
-            '문서 구조와 수식을 살펴 번역하고, 결과를 다시 조판하고 있습니다.'
-          )
+          job.progress_message ||
+            '문서 구조와 수식을 살펴 번역하고, 결과를 다시 조판하고 있습니다.',
+          true
         );
       } else {
-        // Do not show a fake 5% forever. Make the missing DB migration explicit.
         progressValue.textContent = '진행 중';
         progressFill.style.width = '12%';
         progressTrack.removeAttribute('aria-valuenow');
-        statusText.textContent =
-          '번역을 진행하고 있습니다. 잠시만 기다려 주세요.';
+        setStatusMessage(
+          '번역을 진행하고 있습니다. 잠시만 기다려 주세요.',
+          true
+        );
       }
     } else if (job.status === 'done') {
       updateProgress(100, '번역이 완료되었습니다.');
+      stopLocalElapsedClock();
       spinner.classList.add('hidden');
       statusBox.classList.add('hidden');
       resultBox.classList.remove('hidden');
@@ -254,8 +290,11 @@ form.addEventListener('submit', async (event) => {
   resultBox.classList.add('hidden');
   spinner.classList.remove('hidden');
   statusBox.classList.remove('hidden');
-  processingStartedAt = null;
+  stopLocalElapsedClock();
   queuedStartedAt = null;
+  elapsedStartedAt = null;
+  activeStatusMessage = '';
+  showElapsedTime = false;
   statusTitle.textContent = '파일 업로드 중';
   updateProgress(1, '번역할 PDF를 업로드하고 있습니다.');
   submitBtn.disabled = true;
@@ -294,10 +333,12 @@ form.addEventListener('submit', async (event) => {
     }
 
     queuedStartedAt = Date.now();
+    elapsedStartedAt = queuedStartedAt;
     statusTitle.textContent = '번역 준비 중';
     updateProgress(
       1,
-      '업로드가 완료되었습니다 · 번역을 시작할 준비를 하고 있습니다.'
+      '업로드가 완료되었습니다 · 번역을 준비하고 있습니다.',
+      true
     );
 
     await poll(jobId);

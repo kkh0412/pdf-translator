@@ -11,7 +11,14 @@ import urllib.error
 import urllib.request
 from typing import Callable, Iterable
 
-from .gemini_rate import impose_cooldown, retry_delay_from_text, wait_for_slot
+from .gemini_rate import (
+    daily_quota_exhausted,
+    impose_cooldown,
+    is_daily_quota_error,
+    mark_daily_quota_exhausted,
+    retry_delay_from_text,
+    wait_for_slot,
+)
 
 
 LANGUAGE_NAMES = {
@@ -37,6 +44,13 @@ class GeminiHTTPError(RuntimeError):
 
 class GeminiOutputError(RuntimeError):
     pass
+
+
+class GeminiDailyQuotaError(RuntimeError):
+    def __init__(self, model: str, detail: str):
+        self.model = model
+        self.detail = detail
+        super().__init__(f"Daily quota exhausted for {model}: {detail}")
 
 
 def _sanitize(value: str) -> str:
@@ -122,8 +136,25 @@ def _candidate_models() -> list[str]:
         "GEMINI_TRANSLATION_MODEL",
         "gemini-3.5-flash-lite",
     ).strip()
-    models = [primary, "gemini-3.5-flash-lite", "gemini-3.6-flash"]
-    out = []
+
+    configured = [
+        item.strip()
+        for item in os.getenv("GEMINI_TRANSLATION_MODELS", "").split(",")
+        if item.strip()
+    ]
+
+    models = [
+        primary,
+        *configured,
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
+        "gemini-3.5-flash",
+        "gemini-3.6-flash",
+    ]
+
+    out: list[str] = []
     for model in models:
         if model and model not in out:
             out.append(model)
@@ -357,8 +388,15 @@ def _translate_with_quota_retries(
     strategy: dict,
     *,
     context: str,
+    status_callback: Callable[[str], None] | None = None,
 ) -> list[str]:
-    """Run one model and honor 429 Retry-After instead of aborting immediately."""
+    """Use one model while distinguishing daily quota from temporary throttling."""
+    if daily_quota_exhausted(model):
+        raise GeminiDailyQuotaError(
+            model,
+            "This model already reached its per-day quota earlier in this job.",
+        )
+
     max_429 = max(
         1,
         int(os.getenv("GEMINI_MAX_429_RETRIES", "8")),
@@ -374,15 +412,28 @@ def _translate_with_quota_retries(
                 target_language,
                 strategy,
             )
+
         except GeminiHTTPError as exc:
             if exc.status != 429:
                 raise
 
+            if is_daily_quota_error(exc.detail):
+                mark_daily_quota_exhausted(model)
+                if status_callback:
+                    status_callback(
+                        "현재 처리 경로의 사용량이 많아 다른 경로로 전환하고 있습니다."
+                    )
+                print(
+                    f"Daily quota exhausted for {model}; switching models immediately.",
+                    flush=True,
+                )
+                raise GeminiDailyQuotaError(model, exc.detail) from exc
+
             quota_attempt += 1
             if quota_attempt > max_429:
                 raise RuntimeError(
-                    f"{context}: Gemini rate limit did not recover after "
-                    f"{max_429} Retry-After waits on model {model}."
+                    f"{context}: temporary Gemini rate limit did not recover after "
+                    f"{max_429} waits on model {model}."
                 ) from exc
 
             wait_seconds = max(
@@ -394,15 +445,19 @@ def _translate_with_quota_retries(
             ) + 1.0
 
             impose_cooldown(model, wait_seconds)
+            if status_callback:
+                status_callback(
+                    "현재 요청이 많아 잠시 기다린 뒤 자동으로 계속합니다."
+                )
             print(
-                f"{context}: Gemini 429 on {model}; waiting "
+                f"{context}: transient 429 on {model}; waiting "
                 f"{wait_seconds:.1f}s before retry "
                 f"{quota_attempt}/{max_429}.",
                 flush=True,
             )
 
             # _translate_once -> _call -> wait_for_slot() observes the shared
-            # cooldown on the next loop. Do not split the batch or switch models.
+            # cooldown. Daily quota never reaches this branch.
 
 
 def _request_batch(
@@ -410,90 +465,22 @@ def _request_batch(
     batch: list[dict],
     target_language: str,
     strategy: dict,
+    *,
+    status_callback: Callable[[str], None] | None = None,
 ) -> list[str]:
-    """Treat 429 as a timing condition, never as a translation fallback."""
-    models = _candidate_models()
-    primary = models[0]
-    max_429 = max(1, int(os.getenv("GEMINI_MAX_429_RETRIES", "8")))
+    """Try the configured model chain, skipping models whose RPD is exhausted."""
     last_error: Exception | None = None
+    attempted_models = 0
 
-    output_attempts = 0
-    transient_attempts = 0
-    quota_attempts = 0
+    for model in _candidate_models():
+        if daily_quota_exhausted(model):
+            continue
 
-    while True:
+        attempted_models += 1
+
         try:
             print(
-                f"Translation agent: model={primary}, "
-                f"quota_retry={quota_attempts}, blocks={len(batch)}",
-                flush=True,
-            )
-            return _translate_once(
-                api_key,
-                primary,
-                batch,
-                target_language,
-                strategy,
-            )
-
-        except GeminiOutputError as exc:
-            last_error = exc
-            output_attempts += 1
-            if output_attempts < 2:
-                time.sleep(0.8)
-                continue
-            raise
-
-        except GeminiHTTPError as exc:
-            last_error = exc
-
-            if exc.status == 429:
-                quota_attempts += 1
-                if quota_attempts > max_429:
-                    raise RuntimeError(
-                        "Gemini rate limit did not recover after waiting. "
-                        "The job is stopped instead of inserting untranslated source text."
-                    ) from exc
-
-                wait_seconds = max(
-                    2.0,
-                    float(exc.retry_after or retry_delay_from_text(exc.detail)),
-                ) + 1.0
-
-                impose_cooldown(primary, wait_seconds)
-                print(
-                    f"Gemini 429 for {primary}: waiting {wait_seconds:.1f}s "
-                    f"before retry {quota_attempts}/{max_429}. "
-                    "Original prose will NOT be used as fallback.",
-                    flush=True,
-                )
-                continue
-
-            if exc.status == 404:
-                break
-
-            if exc.status in {500, 502, 503, 504}:
-                transient_attempts += 1
-                if transient_attempts <= 3:
-                    time.sleep(min(20.0, 2.0 ** transient_attempts))
-                    continue
-                break
-
-            raise
-
-        except RuntimeError as exc:
-            last_error = exc
-            transient_attempts += 1
-            if transient_attempts <= 3:
-                time.sleep(min(20.0, 2.0 ** transient_attempts))
-                continue
-            break
-
-    # Different-model fallback is reserved for service availability, not quota.
-    for model in models[1:]:
-        try:
-            print(
-                f"Translation service fallback model={model}, blocks={len(batch)}",
+                f"Translation model attempt: {model}, blocks={len(batch)}",
                 flush=True,
             )
             return _translate_with_quota_retries(
@@ -502,16 +489,49 @@ def _request_batch(
                 batch,
                 target_language,
                 strategy,
-                context="Translation service fallback",
+                context="Translation",
+                status_callback=status_callback,
             )
+
+        except GeminiDailyQuotaError as exc:
+            last_error = exc
+            # The next model has an independent model quota dimension.
+            continue
+
         except GeminiHTTPError as exc:
             last_error = exc
-            if exc.status not in {404, 500, 502, 503, 504}:
-                raise
-        except GeminiOutputError:
+            if exc.status in {404, 500, 502, 503, 504}:
+                if status_callback:
+                    status_callback(
+                        "번역을 계속하기 위해 다른 처리 경로로 전환하고 있습니다."
+                    )
+                continue
             raise
 
-    raise RuntimeError(f"TRANSIENT_GEMINI_ERROR: {last_error}")
+        except RuntimeError as exc:
+            # Temporary 429 retry budget or transport/network errors.
+            last_error = exc
+            if status_callback:
+                status_callback(
+                    "번역을 계속하기 위해 다른 처리 경로로 전환하고 있습니다."
+                )
+            continue
+
+        except GeminiOutputError:
+            # Structured/content quality problems should be handled by _recover
+            # through smaller semantic batches rather than silently switching.
+            raise
+
+    if attempted_models == 0:
+        raise RuntimeError(
+            "TRANSIENT_GEMINI_ERROR: all configured translation models "
+            "have reached their daily quota for this job."
+        )
+
+    raise RuntimeError(
+        "TRANSIENT_GEMINI_ERROR: no configured translation model is currently "
+        f"available. Last error: {last_error}"
+    )
 
 
 def _recover(
@@ -519,26 +539,50 @@ def _recover(
     batch: list[dict],
     target_language: str,
     strategy: dict,
+    *,
+    status_callback: Callable[[str], None] | None = None,
 ) -> list[str]:
     try:
-        return _request_batch(api_key, batch, target_language, strategy)
+        return _request_batch(
+            api_key,
+            batch,
+            target_language,
+            strategy,
+            status_callback=status_callback,
+        )
 
     except GeminiOutputError as exc:
-        # Split only structured-output/content-quality failures.
         if len(batch) > 1:
             mid = len(batch) // 2
             return (
-                _recover(api_key, batch[:mid], target_language, strategy)
-                + _recover(api_key, batch[mid:], target_language, strategy)
+                _recover(
+                    api_key,
+                    batch[:mid],
+                    target_language,
+                    strategy,
+                    status_callback=status_callback,
+                )
+                + _recover(
+                    api_key,
+                    batch[mid:],
+                    target_language,
+                    strategy,
+                    status_callback=status_callback,
+                )
             )
 
-        # Final single-block quality fallback. Never silently use source prose.
-        for model in _candidate_models()[1:]:
+        # One block failed content/structured-output validation. Try alternate
+        # currently available models, still respecting per-model daily quotas.
+        models = _candidate_models()
+        for model in models[1:]:
+            if daily_quota_exhausted(model):
+                continue
+
             try:
-                print(
-                    f"Single-block quality fallback model={model}",
-                    flush=True,
-                )
+                if status_callback:
+                    status_callback(
+                        "문장 품질을 확인하며 다른 처리 경로로 다시 번역하고 있습니다."
+                    )
                 return _translate_with_quota_retries(
                     api_key,
                     model,
@@ -546,22 +590,26 @@ def _recover(
                     target_language,
                     strategy,
                     context="Single-block quality fallback",
+                    status_callback=status_callback,
                 )
-            except GeminiHTTPError as fallback_http:
-                if fallback_http.status not in {404, 500, 502, 503, 504}:
-                    raise
+            except GeminiDailyQuotaError:
                 continue
+            except GeminiHTTPError as fallback_http:
+                if fallback_http.status in {404, 500, 502, 503, 504}:
+                    continue
+                raise
             except GeminiOutputError:
+                continue
+            except RuntimeError:
                 continue
 
         raise RuntimeError(
-            "Translation failed quality validation for one block after retries. "
-            "The document is stopped rather than emitted partly untranslated."
+            "Translation failed quality validation for one block after trying "
+            "all currently available translation paths. The document is stopped "
+            "instead of being emitted partly untranslated."
         ) from exc
 
     except Exception:
-        # HTTP/network quota failures have already been retried. Recursive
-        # splitting would multiply requests and worsen free-tier 429s.
         raise
 
 
@@ -618,11 +666,20 @@ def translate_blocks(
             )
 
         try:
+            def model_status(message: str) -> None:
+                with lock:
+                    current_fraction = max(
+                        completed_blocks / total_blocks,
+                        min(0.96, visible_fraction),
+                    )
+                    emit(current_fraction, message)
+
             return _recover(
                 api_key,
                 batch,
                 target_language,
                 strategy,
+                status_callback=model_status,
             )
         except Exception:
             with lock:
