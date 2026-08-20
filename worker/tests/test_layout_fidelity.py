@@ -8,6 +8,7 @@ from unittest import mock
 from worker.pdf_pipeline import (
     _caption_alignment,
     _equation_tex,
+    _math_preflight_preamble,
     _render_table_tex,
     _source_visual_width_ratio,
     _strip_structural_list_marker,
@@ -51,6 +52,15 @@ class LayoutFidelityTests(unittest.TestCase):
         tex = _equation_tex(block)
         self.assertIn(r"\SourceFitDisplayMath{", tex)
         self.assertNotIn(r"\resizebox{0.98\linewidth}", tex)
+
+    def test_math_preflight_knows_shrink_only_macro(self) -> None:
+        preamble = _math_preflight_preamble()
+        self.assertIn(r"\newcommand{\SourceFitDisplayMath}", preamble)
+        self.assertIn(r"\newsavebox{\SourceDisplayMathBox}", preamble)
+        self.assertLess(
+            preamble.index(r"\newcommand{\SourceFitDisplayMath}"),
+            preamble.index(r"\begin{document}"),
+        )
 
     def test_figure_width_comes_from_source_geometry(self) -> None:
         block = {
@@ -168,7 +178,7 @@ class LayoutFidelityTests(unittest.TestCase):
         self.assertNotIn("\\item •", tex)
         self.assertIn(r"\par\addvspace{0.92em}\noindent", tex)
         self.assertIn(r"\par\addvspace{0.68em}\noindent", tex)
-        self.assertIn(r"\newcommand{\SourceFitDisplayMath}", tex)
+        self.assertEqual(tex.count(r"\newcommand{\SourceFitDisplayMath}"), 1)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,18 @@
-# 대관령산양의 번역기 v8.6.4
+# 대관령산양의 번역기 v8.6.5
+
+## v8.6.5 math preflight renderer sync fix
+
+v8.6.4의 layout fidelity 변경으로 긴 단일 display equation에 `\SourceFitDisplayMath`를 사용할 수 있게 되었지만,
+standalone math preflight 문서의 preamble에는 이 renderer macro가 정의되지 않아 긴 수식 자체가 정상이어도
+`Undefined control sequence: \SourceFitDisplayMath`로 실패할 수 있었습니다.
+
+이번 버전은 math compatibility alias와 shrink-only display macro를 `_shared_math_latex_support()` 하나로 통합하고,
+**math preflight와 최종 PDF renderer가 동일한 LaTeX helper 정의를 공유**하도록 변경했습니다. 따라서 향후 final renderer에
+수식용 helper가 추가되어도 preflight와 정의가 어긋나는 문제를 줄입니다.
+
+회귀 테스트에는 preflight preamble이 `\SourceFitDisplayMath`와 그 savebox를 실제 `\begin{document}` 전에 정의하는지
+검사하는 항목을 추가했습니다. DB/Supabase schema 변경은 없습니다.
+
 
 ## v8.6.4 layout fidelity update
 

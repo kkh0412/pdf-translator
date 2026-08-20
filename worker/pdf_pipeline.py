@@ -2215,10 +2215,17 @@ def _repair_simple_undefined_script(formula: str, command: str | None) -> str | 
     return repaired if repaired != formula else None
 
 
-def _math_preflight_preamble() -> str:
-    return r"""\documentclass[10pt]{article}
-\usepackage{amsmath,amssymb}
-\usepackage{graphicx}
+def _shared_math_latex_support() -> str:
+    """LaTeX helpers required by both math preflight and final rendering.
+
+    Keep renderer-specific commands here rather than duplicating them between
+    the standalone formula compiler and the final document preamble. A long
+    display equation can be wrapped in ``\\SourceFitDisplayMath`` by
+    ``_equation_tex``; math preflight must therefore know the exact same macro
+    or it will report a false formula failure before the source itself is even
+    tested.
+    """
+    return r"""% Shared math compatibility/rendering helpers.
 \providecommand{\coloneq}{\mathrel{:=}}
 \providecommand{\coloneqq}{\mathrel{:=}}
 \providecommand{\eqqcolon}{\mathrel{=:}}
@@ -2232,8 +2239,26 @@ def _math_preflight_preamble() -> str:
 \providecommand{\braket}[2]{\left\langle #1\middle|#2\right\rangle}
 \providecommand{\mel}[3]{\left\langle #1\middle|#2\middle|#3\right\rangle}
 \providecommand{\dd}{\mathrm{d}}
-\begin{document}
+\newsavebox{\SourceDisplayMathBox}
+\newcommand{\SourceFitDisplayMath}[1]{%
+  \sbox{\SourceDisplayMathBox}{$\displaystyle #1$}%
+  \ifdim\wd\SourceDisplayMathBox>0.98\linewidth
+    \resizebox{0.98\linewidth}{!}{\usebox{\SourceDisplayMathBox}}%
+  \else
+    \usebox{\SourceDisplayMathBox}%
+  \fi}
 """
+
+
+def _math_preflight_preamble() -> str:
+    return (
+        r"""\documentclass[10pt]{article}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+"""
+        + _shared_math_latex_support()
+        + "\\begin{document}\n"
+    )
 
 
 def preflight_math_blocks(
@@ -2740,21 +2765,7 @@ def build_latex(
 \usepackage{{array}}
 \usepackage{{tabularx}}
 \usepackage{{booktabs}}
-% Compatibility aliases: avoid extra packages for common AI/source notation.
-\providecommand{{\coloneq}}{{\mathrel{{:=}}}}
-\providecommand{{\coloneqq}}{{\mathrel{{:=}}}}
-\providecommand{{\eqqcolon}}{{\mathrel{{=:}}}}
-\providecommand{{\eqcolon}}{{\mathrel{{=:}}}}
-\providecommand{{\Tr}}{{\operatorname{{Tr}}}}
-\providecommand{{\rank}}{{\operatorname{{rank}}}}
-\providecommand{{\supp}}{{\operatorname{{supp}}}}
-\providecommand{{\diag}}{{\operatorname{{diag}}}}
-\providecommand{{\ket}}[1]{{\left\lvert #1\right\rangle}}
-\providecommand{{\bra}}[1]{{\left\langle #1\right\rvert}}
-\providecommand{{\braket}}[2]{{\left\langle #1\middle|#2\right\rangle}}
-\providecommand{{\mel}}[3]{{\left\langle #1\middle|#2\middle|#3\right\rangle}}
-\providecommand{{\dd}}{{\mathrm{{d}}}}
-\geometry{{
+{_shared_math_latex_support()}\geometry{{
   paperwidth={style['page_width_pt']:.2f}pt,
   paperheight={style['page_height_pt']:.2f}pt,
   left={style['left_margin_pt']:.2f}pt,
@@ -2778,14 +2789,6 @@ def build_latex(
 \setlist[itemize]{{leftmargin=1.5em,itemsep=0.12em,topsep=0.25em,parsep=0pt}}
 \allowdisplaybreaks[2]
 \raggedbottom
-\newsavebox{{\SourceDisplayMathBox}}
-\newcommand{{\SourceFitDisplayMath}}[1]{{%
-  \sbox{{\SourceDisplayMathBox}}{{$\displaystyle #1$}}%
-  \ifdim\wd\SourceDisplayMathBox>0.98\linewidth
-    \resizebox{{0.98\linewidth}}{{!}}{{\usebox{{\SourceDisplayMathBox}}}}%
-  \else
-    \usebox{{\SourceDisplayMathBox}}%
-  \fi}}
 \makeatletter
 \def\ps@sourcepage{{%
   \def\@oddhead{{}}\def\@evenhead{{}}%
