@@ -16,13 +16,13 @@ button, input, select { font: inherit; }
 .admin-link { font-size: 14px; text-decoration: none; border-bottom: 1px solid currentColor; }
 .admin-link.disabled { pointer-events: none; opacity: .4; }
 
-.hero { padding: 78px 0 46px; max-width: 850px; }
+.hero { padding: 78px 0 46px; max-width: 1080px; }
 
 .hero-title-row {
   display: flex;
   flex-direction: row;
   align-items: center;
-  gap: 18px;
+  gap: 20px;
   width: 100%;
 }
 
@@ -34,25 +34,14 @@ button, input, select { font: inherit; }
   margin: 0;
 }
 
-@media (min-width: 1100px) {
-  .hero-title-row {
-    align-items: flex-start;
-  }
-
-  .hero-title-row h1 {
-    font-size: clamp(4.15rem, 5.4vw, 5.6rem);
-    line-height: 0.94;
-    letter-spacing: -0.04em;
-  }
-}
 
 .hero-logo {
   display: block;
-  flex: 0 0 clamp(88px, 8.5vw, 112px);
-  width: clamp(88px, 8.5vw, 112px) !important;
-  height: clamp(88px, 8.5vw, 112px) !important;
-  max-width: 112px;
-  max-height: 112px;
+  flex: 0 0 clamp(120px, 11vw, 156px);
+  width: clamp(120px, 11vw, 156px) !important;
+  height: clamp(120px, 11vw, 156px) !important;
+  max-width: 156px;
+  max-height: 156px;
   object-fit: contain;
   margin: 0;
   padding: 0;
@@ -70,7 +59,8 @@ button, input, select { font: inherit; }
 
 
 .eyebrow { font-size: 11px; font-weight: 750; letter-spacing: .16em; margin-bottom: 18px; color: #77756d; }
-.hero h1 { margin: 0; font-size: clamp(42px, 7vw, 76px); line-height: 1.02; letter-spacing: -.055em; font-weight: 650; }
+.hero h1 { margin: 0; font-size: clamp(48px, 6.1vw, 66px); line-height: .98; letter-spacing: -.055em; font-weight: 650; }
+.hero-line { display: block; white-space: nowrap; }
 .hero p { max-width: 720px; margin: 26px 0 0; font-size: 17px; line-height: 1.78; color: #575650; }
 
 .card { background: #fff; border: 1px solid #deddd7; border-radius: 18px; padding: clamp(22px, 4vw, 38px); box-shadow: 0 18px 50px rgba(0,0,0,.045); }
@@ -169,6 +159,7 @@ select:focus {
 footer { padding-top: 30px; color: #8a887f; font-size: 12px; letter-spacing: .01em; }
 
 @media (max-width: 720px) {
+  .hero-line { white-space: normal; }
   .hero-title-row {
     display: flex;
     flex-direction: row;
@@ -177,12 +168,12 @@ footer { padding-top: 30px; color: #8a887f; font-size: 12px; letter-spacing: .01
   }
 
   .hero-logo {
-    flex-basis: 58px;
-    width: 58px !important;
-    height: 58px !important;
-    max-width: 58px;
-    max-height: 58px;
-    margin-top: 4px;
+    flex-basis: 72px;
+    width: 72px !important;
+    height: 72px !important;
+    max-width: 72px;
+    max-height: 72px;
+    margin-top: 2px;
   }
 
   
