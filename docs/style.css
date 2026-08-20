@@ -157,6 +157,8 @@ select:focus {
 .features h3 { margin: 0 0 9px; font-size: 17px; }
 .features p { margin: 0; line-height: 1.55; color: #65635d; font-size: 14px; }
 footer { padding-top: 30px; color: #8a887f; font-size: 12px; letter-spacing: .01em; }
+footer .provider-note { display: block; margin-top: 7px; color: #9a988f; font-size: 10px; line-height: 1.5; letter-spacing: 0; }
+footer .provider-note a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
 
 @media (max-width: 720px) {
   .hero-line { white-space: normal; }

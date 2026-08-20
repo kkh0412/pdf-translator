@@ -1,4 +1,12 @@
-# 대관령산양의 번역기 v8.4.1
+# 대관령산양의 번역기 v8.5
+
+## Google Translate final fallback
+- 모든 Gemini 본문 번역 모델의 일일 한도/가용성이 소진되면 official Cloud Translation - Basic(v2) NMT로 자동 전환합니다.
+- `GOOGLE_TRANSLATE_API_KEY` GitHub Actions secret이 있을 때만 동작합니다.
+- 수식 placeholder와 KEEP ENGLISH 용어는 HTML 보호 토큰으로 감싸 Google 번역이 수정하지 못하게 합니다.
+- Google 번역 결과도 기존 placeholder/문장 연속성/미번역 영어 검사에 다시 통과해야 checkpoint에 저장됩니다.
+- Google 번역 자체의 429/5xx는 짧게 재시도하고, 계속 실패하면 checkpoint를 유지한 채 일시 중단됩니다.
+- 이 fallback은 자연어 본문 번역 전용입니다. Vision 레이아웃 분석이나 수식-source repair를 Google 번역으로 대체하지 않습니다.
 
 ## Supabase SQL hotfix
 - `pdf_translation_client_signal` 함수의 PL/pgSQL 지역변수 `current_user`를 `v_client_user_id`로 변경했습니다.

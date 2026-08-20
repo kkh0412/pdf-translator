@@ -21,6 +21,11 @@ from .gemini_rate import (
     run_cancellable_io,
     wait_for_slot,
 )
+from .google_translate import (
+    GoogleTranslateError,
+    configured as google_translate_configured,
+    translate_batch as google_translate_batch,
+)
 
 
 LANGUAGE_NAMES = {
@@ -513,6 +518,60 @@ def _translate_with_quota_retries(
             # cooldown. Daily quota never reaches this branch.
 
 
+
+def _google_translate_fallback(
+    batch: list[dict],
+    target_language: str,
+    strategy: dict,
+    *,
+    status_callback: Callable[[str], None] | None = None,
+) -> list[str]:
+    if not google_translate_configured():
+        raise RuntimeError(
+            "TRANSIENT_GEMINI_ERROR: all Gemini translation models are unavailable "
+            "and GOOGLE_TRANSLATE_API_KEY is not configured."
+        )
+
+    values = google_translate_batch(
+        batch,
+        target_language,
+        strategy,
+        status_callback=status_callback,
+    )
+    if len(values) != len(batch):
+        raise GoogleTranslateError(
+            "Google Translate fallback returned the wrong number of blocks"
+        )
+
+    cleaned: list[str] = []
+    for item, value in zip(batch, values):
+        value = _sanitize(value)
+        if not value:
+            raise GoogleTranslateError(
+                "Google Translate fallback returned an empty translation"
+            )
+
+        expected = sorted(PLACEHOLDER_RE.findall(item["text"]))
+        actual = sorted(PLACEHOLDER_RE.findall(value))
+        if expected != actual:
+            raise GoogleTranslateError(
+                f"Google Translate changed math placeholders: "
+                f"expected={expected}, actual={actual}"
+            )
+
+        _validate_translation_quality(
+            item["text"],
+            value,
+            target_language,
+        )
+        _validate_inline_math_continuity(
+            item["text"],
+            value,
+        )
+        cleaned.append(value)
+
+    return cleaned
+
 def _request_batch(
     api_key: str,
     batch: list[dict],
@@ -575,16 +634,28 @@ def _request_batch(
             # through smaller semantic batches rather than silently switching.
             raise
 
-    if attempted_models == 0:
-        raise RuntimeError(
-            "TRANSIENT_GEMINI_ERROR: all configured translation models "
-            "have reached their daily quota for this job."
+    # All Gemini translation paths are exhausted/unavailable. As the final
+    # prose-translation fallback, use the official Google Cloud Translation API.
+    # Vision/math reconstruction still remains Gemini/source-PDF based.
+    try:
+        return _google_translate_fallback(
+            batch,
+            target_language,
+            strategy,
+            status_callback=status_callback,
         )
-
-    raise RuntimeError(
-        "TRANSIENT_GEMINI_ERROR: no configured translation model is currently "
-        f"available. Last error: {last_error}"
-    )
+    except GoogleTranslateError as google_exc:
+        if attempted_models == 0:
+            raise RuntimeError(
+                "TRANSIENT_GOOGLE_TRANSLATE_ERROR: all Gemini translation models "
+                "reached their daily quota and the Google Translate fallback also "
+                f"failed: {google_exc}"
+            ) from google_exc
+        raise RuntimeError(
+            "TRANSIENT_GOOGLE_TRANSLATE_ERROR: no Gemini translation model is "
+            "currently available and the Google Translate fallback also failed. "
+            f"Gemini last error: {last_error}; Google error: {google_exc}"
+        ) from google_exc
 
 
 def _recover(
@@ -656,11 +727,20 @@ def _recover(
             except RuntimeError:
                 continue
 
-        raise RuntimeError(
-            "Translation failed quality validation for one block after trying "
-            "all currently available translation paths. The document is stopped "
-            "instead of being emitted partly untranslated."
-        ) from exc
+        # Last resort for a single prose block: official Google Translate.
+        # This is preferable to emitting the original English block unchanged.
+        try:
+            return _google_translate_fallback(
+                batch,
+                target_language,
+                strategy,
+                status_callback=status_callback,
+            )
+        except (GoogleTranslateError, RuntimeError) as google_exc:
+            raise RuntimeError(
+                "Translation failed quality validation after all Gemini paths and "
+                f"the Google Translate fallback also failed: {google_exc}"
+            ) from exc
 
     except Exception:
         raise

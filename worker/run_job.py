@@ -192,6 +192,12 @@ def _is_transient_error(message: str) -> bool:
     text = message.lower()
     return (
         "transient_gemini_error:" in text
+        or "transient_google_translate_error:" in text
+        or "cloud translation api http 429" in text
+        or "cloud translation api http 500" in text
+        or "cloud translation api http 502" in text
+        or "cloud translation api http 503" in text
+        or "cloud translation api http 504" in text
         or "temporarily unavailable" in text
         or "high demand" in text
         or "resource_exhausted" in text
