@@ -17,6 +17,28 @@ button, input, select { font: inherit; }
 .admin-link.disabled { pointer-events: none; opacity: .4; }
 
 .hero { padding: 78px 0 46px; max-width: 850px; }
+
+.hero-title-row {
+  display: flex;
+  align-items: center;
+  gap: clamp(16px, 2vw, 24px);
+  margin-top: 0;
+}
+
+.hero-title-row h1 {
+  margin: 0;
+  min-width: 0;
+}
+
+.hero-logo {
+  display: block;
+  flex: 0 0 auto;
+  width: clamp(54px, 5.2vw, 72px);
+  height: clamp(54px, 5.2vw, 72px);
+  object-fit: cover;
+  border-radius: 14px;
+}
+
 .hero-layout {
   display: grid;
   grid-template-columns: clamp(88px, 9vw, 128px) minmax(0, 1fr);
@@ -136,14 +158,19 @@ select:focus {
 footer { padding-top: 30px; color: #8a887f; font-size: 12px; letter-spacing: .01em; }
 
 @media (max-width: 720px) {
-  .hero-layout {
-    grid-template-columns: 64px minmax(0, 1fr);
-    gap: 18px;
+  .hero-title-row {
+    align-items: flex-start;
+    gap: 12px;
   }
 
   .hero-logo {
-    margin-top: 2px;
+    width: 46px;
+    height: 46px;
+    border-radius: 10px;
+    margin-top: 4px;
   }
+
+
 
   .shell { width: min(100% - 24px, 1080px); }
   .hero { padding: 54px 0 32px; }
