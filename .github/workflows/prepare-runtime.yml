@@ -8,6 +8,10 @@ on:
       - 'worker/requirements.txt'
       - 'worker/latex_requirements.txt'
       - 'worker/setup_runtime.sh'
+      - 'worker/translator.py'
+      - 'worker/google_translate.py'
+      - 'worker/pdf_pipeline.py'
+      - 'worker/tests/**'
       - '.github/workflows/prepare-runtime.yml'
       - '.github/workflows/process-pdf.yml'
   schedule:
@@ -42,6 +46,10 @@ jobs:
       - name: Verify cached Python dependencies
         shell: bash
         run: bash worker/ensure_python_runtime.sh
+
+      - name: Run translation routing regression tests
+        shell: bash
+        run: .venv/bin/python -m unittest discover -s worker/tests -v
 
       - name: Smoke test two-column Korean + real LaTeX math
         if: steps.runtime-cache.outputs.cache-hit != 'true'

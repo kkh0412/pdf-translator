@@ -4,7 +4,6 @@ import concurrent.futures
 import json
 import os
 import re
-import time
 import threading
 import unicodedata
 import urllib.error
@@ -16,12 +15,13 @@ from .gemini_rate import (
     daily_quota_exhausted,
     is_daily_quota_error,
     mark_daily_quota_exhausted,
-    retry_delay_from_text,
     run_cancellable_io,
     wait_for_slot,
 )
 from .google_translate import (
     GoogleTranslateError,
+    GoogleTranslateIntegrityError,
+    GoogleTranslateTransientError,
     configured as google_translate_configured,
     translate_batch as google_translate_batch,
 )
@@ -41,15 +41,22 @@ PLACEHOLDER_RE = re.compile(r"\[\[MATH_\d+\]\]")
 
 
 class GeminiHTTPError(RuntimeError):
-    def __init__(self, status: int, detail: str, retry_after: float | None = None):
+    def __init__(self, status: int, detail: str):
         self.status = status
         self.detail = detail
-        self.retry_after = retry_after
         super().__init__(f"Gemini API HTTP {status}: {detail}")
+
+
+class GeminiTransportError(RuntimeError):
+    """Transient network/protocol failure while calling Gemini."""
 
 
 class GeminiOutputError(RuntimeError):
     pass
+
+
+class TranslationValidationError(RuntimeError):
+    """Provider-neutral validation failure for a translated prose block."""
 
 
 class GeminiDailyQuotaError(RuntimeError):
@@ -68,10 +75,42 @@ class Gemini429UseGoogle(RuntimeError):
         super().__init__(f"Gemini translation 429 on {model}")
 
 
-# Once any translation batch receives a Gemini 429, all remaining translation
-# batches in this process use Google Translate immediately. This prevents a
-# parallel batch from spending another minute in Retry-After waits.
-_use_google_for_remaining_translation = threading.Event()
+class TranslationRoute:
+    """Per-job translation provider state.
+
+    A module-global switch is unsafe for checkpoint/resume because a new worker
+    process would forget that this particular job already hit Gemini 429.  Keep
+    the route state explicit and persist the Google lock in the job checkpoint.
+    """
+
+    def __init__(self, *, force_google: bool = False):
+        self._google_locked = threading.Event()
+        self._google_persistent = threading.Event()
+        if force_google:
+            self._google_locked.set()
+            self._google_persistent.set()
+
+    @property
+    def google_locked(self) -> bool:
+        return self._google_locked.is_set()
+
+    @property
+    def persistent_google_lock(self) -> bool:
+        """Whether this route lock must survive a worker restart."""
+        return self._google_persistent.is_set()
+
+    def lock_google(self, *, persistent: bool = False) -> bool:
+        """Lock the rest of this translation stage to Google.
+
+        Returns True only for the first transition.  The caller can use that
+        edge to persist provider state without repeatedly writing checkpoints.
+        """
+        if persistent:
+            self._google_persistent.set()
+        if self._google_locked.is_set():
+            return False
+        self._google_locked.set()
+        return True
 
 
 def _sanitize(value: str) -> str:
@@ -124,7 +163,7 @@ def _validate_translation_quality(
         "\uffff",
     )
     if any(token in translated for token in forbidden):
-        raise GeminiOutputError(
+        raise TranslationValidationError(
             "Translation leaked an internal math/control marker"
         )
 
@@ -132,7 +171,7 @@ def _validate_translation_quality(
         r"(?:[가-힣]\s+){5,}[가-힣]",
         translated,
     ):
-        raise GeminiOutputError(
+        raise TranslationValidationError(
             "Translation contains suspicious syllable-by-syllable Korean spacing"
         )
 
@@ -147,9 +186,34 @@ def _validate_translation_quality(
             and out_latin >= 45
             and out_hangul < max(8, int(out_latin * 0.18))
         ):
-            raise GeminiOutputError(
+            raise TranslationValidationError(
                 "Translation appears to be an untranslated English prose block"
             )
+
+
+def _validate_math_placeholders(source: str, translated: str) -> None:
+    """Require exact preservation of every inline-math placeholder.
+
+    Punctuation adjacency is intentionally *not* validated.  Word order and
+    sentence-final placement legitimately change across languages (especially
+    English -> Korean), while the actual mathematical integrity requirement is
+    that placeholders are neither edited, dropped, duplicated, nor invented.
+    """
+    expected = sorted(PLACEHOLDER_RE.findall(source))
+    actual = sorted(PLACEHOLDER_RE.findall(translated))
+    if expected != actual:
+        raise TranslationValidationError(
+            f"Math placeholders changed: expected={expected}, actual={actual}"
+        )
+
+
+def _validate_translation_result(
+    source: str,
+    translated: str,
+    target_language: str,
+) -> None:
+    _validate_math_placeholders(source, translated)
+    _validate_translation_quality(source, translated, target_language)
 
 
 def _candidate_models() -> list[str]:
@@ -268,25 +332,9 @@ def _call(api_key: str, model: str, prompt: str, count: int) -> dict:
         return payload
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        retry_after = None
-
-        if exc.code == 429:
-            header_value = exc.headers.get("Retry-After") if exc.headers else None
-            if header_value:
-                try:
-                    retry_after = float(header_value)
-                except ValueError:
-                    retry_after = None
-            if retry_after is None:
-                retry_after = retry_delay_from_text(detail, default=60.0)
-
-        raise GeminiHTTPError(
-            exc.code,
-            detail,
-            retry_after=retry_after,
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"TRANSIENT_GEMINI_ERROR: {exc}") from exc
+        raise GeminiHTTPError(exc.code, detail) from exc
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise GeminiTransportError(f"TRANSIENT_GEMINI_ERROR: {exc}") from exc
 
 
 def _strategy_prompt(strategy: dict) -> str:
@@ -325,33 +373,6 @@ def _strategy_prompt(strategy: dict) -> str:
     )
 
 
-
-_SENTENCE_TERMINATORS = ".!?。！？"
-
-def _nearest_nonspace_left(text: str, index: int) -> str:
-    i=index-1
-    while i>=0 and text[i].isspace(): i-=1
-    return text[i] if i>=0 else ""
-
-def _nearest_nonspace_right(text: str, index: int) -> str:
-    i=index
-    while i<len(text) and text[i].isspace(): i+=1
-    return text[i] if i<len(text) else ""
-
-def _validate_inline_math_continuity(source: str, translated: str) -> None:
-    """Reject a sentence boundary introduced solely beside embedded inline math."""
-    for match in PLACEHOLDER_RE.finditer(source):
-        token=match.group(0)
-        sl=_nearest_nonspace_left(source,match.start()); sr=_nearest_nonspace_right(source,match.end())
-        if not (sl and sr and sl not in _SENTENCE_TERMINATORS and sr not in _SENTENCE_TERMINATORS):
-            continue
-        ti=translated.find(token)
-        if ti<0: continue
-        tl=_nearest_nonspace_left(translated,ti); tr=_nearest_nonspace_right(translated,ti+len(token))
-        if tl in _SENTENCE_TERMINATORS:
-            raise GeminiOutputError("Translation introduced a sentence break immediately before embedded inline math")
-        if tr in _SENTENCE_TERMINATORS:
-            raise GeminiOutputError("Translation introduced a sentence break immediately after embedded inline math")
 
 def _translate_once(
     api_key: str,
@@ -429,22 +450,14 @@ def _translate_once(
         if not value:
             raise GeminiOutputError("Gemini returned an empty translation")
 
-        expected = sorted(PLACEHOLDER_RE.findall(item["text"]))
-        actual = sorted(PLACEHOLDER_RE.findall(value))
-        if expected != actual:
-            raise GeminiOutputError(
-                f"Math placeholders changed: expected={expected}, actual={actual}"
+        try:
+            _validate_translation_result(
+                item["text"],
+                value,
+                target_language,
             )
-
-        _validate_translation_quality(
-            item["text"],
-            value,
-            target_language,
-        )
-        _validate_inline_math_continuity(
-            item["text"],
-            value,
-        )
+        except TranslationValidationError as exc:
+            raise GeminiOutputError(str(exc)) from exc
 
         out.append(value)
 
@@ -458,6 +471,7 @@ def _translate_with_quota_retries(
     batch: list[dict],
     target_language: str,
     strategy: dict,
+    route: TranslationRoute,
     *,
     context: str,
     status_callback: Callable[[str], None] | None = None,
@@ -468,6 +482,19 @@ def _translate_with_quota_retries(
     cannot replace those tasks. This function is used only for natural-language
     translation, where Google Translate is an acceptable immediate fallback.
     """
+    # A previous batch in this job may have hit 429 while this batch was waiting
+    # for recovery.  Never start a fresh Gemini request after the route is locked.
+    if route.google_locked:
+        if google_translate_configured():
+            raise Gemini429UseGoogle(
+                model,
+                "This translation job is already locked to Google Translate.",
+            )
+        raise RuntimeError(
+            "TRANSIENT_GOOGLE_TRANSLATE_ERROR: this translation job is locked "
+            "to Google Translate, but the googletrans runtime is unavailable."
+        )
+
     if daily_quota_exhausted(model):
         raise GeminiDailyQuotaError(
             model,
@@ -493,8 +520,12 @@ def _translate_with_quota_retries(
         # Do NOT impose a cooldown or honor Retry-After for prose translation.
         # User latency is more important here because Google Translate can take
         # over this exact task immediately.
+        # A live prose-translation 429 is a one-way route change for this job.
+        # Never probe another Gemini model after this point, even if the Google
+        # runtime is unexpectedly missing; the runtime verifier should normally
+        # make that state impossible.
+        route.lock_google(persistent=True)
         if google_translate_configured():
-            _use_google_for_remaining_translation.set()
             if status_callback:
                 status_callback(
                     "번역 요청이 지연되어 Google 번역으로 전환해 계속 처리하고 있습니다."
@@ -506,17 +537,10 @@ def _translate_with_quota_retries(
             )
             raise Gemini429UseGoogle(model, exc.detail) from exc
 
-        # If Python Google Translate is unavailable, still do not sleep. Let the
-        # caller try the next Gemini model immediately.
-        print(
-            f"{context}: Gemini 429 on {model}; Python Google Translate "
-            "runtime is unexpectedly unavailable, trying the next model "
-            "without waiting.",
-            flush=True,
-        )
-        if is_daily_quota_error(exc.detail):
-            raise GeminiDailyQuotaError(model, exc.detail) from exc
-        raise exc
+        raise RuntimeError(
+            "TRANSIENT_GOOGLE_TRANSLATE_ERROR: Gemini translation returned 429, "
+            "but the required Python Google Translate runtime is unavailable."
+        ) from exc
 
 
 def _google_translate_fallback(
@@ -528,8 +552,8 @@ def _google_translate_fallback(
 ) -> list[str]:
     if not google_translate_configured():
         raise RuntimeError(
-            "TRANSIENT_GEMINI_ERROR: all Gemini translation models are unavailable "
-            "and the Python Google Translate fallback is unavailable."
+            "TRANSIENT_GOOGLE_TRANSLATE_ERROR: Python Google Translate is required "
+            "for this translation route, but the googletrans runtime is unavailable."
         )
 
     values = google_translate_batch(
@@ -547,27 +571,18 @@ def _google_translate_fallback(
     for item, value in zip(batch, values):
         value = _sanitize(value)
         if not value:
-            raise GoogleTranslateError(
+            raise GoogleTranslateIntegrityError(
                 "Google Translate fallback returned an empty translation"
             )
 
-        expected = sorted(PLACEHOLDER_RE.findall(item["text"]))
-        actual = sorted(PLACEHOLDER_RE.findall(value))
-        if expected != actual:
-            raise GoogleTranslateError(
-                f"Google Translate changed math placeholders: "
-                f"expected={expected}, actual={actual}"
+        try:
+            _validate_translation_result(
+                item["text"],
+                value,
+                target_language,
             )
-
-        _validate_translation_quality(
-            item["text"],
-            value,
-            target_language,
-        )
-        _validate_inline_math_continuity(
-            item["text"],
-            value,
-        )
+        except TranslationValidationError as exc:
+            raise GoogleTranslateIntegrityError(str(exc)) from exc
         cleaned.append(value)
 
     return cleaned
@@ -577,11 +592,12 @@ def _request_batch(
     batch: list[dict],
     target_language: str,
     strategy: dict,
+    route: TranslationRoute,
     *,
     status_callback: Callable[[str], None] | None = None,
 ) -> list[str]:
     """Translate a batch with zero-wait Google fallback on any Gemini 429."""
-    if _use_google_for_remaining_translation.is_set() and google_translate_configured():
+    if route.google_locked:
         return _google_translate_fallback(
             batch,
             target_language,
@@ -589,14 +605,17 @@ def _request_batch(
             status_callback=status_callback,
         )
 
-    last_error: Exception | None = None
-    attempted_models = 0
-
     for model in _candidate_models():
+        if route.google_locked:
+            return _google_translate_fallback(
+                batch,
+                target_language,
+                strategy,
+                status_callback=status_callback,
+            )
+
         if daily_quota_exhausted(model):
             continue
-
-        attempted_models += 1
 
         try:
             print(
@@ -609,6 +628,7 @@ def _request_batch(
                 batch,
                 target_language,
                 strategy,
+                route,
                 context="Translation",
                 status_callback=status_callback,
             )
@@ -621,14 +641,12 @@ def _request_batch(
                 status_callback=status_callback,
             )
 
-        except GeminiDailyQuotaError as exc:
-            last_error = exc
+        except GeminiDailyQuotaError:
             # Daily exhaustion known before the call can still move to another
             # model. A live 429 with Google configured never reaches here.
             continue
 
         except GeminiHTTPError as exc:
-            last_error = exc
             if exc.status in {404, 500, 502, 503, 504}:
                 if status_callback:
                     status_callback(
@@ -637,23 +655,99 @@ def _request_batch(
                 continue
             raise
 
-        except RuntimeError as exc:
-            # Temporary 429 retry budget or transport/network errors.
-            last_error = exc
+        except GeminiOutputError:
+            # Structured/content quality problems are handled by _recover,
+            # which can isolate the offending semantic block.
+            raise
+
+        except GeminiTransportError:
+            # Network/protocol failures may use another configured model, but
+            # unrelated RuntimeError bugs must not be silently swallowed here.
             if status_callback:
                 status_callback(
                     "번역을 계속하기 위해 다른 처리 경로로 전환하고 있습니다."
                 )
             continue
 
-        except GeminiOutputError:
-            # Structured/content quality problems should be handled by _recover
-            # through smaller semantic batches rather than silently switching.
-            raise
-
     # All Gemini translation paths are exhausted/unavailable. As the final
     # prose-translation fallback, use the local Python googletrans fallback.
     # Vision/math reconstruction still remains Gemini/source-PDF based.
+    if google_translate_configured():
+        if route.lock_google() and status_callback:
+            status_callback(
+                "Gemini 번역 경로를 사용할 수 없어 Google 번역으로 계속 처리하고 있습니다."
+            )
+    return _google_translate_fallback(
+        batch,
+        target_language,
+        strategy,
+        status_callback=status_callback,
+    )
+
+
+def _handle_google_error(
+    exc: GoogleTranslateError,
+    api_key: str,
+    batch: list[dict],
+    target_language: str,
+    strategy: dict,
+    route: TranslationRoute,
+    *,
+    status_callback: Callable[[str], None] | None = None,
+) -> list[str]:
+    if isinstance(exc, GoogleTranslateIntegrityError):
+        # A malformed response for one item must not discard an otherwise valid
+        # multi-block batch. Isolate the offending block without going back to
+        # Gemini after the job has entered Google mode.
+        if len(batch) > 1:
+            mid = len(batch) // 2
+            return (
+                _google_recoverable(
+                    api_key,
+                    batch[:mid],
+                    target_language,
+                    strategy,
+                    route,
+                    status_callback=status_callback,
+                )
+                + _google_recoverable(
+                    api_key,
+                    batch[mid:],
+                    target_language,
+                    strategy,
+                    route,
+                    status_callback=status_callback,
+                )
+            )
+        raise RuntimeError(
+            "TRANSIENT_GOOGLE_TRANSLATE_ERROR: Google Translate returned a "
+            f"single-block result that failed integrity validation: {exc}"
+        ) from exc
+
+    if isinstance(exc, GoogleTranslateTransientError):
+        raise RuntimeError(
+            f"TRANSIENT_GOOGLE_TRANSLATE_ERROR: {exc}"
+        ) from exc
+
+    raise RuntimeError(
+        f"TRANSIENT_GOOGLE_TRANSLATE_ERROR: {exc}"
+    ) from exc
+
+
+def _google_recoverable(
+    api_key: str,
+    batch: list[dict],
+    target_language: str,
+    strategy: dict,
+    route: TranslationRoute,
+    *,
+    status_callback: Callable[[str], None] | None = None,
+) -> list[str]:
+    """Run Google translation with structural isolation and transient tagging."""
+    if route.lock_google() and status_callback:
+        status_callback(
+            "Google 번역으로 본문을 계속 처리하고 있습니다."
+        )
     try:
         return _google_translate_fallback(
             batch,
@@ -661,25 +755,23 @@ def _request_batch(
             strategy,
             status_callback=status_callback,
         )
-    except GoogleTranslateError as google_exc:
-        if attempted_models == 0:
-            raise RuntimeError(
-                "TRANSIENT_GOOGLE_TRANSLATE_ERROR: all Gemini translation models "
-                "reached their daily quota and the Google Translate fallback also "
-                f"failed: {google_exc}"
-            ) from google_exc
-        raise RuntimeError(
-            "TRANSIENT_GOOGLE_TRANSLATE_ERROR: no Gemini translation model is "
-            "currently available and the Google Translate fallback also failed. "
-            f"Gemini last error: {last_error}; Google error: {google_exc}"
-        ) from google_exc
-
+    except GoogleTranslateError as exc:
+        return _handle_google_error(
+            exc,
+            api_key,
+            batch,
+            target_language,
+            strategy,
+            route,
+            status_callback=status_callback,
+        )
 
 def _recover(
     api_key: str,
     batch: list[dict],
     target_language: str,
     strategy: dict,
+    route: TranslationRoute,
     *,
     status_callback: Callable[[str], None] | None = None,
 ) -> list[str]:
@@ -689,6 +781,21 @@ def _recover(
             batch,
             target_language,
             strategy,
+            route,
+            status_callback=status_callback,
+        )
+
+    except GoogleTranslateError as exc:
+        # _request_batch can enter here directly when the route was already
+        # Google-locked. Classify the response without re-sending the same whole
+        # batch; integrity failures are split immediately into smaller batches.
+        return _handle_google_error(
+            exc,
+            api_key,
+            batch,
+            target_language,
+            strategy,
+            route,
             status_callback=status_callback,
         )
 
@@ -701,6 +808,7 @@ def _recover(
                     batch[:mid],
                     target_language,
                     strategy,
+                    route,
                     status_callback=status_callback,
                 )
                 + _recover(
@@ -708,21 +816,44 @@ def _recover(
                     batch[mid:],
                     target_language,
                     strategy,
+                    route,
                     status_callback=status_callback,
                 )
             )
 
-        # One block failed content/structured-output validation. Try alternate
-        # currently available models, still respecting per-model daily quotas.
+        # If any concurrent batch has already observed a live 429, quality
+        # recovery is Google-only. This closes the old path that could call a
+        # second Gemini model after the job had switched providers.
+        if route.google_locked:
+            return _google_recoverable(
+                api_key,
+                batch,
+                target_language,
+                strategy,
+                route,
+                status_callback=status_callback,
+            )
+
+        # One block failed Gemini content/structured-output validation. Try
+        # alternate models only while the job is still in Gemini mode.
         models = _candidate_models()
         for model in models[1:]:
+            if route.google_locked:
+                return _google_recoverable(
+                    api_key,
+                    batch,
+                    target_language,
+                    strategy,
+                    route,
+                    status_callback=status_callback,
+                )
             if daily_quota_exhausted(model):
                 continue
 
             try:
                 if status_callback:
                     status_callback(
-                        "문장 품질을 확인하며 다른 처리 경로로 다시 번역하고 있습니다."
+                        "문장 품질을 확인하며 다른 번역 모델로 다시 처리하고 있습니다."
                     )
                 return _translate_with_quota_retries(
                     api_key,
@@ -730,14 +861,17 @@ def _recover(
                     batch,
                     target_language,
                     strategy,
+                    route,
                     context="Single-block quality fallback",
                     status_callback=status_callback,
                 )
             except Gemini429UseGoogle:
-                return _google_translate_fallback(
+                return _google_recoverable(
+                    api_key,
                     batch,
                     target_language,
                     strategy,
+                    route,
                     status_callback=status_callback,
                 )
             except GeminiDailyQuotaError:
@@ -748,27 +882,19 @@ def _recover(
                 raise
             except GeminiOutputError:
                 continue
-            except RuntimeError:
+            except GeminiTransportError:
                 continue
 
-        # Last resort for a single prose block: Python Google Translate.
-        # This is preferable to emitting the original English block unchanged.
-        try:
-            return _google_translate_fallback(
-                batch,
-                target_language,
-                strategy,
-                status_callback=status_callback,
-            )
-        except (GoogleTranslateError, RuntimeError) as google_exc:
-            raise RuntimeError(
-                "Translation failed quality validation after all Gemini paths and "
-                f"the Google Translate fallback also failed: {google_exc}"
-            ) from exc
-
-    except Exception:
-        raise
-
+        # Last prose fallback after Gemini quality failure. Lock the route so
+        # recursive recovery cannot cycle back into the Gemini model chain.
+        return _google_recoverable(
+            api_key,
+            batch,
+            target_language,
+            strategy,
+            route,
+            status_callback=status_callback,
+        )
 
 def translate_blocks(
     items: list[dict],
@@ -777,10 +903,22 @@ def translate_blocks(
     progress_callback: Callable[[float, str], None] | None = None,
     initial_translations: dict[str, str] | None = None,
     checkpoint_callback: Callable[[dict[str, str]], None] | None = None,
+    *,
+    force_google_fallback: bool = False,
+    route_state_callback: Callable[[bool], None] | None = None,
 ) -> dict[str, str]:
-    # One translation stage == one provider decision lifecycle. Once a live 429
-    # occurs, the event remains set for all remaining parallel batches.
-    _use_google_for_remaining_translation.clear()
+    # Provider routing is scoped to this translation job and can be restored
+    # from its persistent checkpoint.  This prevents a resumed job from probing
+    # Gemini again after an earlier live 429.
+    route = TranslationRoute(force_google=force_google_fallback)
+    route_notified = force_google_fallback
+
+    def notify_route_state() -> None:
+        nonlocal route_notified
+        if route.persistent_google_lock and not route_notified:
+            route_notified = True
+            if route_state_callback:
+                route_state_callback(True)
 
     if not items:
         return {}
@@ -795,11 +933,11 @@ def translate_blocks(
         if item is None or not isinstance(value, str) or not value.strip():
             continue
         try:
-            _validate_translation_quality(item["text"], value, target_language)
-            _validate_inline_math_continuity(item["text"], value)
-        except GeminiOutputError:
+            _validate_translation_result(item["text"], value, target_language)
+        except TranslationValidationError:
             print(
-                f"Checkpoint translation {key} failed current quality rules; retranslating only this block.",
+                f"Checkpoint translation {key} failed current integrity/quality rules; "
+                "retranslating only this block.",
                 flush=True,
             )
             continue
@@ -812,10 +950,17 @@ def translate_blocks(
         return result
 
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not api_key:
+    if not api_key and not route.google_locked:
         raise RuntimeError("GEMINI_API_KEY is not configured")
     if target_language not in LANGUAGE_NAMES:
         raise RuntimeError(f"Unsupported target language: {target_language}")
+
+    if route.google_locked:
+        print(
+            "Translation resume policy: Google Translate is already locked for "
+            "this job from an earlier Gemini 429/fallback checkpoint.",
+            flush=True,
+        )
 
     pending_items = [item for item in items if item["id"] not in result]
     total_blocks = max(1, len(items))
@@ -835,93 +980,97 @@ def translate_blocks(
     workers = max(1, min(2, int(os.getenv("TRANSLATION_WORKERS", "2"))))
     print(
         f"Translation resume plan: {completed_blocks}/{len(items)} blocks saved, "
-        f"remaining={len(pending_items)}, batches={len(batches)}, workers={workers}",
+        f"remaining={len(pending_items)}, batches={len(batches)}, workers={workers}, "
+        f"google_locked={route.google_locked}",
         flush=True,
     )
 
-    started_batches = 0
     lock = threading.Lock()
+    completed_batches = 0
 
     def emit(fraction: float, message: str) -> None:
         if progress_callback:
             progress_callback(max(0.0, min(1.0, fraction)), message)
 
     def run_one(index: int, batch: list[dict]) -> list[str]:
-        nonlocal started_batches
         check_cancel()
         with lock:
-            started_batches += 1
-            start_number = started_batches
             visible_fraction = min(
                 0.96,
                 (completed_blocks + min(len(batch) * 0.18, 2.0)) / total_blocks,
             )
             emit(
                 visible_fraction,
-                f"본문 번역 중 · 남은 묶음 {start_number}/{len(batches)} · "
+                f"본문 번역 묶음 {index + 1}/{len(batches)} 처리 중 · "
                 f"{len(batch)}개 블록",
             )
 
-        try:
-            def model_status(message: str) -> None:
-                with lock:
-                    current_fraction = max(
-                        completed_blocks / total_blocks,
-                        min(0.96, visible_fraction),
-                    )
-                    emit(current_fraction, message)
-
-            return _recover(
-                api_key,
-                batch,
-                target_language,
-                strategy,
-                status_callback=model_status,
-            )
-        except Exception:
+        def model_status(message: str) -> None:
             with lock:
-                emit(
+                current_fraction = max(
                     completed_blocks / total_blocks,
-                    f"문장 품질을 확인하며 현재 묶음을 다시 처리하고 있습니다.",
+                    min(0.96, visible_fraction),
                 )
-            raise
+                emit(current_fraction, message)
+
+        return _recover(
+            api_key,
+            batch,
+            target_language,
+            strategy,
+            route,
+            status_callback=model_status,
+        )
 
     def mark_complete(
         batch: list[dict],
         translated: list[str],
-        index: int,
     ) -> None:
-        nonlocal completed_blocks
+        nonlocal completed_blocks, completed_batches
 
         # This coordinator is the only place that mutates/persists result.
+        # In the threaded path future.result() and this function both run on the
+        # coordinator thread, so checkpoint snapshots are deterministic.
         with lock:
             for item, value in zip(batch, translated):
                 result[item["id"]] = value
             completed_blocks += len(batch)
+            completed_batches += 1
             snapshot = dict(result)
             emit(
                 completed_blocks / total_blocks,
-                f"본문 번역 · {completed_blocks}/{len(items)}개 블록 완료 "
-                f"({index + 1}/{len(batches)} 남은 묶음)",
+                f"본문 번역 · {completed_blocks}/{len(items)}개 블록 완료 · "
+                f"완료된 묶음 {completed_batches}/{len(batches)}",
             )
 
+        notify_route_state()
         if checkpoint_callback:
             checkpoint_callback(snapshot)
 
-    if workers == 1 or len(batches) <= 1:
-        for index, batch in enumerate(batches):
-            translated = run_one(index, batch)
-            mark_complete(batch, translated, index)
-    else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            future_to_index = {
-                executor.submit(run_one, index, batch): index
-                for index, batch in enumerate(batches)
-            }
-            for future in concurrent.futures.as_completed(future_to_index):
-                index = future_to_index[future]
-                translated = future.result()
-                mark_complete(batches[index], translated, index)
+    try:
+        if workers == 1 or len(batches) <= 1:
+            for index, batch in enumerate(batches):
+                translated = run_one(index, batch)
+                mark_complete(batch, translated)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                future_to_index = {
+                    executor.submit(run_one, index, batch): index
+                    for index, batch in enumerate(batches)
+                }
+                for future in concurrent.futures.as_completed(future_to_index):
+                    index = future_to_index[future]
+                    translated = future.result()
+                    mark_complete(batches[index], translated)
+    except Exception:
+        # Persist the provider lock and every successfully completed block before
+        # propagating a transient/cancellation error to run_job.
+        notify_route_state()
+        if checkpoint_callback:
+            checkpoint_callback(dict(result))
+        raise
+
+    notify_route_state()
 
     missing = [item["id"] for item in items if item["id"] not in result]
     if missing:
@@ -931,4 +1080,3 @@ def translate_blocks(
         )
 
     return result
-

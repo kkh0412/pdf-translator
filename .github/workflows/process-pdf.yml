@@ -85,6 +85,11 @@ jobs:
         shell: bash
         run: bash worker/ensure_python_runtime.sh
 
+      - name: Run translation routing regression tests
+        if: steps.target.outputs.has_jobs == 'true'
+        shell: bash
+        run: .venv/bin/python -m unittest discover -s worker/tests -v
+
       - name: Process requested PDF
         if: steps.target.outputs.has_jobs == 'true'
         env:
@@ -103,7 +108,6 @@ jobs:
           VISION_WORKERS: '2'
           TRANSLATION_WORKERS: '2'
           GEMINI_SAFE_RPM: '18'
-          GEMINI_MAX_429_RETRIES: '8'
           BOOK_FONT_DIR: /home/runner/.cache/pdf-translator-fonts
           MAX_PAGES: '100'
         shell: bash

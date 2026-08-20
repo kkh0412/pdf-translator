@@ -21,6 +21,14 @@ class GoogleTranslateError(RuntimeError):
     pass
 
 
+class GoogleTranslateTransientError(GoogleTranslateError):
+    """The web translation service failed in a way worth retrying later."""
+
+
+class GoogleTranslateIntegrityError(GoogleTranslateError):
+    """A response arrived, but protected content could not be restored safely."""
+
+
 def configured() -> bool:
     """No API key is required; only the Python package must be installed."""
     if os.getenv("PY_GOOGLE_TRANSLATE_DISABLED", "").strip().lower() in {
@@ -77,7 +85,7 @@ def _restore_text(translated: str, mapping: dict[str, str]) -> str:
     def repl(match: re.Match) -> str:
         key = match.group("token")
         if key not in mapping:
-            raise GoogleTranslateError(
+            raise GoogleTranslateIntegrityError(
                 f"Python Google Translate returned an unknown protected token: {key}"
             )
         seen.add(key)
@@ -86,13 +94,13 @@ def _restore_text(translated: str, mapping: dict[str, str]) -> str:
     restored = PROTECTED_TOKEN_RE.sub(repl, translated)
     missing = sorted(set(mapping) - seen)
     if missing:
-        raise GoogleTranslateError(
+        raise GoogleTranslateIntegrityError(
             "Python Google Translate dropped protected tokens: "
             + ", ".join(missing)
         )
 
     if re.search(r"ZXQPDFTRTOKEN", restored, flags=re.I):
-        raise GoogleTranslateError(
+        raise GoogleTranslateIntegrityError(
             "Python Google Translate left an unrecovered protection token"
         )
 
@@ -162,7 +170,7 @@ async def _translate_async(
             result = await perform(translator)
 
     except Exception as exc:
-        raise GoogleTranslateError(
+        raise GoogleTranslateTransientError(
             f"TRANSIENT_PY_GOOGLE_TRANSLATE_ERROR: {type(exc).__name__}: {exc}"
         ) from exc
 
@@ -170,7 +178,7 @@ async def _translate_async(
         result = [result]
 
     if len(result) != len(texts):
-        raise GoogleTranslateError(
+        raise GoogleTranslateTransientError(
             "Python Google Translate returned the wrong number of translations"
         )
 
@@ -178,7 +186,7 @@ async def _translate_async(
     for item in result:
         value = getattr(item, "text", None)
         if not isinstance(value, str):
-            raise GoogleTranslateError(
+            raise GoogleTranslateTransientError(
                 "Python Google Translate returned a non-string translation"
             )
         values.append(value)
@@ -222,11 +230,6 @@ def translate_batch(
         )
         protected.append(protected_text)
         mappings.append(mapping)
-
-    if status_callback:
-        status_callback(
-            "번역 요청이 지연되어 Google 번역으로 전환해 계속 처리하고 있습니다."
-        )
 
     print(
         "Python Google Translate fallback: "

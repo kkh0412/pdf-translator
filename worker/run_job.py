@@ -599,7 +599,7 @@ def main(job_id: str) -> int:
                 retry_payload
             ).eq("id", job_id).execute()
             print(
-                f"Temporary Gemini error; requeued {job_id}: {message}",
+                f"Temporary translation-provider error; requeued {job_id}: {message}",
                 file=sys.stderr,
             )
             return 0

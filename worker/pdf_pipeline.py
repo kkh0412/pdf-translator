@@ -28,6 +28,7 @@ from .gemini_rate import check_cancel
 
 
 PLACEHOLDER_RE = re.compile(r"\[\[MATH_(\d+)\]\]")
+TRANSLATION_STATE_VERSION = 2
 DANGEROUS_MATH = re.compile(
     r"\\(?:documentclass|usepackage|input|include|write|openout|read|catcode|csname|newread|newwrite)\b",
     re.I,
@@ -804,6 +805,39 @@ def _render_translated_text(text: str, math_map: dict[str, str]) -> str:
 
     out.append(_escape_text(text[pos:]))
     return "".join(out)
+
+
+def _translation_integrity_errors(
+    translation_items: list[dict],
+    translations: dict[str, str],
+) -> list[str]:
+    """Validate checkpoint/provider output before any translated text is rendered."""
+    errors: list[str] = []
+
+    for item in translation_items:
+        item_id = str(item.get("id", ""))
+        translated = translations.get(item_id, "")
+        if not translated:
+            errors.append(f"{item_id}: empty translation")
+            continue
+
+        expected_math = sorted(
+            match.group(0)
+            for match in PLACEHOLDER_RE.finditer(str(item.get("text", "")))
+        )
+        actual_math = sorted(
+            match.group(0) for match in PLACEHOLDER_RE.finditer(translated)
+        )
+        if expected_math != actual_math:
+            errors.append(
+                f"{item_id}: inline-math placeholders changed "
+                f"expected={expected_math} actual={actual_math}"
+            )
+
+        if _contains_bare_math_transport(translated) or "\\math{" in translated:
+            errors.append(f"{item_id}: internal math transport marker")
+
+    return errors
 
 
 def _normalized_bbox_values(bbox_norm: object) -> list[float] | None:
@@ -3038,6 +3072,9 @@ def process_pdf(
     existing_translations = checkpoint_state.get("translations")
     if not isinstance(existing_translations, dict):
         existing_translations = {}
+    translation_google_locked = bool(
+        checkpoint_state.get("translation_google_fallback_locked")
+    )
 
     completed_saved = sum(
         1 for item in translation_items if item.get("id") in existing_translations
@@ -3076,10 +3113,23 @@ def process_pdf(
             blocks=_checkpoint_copy_blocks(blocks),
             translations=dict(values),
             translation_complete=False,
+            translation_state_version=TRANSLATION_STATE_VERSION,
         )
 
-    if checkpoint_state.get("translation_complete") and all(
-        item.get("id") in existing_translations for item in translation_items
+    def remember_translation_route(google_locked: bool) -> None:
+        # translate_blocks calls this on its coordinator thread before writing a
+        # translation checkpoint.  Persisting the route prevents a resumed job
+        # from probing Gemini again after an earlier live 429.
+        if google_locked:
+            checkpoint_state["translation_google_fallback_locked"] = True
+
+    if (
+        checkpoint_state.get("translation_state_version") == TRANSLATION_STATE_VERSION
+        and checkpoint_state.get("translation_complete")
+        and all(
+            item.get("id") in existing_translations
+            for item in translation_items
+        )
     ):
         translations = dict(existing_translations)
         if progress_callback:
@@ -3094,6 +3144,8 @@ def process_pdf(
             progress_callback=translation_progress,
             initial_translations=existing_translations,
             checkpoint_callback=save_translation_checkpoint,
+            force_google_fallback=translation_google_locked,
+            route_state_callback=remember_translation_route,
         )
         _checkpoint_emit(
             checkpoint_state,
@@ -3101,18 +3153,13 @@ def process_pdf(
             stage="translation_complete",
             translations=dict(translations),
             translation_complete=True,
+            translation_state_version=TRANSLATION_STATE_VERSION,
         )
 
-    integrity_errors: list[str] = []
-    for item in translation_items:
-        translated = translations.get(item["id"], "")
-        if not translated:
-            integrity_errors.append(f"{item['id']}: empty translation")
-            continue
-        if _contains_bare_math_transport(translated) or "\\math{" in translated:
-            integrity_errors.append(
-                f"{item['id']}: internal math transport marker"
-            )
+    integrity_errors = _translation_integrity_errors(
+        translation_items,
+        translations,
+    )
 
     if integrity_errors:
         raise RuntimeError(
